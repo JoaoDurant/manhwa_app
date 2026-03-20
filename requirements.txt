@@ -1,0 +1,70 @@
+# ============================================================================
+# MANHWA VIDEO CREATOR - ALL-IN-ONE REQUIREMENTS (NVIDIA GPU OPTIMIZED)
+# ============================================================================
+
+# --- PyTorch CUDA 12.4 (Recomendado para RTX 30/40/50 series) ---
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+torchaudio==2.5.1+cu124
+
+# --- Core TTS Application ---
+chatterbox-tts @ git+https://github.com/devnen/chatterbox-v2.git@master
+
+# --- Desktop UI ---
+PySide6>=6.5
+
+# --- Speech Recognition & Verification ---
+openai-whisper
+
+# --- Video & Image Processing ---
+moviepy==1.0.3
+Pillow>=10.0
+ffmpeg-python
+
+# --- NLP & Text Processing ---
+spacy
+spacy-lookups-data
+pydub
+Unidecode
+inflect
+
+# --- Machine Learning & Audio Libraries ---
+numpy>=1.24.0,<2.0.0
+librosa
+soundfile
+safetensors
+descript-audio-codec
+praat-parselmouth
+audiotsm
+
+# --- Kokoro-TTS Engine ---
+kokoro
+misaki
+huggingface-hub
+espeakng-loader
+phonemizer-fork
+underthesea
+fugashi[unidic]
+jaconv
+mojimoji
+pyopenjtalk
+jamo
+nltk
+cn2an
+jieba
+ordered-set
+pypinyin
+pypinyin-dict
+
+# --- Server & API Utilities ---
+fastapi
+uvicorn[standard]
+python-multipart
+requests
+Jinja2
+aiofiles
+hf_transfer
+watchdog
+tqdm

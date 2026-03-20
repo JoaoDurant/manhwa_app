@@ -1,0 +1,47 @@
+# ============================================================================
+# MANHWA VIDEO CREATOR — EXTRA DEPENDENCIES
+# ============================================================================
+# Install into the existing Chatterbox TTS Server virtual environment:
+#   pip install -r requirements_manhwa.txt
+
+# --- Desktop UI ---
+PySide6>=6.5
+
+# --- Speech Recognition (Whisper verification) ---
+openai-whisper
+
+# --- Video Composition ---
+moviepy==1.0.3
+
+# --- Image Processing ---
+Pillow>=10.0
+
+# --- FFmpeg Python Wrapper ---
+ffmpeg-python
+
+# --- Audio & Text Processing ---
+spacy
+spacy-lookups-data
+pydub
+
+# --- Text Similarity ---
+# (uses stdlib difflib — no extra package needed)
+
+# --- Kokoro-TTS Engine Extra Dependencies ---
+kokoro
+misaki
+huggingface-hub
+espeakng-loader
+phonemizer-fork
+underthesea
+fugashi[unidic]
+jaconv
+mojimoji
+pyopenjtalk
+jamo
+nltk
+cn2an
+jieba
+ordered-set
+pypinyin
+pypinyin-dict

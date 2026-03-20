@@ -425,6 +425,20 @@ def load_model() -> bool:
             MODEL_LOADED = False
             return False
 
+        # --- torch.compile: compila o modelo para eliminar overhead de dispatch CUDA ---
+        # Modo 'reduce-overhead': ideal para inferência TTS com formas dinâmicas.
+        # fullgraph=False: mais seguro para modelos com control flow dinâmico.
+        if model_device == "cuda" and hasattr(torch, 'compile'):
+            try:
+                chatterbox_model.t3 = torch.compile(
+                    chatterbox_model.t3,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                )
+                logger.info("torch.compile aplicado ao modelo T3 (reduce-overhead). Primeira inferência compila JIT.")
+            except Exception as e_compile:
+                logger.warning(f"torch.compile falhou (não crítico): {e_compile}")
+
         return True
 
     except Exception as e:
@@ -434,6 +448,25 @@ def load_model() -> bool:
         chatterbox_model = None
         MODEL_LOADED = False
         return False
+
+
+def warmup_model():
+    """
+    Executa uma síntese dummy para eliminar a latência de cold-start do CUDA.
+    Chame imediatamente após load_model() no thread de background.
+    """
+    global chatterbox_model, MODEL_LOADED, model_device
+    if not MODEL_LOADED or chatterbox_model is None:
+        return
+    try:
+        logger.info("Warmup: executando síntese dummy para pre-alocar buffers CUDA...")
+        with torch.inference_mode():
+            chatterbox_model.generate("Hello.") if hasattr(chatterbox_model, 'generate') else None
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        logger.info("Warmup concluído. GPU pronta para inferência.")
+    except Exception as e:
+        logger.warning(f"Warmup falhou (não crítico): {e}")
 
 
 def synthesize(

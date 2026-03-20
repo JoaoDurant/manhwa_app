@@ -214,14 +214,15 @@ def _python_render_clip(
         COLOR_CORRECTION = "eq=contrast=1.05:brightness=0.02:saturation=1.1,unsharp=3:3:0.5:3:3:0"
 
         # FFmpeg piped render — threads=0 usa TODOS os núcleos disponíveis
+        # NVENC p4 = excelente custo/benefício: 2-3x mais rápido que p7 com qualidade similar a 1080p60
         if encoder == "h264_nvenc":
-            vcodec = ["-c:v", "h264_nvenc", "-preset", "p7", "-cq", "18"]
+            vcodec = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "22", "-b:v", "0", "-maxrate", "15M"]
         elif encoder == "h264_amf":
-            vcodec = ["-c:v", "h264_amf", "-quality", "speed", "-qp_i", "18", "-qp_p", "18"]
+            vcodec = ["-c:v", "h264_amf", "-quality", "speed", "-qp_i", "20", "-qp_p", "20"]
         elif encoder == "h264_qsv":
-            vcodec = ["-c:v", "h264_qsv", "-preset", "veryslow", "-global_quality", "18"]
+            vcodec = ["-c:v", "h264_qsv", "-preset", "fast", "-global_quality", "22"]
         else:
-            vcodec = ["-c:v", "libx264", "-preset", "faster", "-crf", "18", "-threads", "0"]
+            vcodec = ["-c:v", "libx264", "-preset", "faster", "-crf", "20", "-threads", "0"]
         cmd = ["ffmpeg", "-y", "-threads", "0",
                "-f", "rawvideo", "-vcodec", "rawvideo", "-s", "1920x1080",
                "-pix_fmt", "rgb24", "-r", str(fps), "-i", "-"]

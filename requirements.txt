@@ -17,6 +17,7 @@ PySide6>=6.5
 
 # --- Speech Recognition & Verification ---
 openai-whisper
+faster-whisper     # 3-5x mais rápido que openai-whisper (usa CTranslate2 + int8)
 
 # --- Video & Image Processing ---
 moviepy==1.0.3

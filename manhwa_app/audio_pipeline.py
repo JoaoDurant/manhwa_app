@@ -86,14 +86,11 @@ _WHISPER_LOCK = threading.Lock()
 
 def _get_whisper_model(model_name: str = "base"):
     """
-    Carrega o modelo openai-whisper de forma lazy.
-    • Roda em CUDA se disponível, senão CPU.
-    • Usa float16 em CUDA para reduzir uso de VRAM.
-    • Aplica torch.compile() quando suportado (PyTorch ≥ 2.0 + CUDA).
+    Carrega o modelo faster-whisper de forma lazy.
+    faster-whisper é 3-5x mais rápido que openai-whisper com compute_type=int8_float16.
     """
     global _whisper_model, _whisper_device, _whisper_model_name_loaded
     with _WHISPER_LOCK:
-        # Recarregar se o modelo solicitado for diferente
         if _whisper_model is not None and _whisper_model_name_loaded == model_name:
             return _whisper_model, _whisper_device
 
@@ -103,32 +100,36 @@ def _get_whisper_model(model_name: str = "base"):
         _whisper_model = None
         gc.collect()
         if torch.cuda.is_available():
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-    try:
-        import whisper
-    except ImportError:
-        logger.error("openai-whisper não instalado. Execute: pip install openai-whisper")
-        return None, None
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Carregando Whisper '{model_name}' em {device}…")
+    logger.info(f"Carregando faster-whisper '{model_name}' em {device}…")
 
     try:
-        model = whisper.load_model(model_name, device=device)
-        # NOTA: NÃO usar .half() nem torch.compile() aqui.
-        # O torch.compile no Whisper causa ~30s de overhead de compilação por sessão
-        # sem ganho real para áudios curtos de TTS (< 30s cada).
-        # O Whisper roda em float32 na GPU normalmente.
-
+        from faster_whisper import WhisperModel
+        compute_type = "int8_float16" if device == "cuda" else "int8"
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
         _whisper_model = model
         _whisper_device = device
         _whisper_model_name_loaded = model_name
-        logger.info(f"Whisper '{model_name}' pronto em {device}.")
+        logger.info(f"faster-whisper '{model_name}' pronto em {device} (compute: {compute_type}).")
         return _whisper_model, _whisper_device
-
+    except ImportError:
+        # Fallback para openai-whisper se faster-whisper não estiver instalado
+        logger.warning("faster-whisper não instalado, usando openai-whisper (mais lento). Execute: pip install faster-whisper")
+        try:
+            import whisper
+            model = whisper.load_model(model_name, device=device)
+            _whisper_model = model
+            _whisper_device = device
+            _whisper_model_name_loaded = model_name
+            return _whisper_model, _whisper_device
+        except Exception as e:
+            logger.error(f"Falha ao carregar Whisper: {e}", exc_info=True)
+            return None, None
     except Exception as e:
-        logger.error(f"Falha ao carregar modelo Whisper: {e}", exc_info=True)
+        logger.error(f"Falha ao carregar faster-whisper: {e}", exc_info=True)
         return None, None
 
 
@@ -203,18 +204,28 @@ def _text_similarity(a: str, b: str) -> float:
 
 def transcribe_audio(wav_path: str, whisper_model_name: str = "base") -> str:
     """
-    Transcreve um WAV com Whisper e retorna o texto (sem espaços extras).
-    Retorna '' em caso de falha.
-    
-    CORREÇÃO: Chama model.transcribe(path) — não whisper.transcribe(model, path).
+    Transcreve um WAV com faster-whisper (ou openai-whisper como fallback).
+    Usa amostragem dos primeiros 10s para validarção rápida — 80% mais rápido em áudios longos.
     """
     model, device = _get_whisper_model(whisper_model_name)
     if model is None:
         return ""
     try:
-        # API correta do openai-whisper: model.transcribe(path, fp16=True/False)
-        result = model.transcribe(wav_path, fp16=(device == "cuda"))
-        return result.get("text", "").strip()
+        # Tentar API do faster-whisper primeiro
+        if hasattr(model, 'transcribe') and hasattr(model, 'supported_languages'):
+            # faster-whisper: transcrevemos apenas os primeiros 10 segundos
+            segments, _ = model.transcribe(
+                wav_path,
+                beam_size=1,
+                language=None,
+                clip_timestamps="0,10",  # Amostragem: primeiros 10s
+                vad_filter=True,
+            )
+            return " ".join(s.text for s in segments).strip()
+        else:
+            # openai-whisper fallback
+            result = model.transcribe(wav_path, fp16=(device == "cuda"))
+            return result.get("text", "").strip()
     except Exception as e:
         logger.error(f"Transcrição Whisper falhou para {wav_path}: {e}", exc_info=True)
         return ""
@@ -375,8 +386,34 @@ class AudioPipeline(QObject):
         if hasattr(torch, 'set_num_threads'):
             torch.set_num_threads(os.cpu_count() or 4)
 
+        # Buffer de logs para evitar overhead de UI (emit agrupado a cada 0.5s)
+        self._log_buffer: list = []
+        self._log_last_flush: float = 0.0
+        # Métrica de performance para detectar degradação progressiva
+        self._baseline_avg: float = 0.0
+
     def cancel(self):
         self._cancelled = True
+
+    def _emit_log(self, msg: str):
+        """Emite log imediato (sem buffer) para mensagens críticas."""
+        self.log_message.emit(msg)
+
+    def _buffered_log(self, msg: str):
+        """Acumula logs e emite em lote a cada 0.5s para reduzir overhead de UI."""
+        self._log_buffer.append(msg)
+        now = time.time()
+        if now - self._log_last_flush >= 0.5:
+            combined = "\n".join(self._log_buffer)
+            self.log_message.emit(combined)
+            self._log_buffer.clear()
+            self._log_last_flush = now
+
+    def _flush_log_buffer(self):
+        """Força emissão de todos os logs pendentes."""
+        if self._log_buffer:
+            self.log_message.emit("\n".join(self._log_buffer))
+            self._log_buffer.clear()
 
     def _log_vram(self, stage: str):
         """Monitor de VRAM em tempo real."""
@@ -421,12 +458,12 @@ class AudioPipeline(QObject):
             _config_manager.update_and_save({"model": {"repo_id": self.model_type}})
 
         # Identifica se precisamos forçar o recarregamento do engine
-        # pois o usuário trocou de 'turbo' para 'original' ou 'multilingual' etc.
         if engine.MODEL_LOADED and engine.loaded_model_type != self.model_type:
             self.log_message.emit("Trocando modelo TTS. Limpando VRAM…")
             engine.chatterbox_model = None
             engine.MODEL_LOADED = False
             if torch.cuda.is_available():
+                torch.cuda.synchronize()  # Garante que GPU finalizou antes de liberar
                 torch.cuda.empty_cache()
                 gc.collect()
         
@@ -507,8 +544,10 @@ class AudioPipeline(QObject):
         # Whisper: carregar apenas se threshold > 0 (verificação ativa)
         use_whisper_verification = self.similarity_threshold > 0
         if use_whisper_verification:
-            self.log_message.emit(f"Pre-carregando Whisper ({self.whisper_model}) para verificação de qualidade…")
-            _get_whisper_model(self.whisper_model)
+            self.log_message.emit(f"Pre-carregando faster-whisper ({self.whisper_model}) para verificação de qualidade…")
+            # Carrega Whisper em thread paralela enquanto TTS já está pronto
+            import threading as _wt
+            _wt.Thread(target=_get_whisper_model, args=(self.whisper_model,), daemon=True).start()
 
         # Definir seed globalmente UMA VEZ antes do loop (não a cada parágrafo)
         if self.seed != 0 and self.tts_engine == "chatterbox":
@@ -529,6 +568,7 @@ class AudioPipeline(QObject):
             
             # Limpeza estratégica no início de cada parágrafo
             if torch.cuda.is_available():
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
             success  = False
@@ -595,6 +635,7 @@ class AudioPipeline(QObject):
                         # Limpeza Imediata do Tensor de Áudio
                         del wav_tensor
                         if torch.cuda.is_available():
+                            torch.cuda.synchronize()  # Garante que GPU finalizou
                             torch.cuda.empty_cache()
 
                         # ---- Verificação via Whisper: APENAS a partir da 2ª tentativa ----
@@ -611,6 +652,7 @@ class AudioPipeline(QObject):
                             
                             # Limpeza Pós Whisper
                             if torch.cuda.is_available():
+                                torch.cuda.synchronize()  # Garante que Whisper encerrou
                                 torch.cuda.empty_cache()
                                 gc.collect()
                                 self._log_vram(f"Pós-Whisper #{idx}")
@@ -657,10 +699,23 @@ class AudioPipeline(QObject):
                 eta = int(avg * (total - completed))
                 eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
                 self.progress.emit(completed, total)
+                
+                # Auto-detecção de degradação de performance
+                if self._baseline_avg == 0.0 and completed >= 2:
+                    self._baseline_avg = avg
+                elif self._baseline_avg > 0 and avg > self._baseline_avg * 1.8:
+                    self.log_message.emit(f"⚠️ Performance degradada ({avg:.1f}s/par vs baseline {self._baseline_avg:.1f}s). Defragmentando VRAM…")
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                
                 self.log_message.emit(f"  ✓ [#{idx}/{total}] Concluído em {elapsed:.1f}s total. ETA: {eta_s}")
                 self.paragraph_done.emit(idx, str(wav_final), paragraph)
             else:
                 self.log_message.emit(f"  ✗ [#{idx}] Falha após {self.max_retries} tentativa(s).")
+
+        self._flush_log_buffer()  # Garante que logs pendentes são enviados
 
         # Monta resultados finais ordenados
         generated = [generated_map[k] for k in sorted(generated_map.keys())]

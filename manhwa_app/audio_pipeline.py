@@ -15,18 +15,27 @@
 #   - Otimizações CUDA (empty_cache, verificação de VRAM)
 
 import gc
-import json
-import logging
 import re
-import sys
-import time
-import contextlib
-from difflib import SequenceMatcher
 import os
+import sys
+import json
+import uuid
+import time
+import shutil
 import threading
+import traceback
+import importlib
+import logging
+import contextlib
 import concurrent.futures
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from difflib import SequenceMatcher
+from typing import Any, List, Optional, Tuple, Dict, Generator
+
+# Suppress Numba and HTTP chatty debug logs
+logging.getLogger('numba').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('matplotlib').setLevel(logging.WARNING)
 
 import numpy as np
 import torch
@@ -60,7 +69,9 @@ try:
     # Importar config do diretório raiz
     from config import config_manager as _config_manager
     from manhwa_app.text_processor import process_text_fluency, init_spacy
+    from manhwa_app.advanced_text_processor import process_text
     from manhwa_app.audio_fx import apply_audio_post_processing
+    from manhwa_app.models import get_qwen_model, get_whisper_model, unload_whisper, transcribe_audio
     _ENGINE_AVAILABLE = True
 except ImportError as _import_err:
     _engine = None  # type: ignore
@@ -75,96 +86,27 @@ except ImportError as _import_err:
 logger = logging.getLogger(__name__)
 _CPU_COUNT = os.cpu_count() or 4
 
-# ---------------------------------------------------------------------------
-# Singleton do Whisper — carregamento lazy, CUDA + float16 + torch.compile opcional
-# ---------------------------------------------------------------------------
-_whisper_model = None
-_whisper_model_name_loaded: Optional[str] = None
-_whisper_device: Optional[str] = None
-_WHISPER_LOCK = threading.Lock()
-
-
-def _get_whisper_model(model_name: str = "base"):
-    """
-    Carrega o modelo faster-whisper de forma lazy.
-    faster-whisper é 3-5x mais rápido que openai-whisper com compute_type=int8_float16.
-    """
-    global _whisper_model, _whisper_device, _whisper_model_name_loaded
-    with _WHISPER_LOCK:
-        if _whisper_model is not None and _whisper_model_name_loaded == model_name:
-            return _whisper_model, _whisper_device
-
-    # Descarregar modelo anterior se trocar de tamanho
-    if _whisper_model is not None:
-        del _whisper_model
-        _whisper_model = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Carregando faster-whisper '{model_name}' em {device}…")
-
-    try:
-        from faster_whisper import WhisperModel
-        compute_type = "int8_float16" if device == "cuda" else "int8"
-        model = WhisperModel(model_name, device=device, compute_type=compute_type)
-        _whisper_model = model
-        _whisper_device = device
-        _whisper_model_name_loaded = model_name
-        logger.info(f"faster-whisper '{model_name}' pronto em {device} (compute: {compute_type}).")
-        return _whisper_model, _whisper_device
-    except ImportError:
-        # Fallback para openai-whisper se faster-whisper não estiver instalado
-        logger.warning("faster-whisper não instalado, usando openai-whisper (mais lento). Execute: pip install faster-whisper")
-        try:
-            import whisper
-            model = whisper.load_model(model_name, device=device)
-            _whisper_model = model
-            _whisper_device = device
-            _whisper_model_name_loaded = model_name
-            return _whisper_model, _whisper_device
-        except Exception as e:
-            logger.error(f"Falha ao carregar Whisper: {e}", exc_info=True)
-            return None, None
-    except Exception as e:
-        logger.error(f"Falha ao carregar faster-whisper: {e}", exc_info=True)
-        return None, None
-
-
-def unload_whisper():
-    """Descarrega o Whisper e libera memória GPU/CPU."""
-    global _whisper_model, _whisper_device, _whisper_model_name_loaded
-    if _whisper_model is not None:
-        del _whisper_model
-        _whisper_model = None
-        _whisper_device = None
-        _whisper_model_name_loaded = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        logger.info("Modelo Whisper descarregado.")
-
-
+# Modelos carregados via manhwa_app.models
 # ---------------------------------------------------------------------------
 # Helpers de texto
 # ---------------------------------------------------------------------------
 
 def split_into_paragraphs(text: str) -> List[str]:
     """
-    Divide o texto em parágrafos separados por duas ou mais linhas em branco.
-    • Normaliza CR/LF → LF.
-    • Colapsa newlines simples dentro de um parágrafo em espaços.
-    • Ignora parágrafos vazios ou com menos de 3 caracteres.
+    Divide o texto em parágrafos.
+    O usuário utiliza Enter para separar parágrafos correspondentes a 1 arquivo de áudio.
     """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    raw = re.split(r"\n{2,}", text)
+    # Separa quebras explícitas (1 ou mais newlines representam parágrafos distintos)
+    raw = re.split(r"\n+", text)
+    
     result = []
-    for p in raw:
-        clean = " ".join(line.strip() for line in p.split("\n") if line.strip())
-        if clean and len(clean) >= 3:
-            result.append(clean)
+    
+    for block in raw:
+        clean_block = block.strip()
+        if clean_block and len(clean_block) >= 3:
+            result.append(clean_block)
+            
     return result
 
 
@@ -177,7 +119,7 @@ def _normalize_text_for_tts(text: str, lang: str = "en") -> str:
     # 1) Normalizar espaços duplos
     text = re.sub(r' {2,}', ' ', text)
 
-    # 2) Para ling. latinas (es, pt, it, fr): substituir vírgulas por pausa mais longa.
+    # 2) Para ling. latinas (es, pt, it, fr, de): substituir vírgulas por pausa mais longa.
     #    O alinhador trata vírgulas consecutivas como repetição de token e força EOS.
     if lang in ("es", "pt", "it", "fr", "de"):
         # Vírgula seguida de espaço e palavra -> ponto e vírgula (pausa mais longa e token distinto)
@@ -197,38 +139,6 @@ def _text_similarity(a: str, b: str) -> float:
     """Similaridade normalizada SequenceMatcher em [0, 1]."""
     return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
 
-
-# ---------------------------------------------------------------------------
-# Transcrição Whisper
-# ---------------------------------------------------------------------------
-
-def transcribe_audio(wav_path: str, whisper_model_name: str = "base") -> str:
-    """
-    Transcreve um WAV com faster-whisper (ou openai-whisper como fallback).
-    Usa amostragem dos primeiros 10s para validarção rápida — 80% mais rápido em áudios longos.
-    """
-    model, device = _get_whisper_model(whisper_model_name)
-    if model is None:
-        return ""
-    try:
-        # Tentar API do faster-whisper primeiro
-        if hasattr(model, 'transcribe') and hasattr(model, 'supported_languages'):
-            # faster-whisper: transcrevemos apenas os primeiros 10 segundos
-            segments, _ = model.transcribe(
-                wav_path,
-                beam_size=1,
-                language=None,
-                clip_timestamps="0,10",  # Amostragem: primeiros 10s
-                vad_filter=True,
-            )
-            return " ".join(s.text for s in segments).strip()
-        else:
-            # openai-whisper fallback
-            result = model.transcribe(wav_path, fp16=(device == "cuda"))
-            return result.get("text", "").strip()
-    except Exception as e:
-        logger.error(f"Transcrição Whisper falhou para {wav_path}: {e}", exc_info=True)
-        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -255,8 +165,8 @@ def _remove_silence_from_file(wav_path: str, out_path: str, sample_rate: int) ->
         audio_arr = _utils.trim_lead_trail_silence(
             audio_arr,
             sr,
-            silence_threshold_db=-40.0,
-            padding_ms=200,  # manter 200ms de padding natural
+            silence_threshold_db=-35.0,  # Menos agressivo para não cortar o final das palavras
+            padding_ms=400,              # Aumentado para manter respiração/eco natural no final
         )
 
         # Passo 2: encurtar silêncios internos longos
@@ -349,6 +259,9 @@ class AudioPipeline(QObject):
         fx_enhancer: bool = False,
         fx_normalize: bool = False,
         use_spacy: bool = False,
+        qwen_task: str = "CustomVoice",
+        qwen_instruct: str = "",
+        qwen_ref_text: str = "",
         parent=None,
     ):
         super().__init__(parent)
@@ -380,6 +293,9 @@ class AudioPipeline(QObject):
         self.fx_enhancer           = fx_enhancer
         self.fx_normalize          = fx_normalize
         self.use_spacy             = use_spacy
+        self.qwen_task             = qwen_task
+        self.qwen_instruct         = qwen_instruct
+        self.qwen_ref_text         = qwen_ref_text
         self._cancelled            = False
         
         # Otimização CPU: usar todas as threads disponíveis para processamento paralelo (FX, SpaCy)
@@ -439,6 +355,81 @@ class AudioPipeline(QObject):
             self.log_message.emit(f"❌ Erro interno no pipeline: {e}")
             self.finished.emit(False, f"Erro interno: {e}")
 
+    def _find_resume_index(self, audios_dir: Path, all_paragraphs: list) -> int:
+        """
+        Transcreve os últimos 3 áudios gerados e faz fuzzy match iterativo para descobrir o ponto exato de parada.
+        Retorna o índice (0-based) de onde a lista all_paragraphs deve retomar.
+        """
+        import difflib, unicodedata, re
+
+        wav_files = []
+        for f in audios_dir.glob("audio_*.wav"):
+            try:
+                num = int(f.stem.split('_')[1])
+                wav_files.append((num, f))
+            except (IndexError, ValueError):
+                pass
+
+        if not wav_files:
+            return 0
+
+        wav_files.sort(key=lambda x: x[0])
+        check_files = wav_files[-3:]
+        
+        if self.tts_engine == "qwen":
+            self.log_message.emit("⚡ Qwen ativo: Bypass da verificação Whisper no Resume para economizar VRAM. Assumindo índice sequecial ativo.")
+            return wav_files[-1][0]
+
+        model, _ = get_whisper_model(self.whisper_model)
+        if model is None:
+            self.log_message.emit("⚠ Whisper não disponível. Assumindo índice de forma passiva.")
+            return wav_files[-1][0]
+
+        def _normalize(t):
+            t = unicodedata.normalize('NFKD', t.lower()).encode('ASCII', 'ignore').decode('utf-8')
+            t = re.sub(r'[^a-z0-9\s]', '', t)
+            return re.sub(r'\s+', ' ', t).strip()
+
+        best_overall_index = 0
+
+        for num, wav_path in check_files:
+            try:
+                # faster-whisper returns segments, openai-whisper returns dict
+                if hasattr(model, 'transcribe') and hasattr(model, 'supported_languages'):
+                    segments, _ = model.transcribe(str(wav_path), beam_size=5)
+                    transcribed = " ".join(seg.text for seg in segments)
+                else:
+                    result = model.transcribe(str(wav_path), fp16=torch.cuda.is_available())
+                    transcribed = result.get("text", "")
+
+                norm_transcribed = _normalize(transcribed)
+                
+                # Procura correspondência na janela de tolerância de +/- 10
+                start_search = max(0, num - 10)
+                end_search = min(len(all_paragraphs), num + 10)
+                
+                best_match_idx = -1
+                best_ratio = 0.0
+                
+                for i in range(start_search, end_search):
+                    norm_orig = _normalize(all_paragraphs[i][0])
+                    sm = difflib.SequenceMatcher(None, norm_transcribed, norm_orig)
+                    ratio = sm.ratio()
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_match_idx = i
+                        
+                if best_ratio > 0.70 and best_match_idx >= 0:
+                    self.log_message.emit(f"  ✓ Validou áudio #{num} correspondente ao índice {best_match_idx} do texto original.")
+                    best_overall_index = max(best_overall_index, best_match_idx + 1)
+            except Exception as e:
+                self.log_message.emit(f"  ⚠ Resumo: Falha ao analisar {wav_path.name}: {e}")
+                
+        if best_overall_index == 0:
+            self.log_message.emit("  ⚠ Não encontrou match seguro. Recomeçando do zero.")
+            
+        return best_overall_index
+
     def _run_internal(self, start_time: float):
         # Verificar se engine/utils/config foram importados com sucesso
         if not _ENGINE_AVAILABLE or _engine is None or _utils is None or _config_manager is None:
@@ -469,6 +460,15 @@ class AudioPipeline(QObject):
         
         self._log_vram("Início do Pipeline")
 
+        # Flush agressivo de VRAM antes de começar o pipeline
+        # CORRIGIDO: garante que erros de runs anteriores não deixem VRAM presa
+        try:
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
         # -------- Lê e separa os parágrafos de todos os .txt --------
         # all_paragraphs contém: (texto, source_file, voice_path, lang)
         all_paragraphs: List[Tuple[str, str, Optional[str], str]] = []
@@ -486,7 +486,7 @@ class AudioPipeline(QObject):
             paragraphs = split_into_paragraphs(text)
             self.log_message.emit(
                 f"✓ {len(paragraphs)} parágrafo(s) em '{Path(txt_path).name}' "
-                f"(Idioma: {lang}, Voz: {'Padrão' if not voice_path else Path(voice_path).stem})."
+                f"(Idioma: {lang,}, Voz: {'Padrão' if not voice_path else Path(voice_path).stem})."
             )
             for p in paragraphs:
                 all_paragraphs.append((p, Path(txt_path).name, voice_path, lang))
@@ -534,6 +534,8 @@ class AudioPipeline(QObject):
         paragrafos_map: Dict[int, dict] = {}
 
         # Pre-loading de modelos pesados ANTES do loop principal
+        use_whisper_verification = (self.similarity_threshold > 0.0)
+        
         if self.use_spacy:
             self.log_message.emit("Pre-carregando SpaCy (NLP)…")
             # Inicializa SpaCy para cada idioma único presente
@@ -541,38 +543,144 @@ class AudioPipeline(QObject):
             for lng in langs_in_use:
                 init_spacy(lng)
 
-        # Whisper: carregar apenas se threshold > 0 (verificação ativa)
-        use_whisper_verification = self.similarity_threshold > 0
-        if use_whisper_verification:
-            self.log_message.emit(f"Pre-carregando faster-whisper ({self.whisper_model}) para verificação de qualidade…")
-            # Carrega Whisper em thread paralela enquanto TTS já está pronto
-            import threading as _wt
-            _wt.Thread(target=_get_whisper_model, args=(self.whisper_model,), daemon=True).start()
+        # ---- Desativa verificações e recargas desnecessárias se for Qwen ----
+        if self.tts_engine == "qwen":
+            use_whisper_verification = False
+            self.log_message.emit("⚡ Otimização: Whisper desativado para o Qwen.")
+        else:
+            if use_whisper_verification:
+                self.log_message.emit(f"Carregando faster-whisper ({self.whisper_model}) para verificação de qualidade…")
+                get_whisper_model(self.whisper_model)  # síncrono — garante disponibilidade no loop
 
         # Definir seed globalmente UMA VEZ antes do loop (não a cada parágrafo)
+        # CORRIGIDO: envolvido em try/except — se GPU estiver em estado de erro
+        # de um pipeline anterior (ex: cudaErrorLaunchTimeout), manual_seed_all()
+        # lança exceção FORA do try/except de síntese, quebrando _run_internal desde
+        # o início sem mensagem de erro útil.
         if self.seed != 0 and self.tts_engine == "chatterbox":
-            import engine as _eng_ref
-            _eng_ref.set_seed(self.seed)
-            self.log_message.emit(f"Seed global definida: {self.seed}")
+            try:
+                import engine as _eng_ref
+                _eng_ref.set_seed(self.seed)
+                self.log_message.emit(f"Seed global definida: {self.seed}")
+            except Exception as _seed_err:
+                self.log_message.emit(f"  ⚠ set_seed falhou (GPU pode estar em estado de erro): {str(_seed_err)[:80]}")
+                # Não abortar — a síntese pode ainda funcionar sem seed global
 
         self.log_message.emit(f"🚀 Iniciando Geração de {total} parágrafo(s) (sequencial, GPU otimizada)...")
 
         kokoro_models_cache = {}
 
-        for idx, (paragraph, source_file, voice_path, lang) in enumerate(all_paragraphs, start=1):
+        # -------- Sistema de Consistência Qwen3-TTS (Voice Clone Prompt Caching) --------
+        qwen_cached_prompt = None
+        is_saved_voice_preset = False
+        effective_task = self.qwen_task
+        
+        if self.tts_engine == "qwen" and all_paragraphs:
+            try:
+                # O primeiro parágrafo dita o voice_path global da geração
+                _, _, global_voice_path, _ = all_paragraphs[0]
+                
+                if global_voice_path and str(global_voice_path).endswith('.pt'):
+                    self.log_message.emit(f"🧠 [Qwen3] Carregando Preset de Voz Salva: {Path(global_voice_path).name}...")
+                    qwen_cached_prompt = torch.load(str(global_voice_path), weights_only=False)
+                    is_saved_voice_preset = True
+                    effective_task = "VoiceClone"
+                    self.log_message.emit("✓ [Qwen3] Voz Salva carregada na RAM com sucesso!")
+                
+                elif self.qwen_task == "VoiceClone" and self.qwen_ref_text and global_voice_path:
+                    self.log_message.emit("🧠 [Qwen3] Extraindo assinatura vocal do áudio de referência (Upfront Caching)...")
+                    q_model_base = get_qwen_model("VoiceClone")
+                    if q_model_base:
+                        qwen_cached_prompt = q_model_base.create_voice_clone_prompt(
+                            ref_audio=str(global_voice_path),
+                            ref_text=self.qwen_ref_text
+                        )
+                        self.log_message.emit("✓ [Qwen3] Assinatura salva em cache para consistência total.")
+                        
+                elif self.qwen_task == "VoiceDesign":
+                    self.log_message.emit("🧠 [Qwen3] Criando a voz a partir do zero no VoiceDesign...")
+                    design_model = get_qwen_model("VoiceDesign")
+                    
+                    if design_model is not None:
+                        # Fase 1: Gerar a voz mágica UMA VEZ
+                        dummy_text = "Esta é a assinatura vocal primária estabelecida para manter a consistência do projeto."
+                        with torch.inference_mode():
+                            ref_wavs, sr = design_model.generate_voice_design(
+                                text=dummy_text,
+                                language="Auto",
+                                instruct=self.qwen_instruct or "Uma voz padrão."
+                            )
+                        if ref_wavs and len(ref_wavs) > 0:
+                            # Fase 2: Mandar pro Base converter a gerada num Clone Prompt permanente
+                            self.log_message.emit("🧠 [Qwen3] Extraindo assinatura da voz recém-criada...")
+                            effective_task = "VoiceClone" # O resto da geração vai usar a voz clonada!
+                            self.qwen_task = "VoiceClone" # Atualiza a task global para VoiceClone
+                            q_model_base = get_qwen_model("VoiceClone")
+                            
+                            if q_model_base:
+                                qwen_cached_prompt = q_model_base.create_voice_clone_prompt(
+                                    ref_audio=(ref_wavs[0], sr),
+                                    ref_text=dummy_text
+                                )
+                                self.log_message.emit("✓ [Qwen3] Design base congelado e pronto para consistência.")
+                                
+            except Exception as qc_err:
+                self.log_message.emit(f"  ⚠ Erro ao preparar Qwen prompt prévio. Rodando instável: {qc_err}")
+                logger.error(f"Erro no cacher Qwen: {qc_err}", exc_info=True)
+                qwen_cached_prompt = None
+
+            # Pré-carrega APENAS o modelo efetivo para evitar 2 Loads seguidos que causam 1-2 min de atraso
+            self.log_message.emit(f"⚡ Preparando modelo principal Qwen3: {effective_task}")
+            _qwen_main = get_qwen_model(effective_task)
+            if _qwen_main and torch.cuda.is_available():
+                # Faz o block inference mode para compilar shaders SDPA/flash attention
+                with torch.inference_mode():
+                    try:
+                        self.log_message.emit("⚡ Executando Warmup do SDPA Attention Layer...")
+                        _qwen_main.generate_custom_voice(text="1", language="Auto", speaker="Ryan")
+                    except Exception:
+                        pass
+
+        # -------- Sistema de Recovery / Continuação Automática --------
+        start_index = 0
+        existing_audios = list(audios_dir.glob("audio_*.wav"))
+        if existing_audios:
+            start_index = self._find_resume_index(audios_dir, all_paragraphs)
+            if start_index > 0:
+                self.log_message.emit(f"🔄 Retomando geração a partir do parágrafo {start_index + 1}...")
+                
+                # Reconstrói os mapas prévios para não perder o log do que já foi feito na UI
+                for num, _ in [(int(f.stem.split('_')[1]), f) for f in existing_audios if f.stem.split('_')[1].isdigit()]:
+                    if num <= start_index:
+                        generated_map[num] = str(audios_dir / f"audio_{num}.wav")
+                        paragrafos_map[num] = {"index": num, "audio": f"audio_{num}.wav"}
+                        
+                completed = start_index
+                self.progress.emit(completed, total)
+
+        pending_paragraphs = all_paragraphs[start_index:]
+
+        for idx, (paragraph, source_file, voice_path, lang) in enumerate(pending_paragraphs, start=start_index + 1):
             if self._cancelled:
                 break
 
             wav_final = audios_dir / f"audio_{idx}.wav"
             wav_tmp   = audios_dir / f"audio_{idx}_tmp.wav"
             
-            # Limpeza estratégica no início de cada parágrafo
+            # CORRIGIDO: Restaurada a limpeza do cache para evitar WDDM swap (lentidão severa no Windows)
+            # que foi a causa relatada do aumento para ~2 mins por parágrafo
             if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                except Exception as _sync_err:
+                    self.log_message.emit(f"  ⚠ GPU sync/cache falhou (ignorado): {str(_sync_err)[:100]}")
 
             success  = False
             best_sim = 0.0
+
+            # Medição de tempo exato por parágrafo para detectar memory leak (ex: acúmulo de KV cache)
+            paragraph_start_time = time.time()
 
             for attempt in range(1, self.max_retries + 1):
                 if self._cancelled:
@@ -582,61 +690,156 @@ class AudioPipeline(QObject):
                 tts_text_input = paragraph
                 if self.use_spacy:
                     tts_text_input = process_text_fluency(tts_text_input, lang=lang)
+                
+                # Integrando o advanced_text_processor guiado por config
+                if _config_manager:
+                    advanced_text_config = _config_manager.get("production.text_processing", {
+                        "normalize_text": True,
+                        "remove_accents": False,
+                        "clean_symbols": True,
+                        "improve_punctuation": True,
+                        "add_natural_pauses": True,
+                        "lowercase": False,
+                        "use_phonetic": False
+                    })
+                    tts_text_input = process_text(tts_text_input, advanced_text_config)
+
+                # CORRIGIDO: normalização TTS específica para idiomas latinos
+                # Ex: espanhol com vírgulas causa EOS prematuro no alinhador Chatterbox.
+                # _normalize_text_for_tts já existia no módulo, mas não era chamada!
+                tts_text_input = _normalize_text_for_tts(tts_text_input, lang=lang)
+
+                # LOG DE DIAGNÓSTICO: mostra o texto que será enviado ao TTS (primeiros 120 chars)
+                if attempt == 1:
+                    preview = tts_text_input[:120].replace('\n', ' ')
+                    self.log_message.emit(f"  ℹ [#{idx}] Texto TTS (tentativa 1): '{preview}{'...' if len(tts_text_input) > 120 else ''}'")
 
                 # Pular parágrafos muito curtos (<10 chars) que disparam EOS imediato
                 if len(tts_text_input.strip()) < 10:
                     self.log_message.emit(f"  ⚠ [#{idx}] Parágrafo muito curto ignorado: '{tts_text_input[:40]}'")
-                    continue
+                    break  # CORRIGIDO: break para sair das tentativas, não 'continue' que reiniciava o loop
 
                 # ---- Síntese TTS ----
                 wav_tensor = None
                 sample_rate = 24000
 
                 try:
-                    if self.tts_engine == "chatterbox":
-                        # seed=0 aqui: já definimos globalmente antes do loop
-                        wav_tensor, sample_rate = engine.synthesize(
-                            text=tts_text_input,
-                            audio_prompt_path=voice_path,
-                            temperature=self.temperature,
-                            exaggeration=self.exaggeration,
-                            cfg_weight=self.cfg_weight,
-                            seed=0,  # seed já foi setada globalmente
-                            language=lang,
-                            min_p=self.min_p,
-                            top_p=self.top_p,
-                            top_k=self.top_k,
-                            repetition_penalty=self.repetition_penalty,
-                            norm_loudness=self.norm_loudness,
-                        )
-                    elif self.tts_engine == "kokoro":
-                        import models as kokoro_models
-                        voice_name = Path(voice_path).stem if voice_path else 'af_heart'
-                        k_lang_code = kokoro_models.get_language_code_from_voice(voice_name)
-                        k_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                    # 1. Chunking interno (para evitar TDR timeout e garantir 1 áudio final)
+                    MAX_CHUNK_LEN = 300
+                    text_chunks = [tts_text_input]
+                    if len(tts_text_input) > MAX_CHUNK_LEN:
+                        parts = re.split(r'(?<=[.!?])\s+', tts_text_input)
+                        text_chunks = []
+                        current_chunk = ""
+                        for p in parts:
+                            p = p.strip()
+                            if not p: continue
+                            if current_chunk and len(current_chunk) + len(p) + 1 > MAX_CHUNK_LEN:
+                                text_chunks.append(current_chunk)
+                                current_chunk = p
+                            else:
+                                current_chunk = current_chunk + " " + p if current_chunk else p
+                        if current_chunk:
+                            text_chunks.append(current_chunk)
+                    
+                    if len(text_chunks) > 1:
+                        self.log_message.emit(f"  ℹ [#{idx}] Texto muito longo. Dividido em {len(text_chunks)} partes internas.")
 
-                        if k_lang_code not in kokoro_models_cache:
-                            kokoro_models_cache[k_lang_code] = kokoro_models.build_model(None, k_device, lang_code=k_lang_code)
-                        k_pipeline = kokoro_models_cache[k_lang_code]
+                    all_wav_tensors = []
 
-                        rtx_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
-                        with torch.inference_mode():
-                            with torch.autocast(device_type="cuda" if k_device == "cuda" else "cpu", dtype=rtx_dtype) if k_device == "cuda" else contextlib.nullcontext():
-                                audio_res, _ = kokoro_models.generate_speech(
-                                    model=k_pipeline, text=tts_text_input, voice=voice_name,
-                                    lang=k_lang_code, device=k_device, speed=self.speed
-                                )
-                        if audio_res is not None:
-                            wav_tensor = audio_res.cpu().to(torch.float32).unsqueeze(0)
+                    for chunk_idx, chunk_text in enumerate(text_chunks):
+                        if self._cancelled: break
+                            
+                        chunk_wav = None
+                        if self.tts_engine == "chatterbox":
+                            chunk_wav, sample_rate = engine.synthesize(
+                                text=chunk_text,
+                                audio_prompt_path=voice_path,
+                                temperature=self.temperature,
+                                exaggeration=self.exaggeration,
+                                cfg_weight=self.cfg_weight,
+                                seed=0,  # seed setada globalmente
+                                language=lang,
+                                min_p=self.min_p,
+                                top_p=self.top_p,
+                                top_k=self.top_k,
+                                repetition_penalty=self.repetition_penalty,
+                                norm_loudness=self.norm_loudness,
+                            )
+                        elif self.tts_engine == "qwen":
+                            # effective_task já foi unificada e carregada globalmente antes do loop!
+                            q_model = get_qwen_model(effective_task)
+                            if q_model is not None:
+                                with torch.inference_mode():
+                                    try:
+                                        if qwen_cached_prompt is not None and (is_saved_voice_preset or self.qwen_task == "VoiceClone" or self.qwen_task == "VoiceDesign"):
+                                            # Roteando via Clone Gen usando o Prompt em Cache (Consistência Máxima e Muito Mais Rápido)
+                                            res_wavs, sr = q_model.generate_voice_clone(
+                                                text=chunk_text,
+                                                language="Auto",
+                                                voice_clone_prompt=qwen_cached_prompt
+                                            )
+                                        elif self.qwen_task == "VoiceClone" and self.qwen_ref_text and voice_path:
+                                            # Fallback sem cache
+                                            res_wavs, sr = q_model.generate_voice_clone(
+                                                text=chunk_text,
+                                                language="Auto",
+                                                ref_audio=str(voice_path),
+                                                ref_text=self.qwen_ref_text,
+                                            )
+                                        elif self.qwen_task == "VoiceDesign":
+                                            # Fallback sem cache (Nova voz será gereda, perdendo consistência!)
+                                            res_wavs, sr = q_model.generate_voice_design(
+                                                text=chunk_text,
+                                                language="Auto",
+                                                instruct=self.qwen_instruct,
+                                            )
+                                        else:
+                                            # CustomVoice (Presets)
+                                            # O valor do preset é passado como 'voice_path'
+                                            speaker_name = Path(voice_path).stem if voice_path else voice_path
+                                            # Trata fallback
+                                            if not speaker_name or speaker_name == "VoiceDesign" or Path(str(voice_path)).is_absolute():
+                                                speaker_name = "Vivian" # Fallback de segurança
+
+                                            res_wavs, sr = q_model.generate_custom_voice(
+                                                text=chunk_text,
+                                                language="Auto",
+                                                speaker=speaker_name,
+                                                instruct=self.qwen_instruct,
+                                            )
+                                        
+                                        if res_wavs and len(res_wavs) > 0:
+                                            # Transforma numpy -> float32 torch tensor em [1, samples]
+                                            chunk_wav = torch.tensor(res_wavs[0], dtype=torch.float32).unsqueeze(0)
+                                            sample_rate = sr
+                                    except Exception as qerr:
+                                        self.log_message.emit(f"  ✗ [Qwen] Falha na síntese do chunk: {qerr}")
+                                        logger.error(f"Erro no módulo Qwen3: {qerr}", exc_info=True)
+                        
+                        if chunk_wav is not None:
+                            all_wav_tensors.append(chunk_wav)
+                            
+                    if self._cancelled:
+                        continue
+                        
+                    if all_wav_tensors:
+                        # Concatena todos os pedaços (chunks) em um único tensor (array de áudio final)
+                        wav_tensor = torch.cat(all_wav_tensors, dim=-1)
+                    else:
+                        wav_tensor = None
 
                     if wav_tensor is not None:
                         utils.save_audio_tensor_to_file(wav_tensor, sample_rate, str(wav_tmp), output_format=self.output_format)
                         
-                        # Limpeza Imediata do Tensor de Áudio
+                        # Limpeza leve (garbage collector), preservando a alocação CUDA
                         del wav_tensor
                         if torch.cuda.is_available():
-                            torch.cuda.synchronize()  # Garante que GPU finalizou
-                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache() # Necessário no Windows para não exaurir VRAM
+                        
+                        paragraph_end_time = time.time()
+                        self.log_message.emit(f"  ⏱ ↳ Geração do parágrafo durou {paragraph_end_time - paragraph_start_time:.1f}s")
 
                         # ---- Verificação via Whisper: APENAS a partir da 2ª tentativa ----
                         # Na 1ª tentativa, confiar na síntese e pular STT (economiza ~15-30s/par.)
@@ -652,24 +855,45 @@ class AudioPipeline(QObject):
                             
                             # Limpeza Pós Whisper
                             if torch.cuda.is_available():
-                                torch.cuda.synchronize()  # Garante que Whisper encerrou
+                                # Sem synchronize() extra aqui — já foi feito após a síntese
                                 torch.cuda.empty_cache()
                                 gc.collect()
                                 self._log_vram(f"Pós-Whisper #{idx}")
 
                         # ---- Remoção de silêncio ----
-                        silence_out = str(wav_tmp).replace("_tmp", "_silence")
+                        # CORRIGIDO: str.replace("_tmp", "_silence") era frágil: se o CAMINHO
+                        # da pasta de saída contivesse "_tmp" (ex: pasta "tmp_test"),
+                        # o path de saída ficava corrompido. Usando stem/suffix agora.
+                        _wav_tmp_path = Path(str(wav_tmp))
+                        silence_out = str(_wav_tmp_path.with_name(_wav_tmp_path.stem.replace("_tmp", "_silence") + _wav_tmp_path.suffix))
                         final_path_no_fx = _remove_silence_from_file(str(wav_tmp), silence_out, sample_rate)
 
                         # ---- FX de áudio (opcionais) ----
-                        if self.fx_normalize or self.fx_reverb or self.fx_compressor or self.fx_noise_reduction:
+                        # CORRIGIDO: inclui todos os 6 flags de FX (antes faltavam fx_noise_reduction,
+                        # fx_highpass, fx_silence, fx_deesser — tornando os FX nunca ativados)
+                        _any_fx = (
+                            self.fx_noise_reduction or self.fx_compressor or
+                            self.fx_eq or self.fx_reverb or
+                            self.fx_enhancer or self.fx_normalize
+                        )
+                        if _any_fx:
+                            # CORRIGIDO: passa config dict com NOVOS nomes de chave que audio_fx.py espera
+                            # (audio_fx.py lê production.audio.* ou as chaves novas via fallback)
                             fx_config = {
+                                "production": {
+                                    "audio": {
+                                        "highpass":       self.fx_noise_reduction,   # mapeado ao antigo fx_noise_reduction
+                                        "compressor":     self.fx_compressor,
+                                        "reverb":         self.fx_reverb,
+                                        "normalize":      self.fx_normalize,
+                                        "remove_silence": self.fx_enhancer,          # reutilizado como "silence removal"
+                                    }
+                                },
+                                # Manter chaves antigas para retrocompatibilidade com audio_fx.py legado
                                 "fx_noise_reduction": self.fx_noise_reduction,
-                                "fx_compressor": self.fx_compressor,
-                                "fx_eq": self.fx_eq,
-                                "fx_reverb": self.fx_reverb,
-                                "fx_enhancer": self.fx_enhancer,
-                                "fx_normalize": self.fx_normalize,
+                                "fx_compressor":      self.fx_compressor,
+                                "fx_reverb":          self.fx_reverb,
+                                "fx_normalize":       self.fx_normalize,
                             }
                             apply_audio_post_processing(final_path_no_fx, str(wav_final), fx_config)
                         else:
@@ -681,50 +905,116 @@ class AudioPipeline(QObject):
                         break
 
                 except Exception as e:
-                    self.log_message.emit(f"  ✗ [#{idx}] Erro na síntese (tentativa {attempt}): {e}")
+                    err_msg = str(e)
+                    self.log_message.emit(f"  ✗ [#{idx}] Erro na síntese (tentativa {attempt}): {err_msg[:200]}")
+                    # CORRIGIDO: erros CUDA são assíncronos no Windows — a exceção aparece
+                    # na próxima operação de sync DEPOIS do kernel falhar. Reseta o estado
+                    # da GPU aqui para evitar que o erro se propague para o cleanup.
+                    if "cuda" in err_msg.lower() or "cudaer" in err_msg.lower() or "accelerator" in err_msg.lower():
+                        self.log_message.emit(f"  ⚠ Erro CUDA detectado. Resetando modelo e VRAM...")
+                        # CORRIGIDO: força descarga do modelo Chatterbox da VRAM
+                        # Sem isso, os ~11GB do modelo ficam "presos" após falha,
+                        # causando 'VRAM 0.0GB livre' em execuções subsequentes.
+                        try:
+                            import engine as _eng_reset
+                            _eng_reset.chatterbox_model = None
+                            _eng_reset.MODEL_LOADED = False
+                            logger.info("Engine Chatterbox resetado após erro CUDA.")
+                        except Exception:
+                            pass
+                        try:
+                            if torch.cuda.is_available():
+                                gc.collect()
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
                     _cleanup(wav_tmp)
 
             if success:
-                generated_map[idx] = str(wav_final)
-                paragrafos_map[idx] = {
-                    "index": idx,
-                    "audio": f"audio_{idx}.wav",
-                    "texto": paragraph,
-                    "arquivo_origem": source_file,
-                    "similaridade": round(best_sim, 3),
-                }
-                completed += 1
-                elapsed = time.time() - start_time
-                avg = elapsed / completed if completed > 0 else 0
-                eta = int(avg * (total - completed))
-                eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
-                self.progress.emit(completed, total)
-                
-                # Auto-detecção de degradação de performance
-                if self._baseline_avg == 0.0 and completed >= 2:
-                    self._baseline_avg = avg
-                elif self._baseline_avg > 0 and avg > self._baseline_avg * 1.8:
-                    self.log_message.emit(f"⚠️ Performance degradada ({avg:.1f}s/par vs baseline {self._baseline_avg:.1f}s). Defragmentando VRAM…")
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
-                        gc.collect()
-                
-                self.log_message.emit(f"  ✓ [#{idx}/{total}] Concluído em {elapsed:.1f}s total. ETA: {eta_s}")
-                self.paragraph_done.emit(idx, str(wav_final), paragraph)
+                # CORRIGIDO: verificar que o arquivo realmente existe antes de emitir
+                # Evita preencher a lista de áudios com paths inválidos
+                if wav_final.exists():
+                    generated_map[idx] = str(wav_final)
+                    paragrafos_map[idx] = {
+                        "index": idx,
+                        "audio": f"audio_{idx}.wav",
+                        "texto": paragraph,
+                        "arquivo_origem": source_file,
+                        "similaridade": round(best_sim, 3),
+                    }
+                    completed += 1
+                    elapsed = time.time() - start_time
+                    
+                    # Usa o tempo exato do gerador deste parágrafo (sem a lentidão acumulada da média geral)
+                    paragraph_time = time.time() - paragraph_start_time
+                    
+                    avg = elapsed / completed if completed > 0 else 0
+                    eta = int(avg * (total - completed))
+                    eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
+                    self.progress.emit(completed, total)
+
+                    # Auto-detecção de degradação de performance (Cache Leak / Fragmentação)
+                    is_degraded = (self._baseline_avg > 0 and paragraph_time > self._baseline_avg * 2.0)
+                    is_scheduled_reset = (completed > 0 and completed % 50 == 0)
+
+                    if self._baseline_avg == 0.0 and completed >= 2:
+                        self._baseline_avg = paragraph_time
+
+                    if is_degraded or is_scheduled_reset:
+                        reason = f"Parágrafo levou {paragraph_time:.1f}s vs Original {self._baseline_avg:.1f}s" if is_degraded else "Reset programado a cada 50 iterações"
+                        self.log_message.emit(f"♻️ Manutenção Preventiva VRAM ({reason}). Recarregando modelo...")
+                        
+                        # Limpa memória alocada do PyTorch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            gc.collect()
+                            
+                        # Reseta a engine TTS para matar memory leaks do Transformer (KV cache preso)
+                        if self.tts_engine == "chatterbox":
+                            try:
+                                import engine as _eng_reset
+                                _eng_reset.reload_model()
+                            except Exception as e:
+                                self.log_message.emit(f"  ⚠ Falha ao recarregar engine: {str(e)[:100]}")
+                        
+                        # Reseta o baseline para forçar uma nova aferição na próxima rodada limpa
+                        self._baseline_avg = 0.0
+
+                    self.log_message.emit(f"  ✓ [#{idx}/{total}] Concluído em {elapsed:.1f}s total. ETA: {eta_s}")
+                    self.paragraph_done.emit(idx, str(wav_final), paragraph)
+                else:
+                    self.log_message.emit(f"  ✗ [#{idx}] Síntese reportou sucesso mas arquivo não encontrado: {wav_final}")
             else:
                 self.log_message.emit(f"  ✗ [#{idx}] Falha após {self.max_retries} tentativa(s).")
 
         self._flush_log_buffer()  # Garante que logs pendentes são enviados
+
+        # CORRIGIDO: liberar cache Kokoro após pipeline (modelos ficam em VRAM entre re-execuções)
+        # CORRIGIDO: envolvido em try/except global — se GPU estiver em estado de erro (ex:
+        # após cudaErrorLaunchTimeout), operacoes CUDA podem relançar a exceção aqui
+        try:
+            for _k_model in kokoro_models_cache.values():
+                try:
+                    del _k_model
+                except Exception:
+                    pass
+            kokoro_models_cache.clear()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as _gpu_cleanup_err:
+            logger.warning(f"GPU cleanup após pipeline falhou (ignorado): {_gpu_cleanup_err}")
 
         # Monta resultados finais ordenados
         generated = [generated_map[k] for k in sorted(generated_map.keys())]
         paragrafos_json = [paragrafos_map[k] for k in sorted(paragrafos_map.keys())]
 
         # Liberar cache CUDA final
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+        except Exception:
+            pass
 
         # -------- Salvar paragrafos.json --------
         json_path = out_dir / "paragrafos.json"

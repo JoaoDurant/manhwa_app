@@ -33,6 +33,7 @@ from PySide6.QtGui import (
     QColor, QDragEnterEvent, QDropEvent, QFont, QPixmap,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -90,6 +91,14 @@ class ModelLoaderThread(QThread):
                         self.finished_loading.emit(False, "Falha Chatterbox")
                 else:
                     self.finished_loading.emit(True, f"Reutilizando {_engine.loaded_model_type}")
+
+            elif self.tts_engine == "qwen":
+                from manhwa_app.audio_pipeline import _get_qwen_model
+                q_model = _get_qwen_model("CustomVoice") # Always preload the cheapest one to initialize memory
+                if q_model is not None:
+                    self.finished_loading.emit(True, "Qwen3-TTS (CustomVoice/Base)")
+                else:
+                    self.finished_loading.emit(False, "Falha Qwen-TTS")
 
             elif self.tts_engine == "kokoro":
                 # Kokoro local load check
@@ -181,7 +190,21 @@ THEMES = {
         "danger":"#9b2d30","danger_txt":"#ffb8b8",
         "success":"#2d6b45","success_txt":"#8ce8b5","type":"dark",
     },
+    "🌟 Cyberpunk": {
+        "bg":"#0b0c10","surface":"#1f2833","surface2":"#45a29e",
+        "border":"rgba(102,252,241,0.2)","border2":"rgba(102,252,241,0.4)",
+        "accent":"#66fcf1","accent2":"#45a29e","accent3":"#c5c6c7",
+        "text":"#c5c6c7","subtext":"#66fcf1","dim":"#45a29e",
+        "tab_bg":"#12181f","tab_sel":"#1f2833","header_bg":"#050608",
+        "danger":"#ff003c","danger_txt":"#ff8a8a",
+        "success":"#00ff66","success_txt":"#aaffcc","type":"dark",
+    }
 }
+
+def natural_sort_key(s):
+    """Ordenação alfanumérica natural (ex: 2.png precede 10.png)."""
+    import re
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', str(s))]
 
 def _build_stylesheet(t: dict) -> str:
     light = t.get("type") == "light"
@@ -317,6 +340,7 @@ class TtsConfigTab(QWidget):
         self.engine_combo = QComboBox()
         self.engine_combo.addItem("Chatterbox TTS", "chatterbox")
         self.engine_combo.addItem("Kokoro TTS", "kokoro")
+        self.engine_combo.addItem("Qwen3-TTS (All)", "qwen")
         self.engine_combo.setToolTip("Qual motor gerador base usar.")
         self.engine_combo.setMinimumHeight(32)
         mg.addWidget(self.engine_combo, 0, 1)
@@ -457,25 +481,31 @@ class TtsConfigTab(QWidget):
         root.addWidget(whisper_group)
         
         # --- Efeitos de Áudio e Texto ---
-        fx_group = QGroupBox("✨ Efeitos e Processamento")
+        fx_group = QGroupBox("✨ Processamento Profissional FFmpeg")
         fxg = QGridLayout(fx_group)
         fxg.setSpacing(10)
         
         self.spacy_chk = QCheckBox("Pré-processar Texto (Adicionar Pausas / Dividir frases com spaCy)")
-        self.fx_nr_chk = QCheckBox("Noise Reduction (Leve)")
-        self.fx_enhancer_chk = QCheckBox("Enhancer (Isolamento de Voz Krisp-like)")
-        self.fx_comp_chk = QCheckBox("Compressor (Nivelar Dinâmica)")
-        self.fx_eq_chk = QCheckBox("EQ Leve (Grave + Presença)")
-        self.fx_reverb_chk = QCheckBox("Reverb Leve (Estúdio)")
-        self.fx_norm_chk = QCheckBox("Normalize (-1 dB)")
+        self.fx_highpass_chk = QCheckBox("Highpass (Corta Graves/Rumble)")
+        self.fx_deesser_chk = QCheckBox("De-esser (Suaviza sibilância 'S')")
+        self.fx_comp_chk = QCheckBox("Compressor (Nivela volume da voz)")
+        self.fx_silence_chk = QCheckBox("Remove Silêncio (> 0.5s)")
+        self.fx_reverb_chk = QCheckBox("Reverb Leve (Sala)")
+        self.fx_loudnorm_chk = QCheckBox("Loudnorm (-16 LUFS, Padrão Youtube)")
         
+        self.fx_highpass_chk.setChecked(True)
+        self.fx_deesser_chk.setChecked(True)
+        self.fx_comp_chk.setChecked(True)
+        self.fx_silence_chk.setChecked(True)
+        self.fx_loudnorm_chk.setChecked(True)
+
         fxg.addWidget(self.spacy_chk, 0, 0, 1, 2)
-        fxg.addWidget(self.fx_nr_chk, 1, 0)
-        fxg.addWidget(self.fx_enhancer_chk, 1, 1)
+        fxg.addWidget(self.fx_highpass_chk, 1, 0)
+        fxg.addWidget(self.fx_deesser_chk, 1, 1)
         fxg.addWidget(self.fx_comp_chk, 2, 0)
-        fxg.addWidget(self.fx_eq_chk, 2, 1)
+        fxg.addWidget(self.fx_silence_chk, 2, 1)
         fxg.addWidget(self.fx_reverb_chk, 3, 0)
-        fxg.addWidget(self.fx_norm_chk, 3, 1)
+        fxg.addWidget(self.fx_loudnorm_chk, 3, 1)
         
         root.addWidget(fx_group)
 
@@ -544,7 +574,8 @@ class TtsConfigTab(QWidget):
         if path and Path(path).exists():
             name = self.preset_config_combo.currentText()
             ans = QMessageBox.question(self, "Deletar", f"Tem certeza que deseja deletar o preset '{name}'?")
-            if ans == QMessageBox.Yes:
+            # CORRIGIDO: QMessageBox.Yes está depreciado — usar StandardButton.Yes
+            if ans == QMessageBox.StandardButton.Yes:
                 Path(path).unlink()
                 self._load_presets()
                 self.preset_config_combo.setCurrentIndex(0)
@@ -554,8 +585,8 @@ class TtsConfigTab(QWidget):
         self.model_combo.setCurrentIndex(0)
         self.temp_spin.setValue(0.65)
         self.speed_spin.setValue(1.0)
-        self.exag_spin.setValue(0.5)
-        self.cfg_spin.setValue(0.5)
+        self.exag_spin.setValue(0.55)
+        self.cfg_spin.setValue(0.60)
         self.seed_spin.setValue(3000)
         self.format_combo.setCurrentIndex(0)
         self.sample_rate_combo.setCurrentIndex(0)
@@ -570,28 +601,29 @@ class TtsConfigTab(QWidget):
         
         # Desliga todos os FX por padrão
         self.spacy_chk.setChecked(False)
-        self.fx_nr_chk.setChecked(False)
-        self.fx_enhancer_chk.setChecked(False)
-        self.fx_comp_chk.setChecked(False)
-        self.fx_eq_chk.setChecked(False)
+        self.fx_highpass_chk.setChecked(True)
+        self.fx_deesser_chk.setChecked(True)
+        self.fx_comp_chk.setChecked(True)
+        self.fx_silence_chk.setChecked(True)
         self.fx_reverb_chk.setChecked(False)
-        self.fx_norm_chk.setChecked(False)
+        self.fx_loudnorm_chk.setChecked(True)
 
     def _on_engine_change(self):
-        is_kokoro = self.engine_combo.currentData() == "kokoro"
+        eng = self.engine_combo.currentData()
         
-        # Oculta opções do Chatterbox
-        self.lbl_model_chatterbox.setVisible(not is_kokoro)
-        self.model_combo.setVisible(not is_kokoro)
-        self.exag_spin.setEnabled(not is_kokoro)
-        self.cfg_spin.setEnabled(not is_kokoro)
-        self.rep_spin.setEnabled(not is_kokoro)
-        self.norm_loudness_chk.setEnabled(not is_kokoro)
+        # Oculta/Desabilita opções do Chatterbox se não for chatterbox
+        self.lbl_model_chatterbox.setVisible(eng == "chatterbox")
+        self.model_combo.setVisible(eng == "chatterbox")
+        self.exag_spin.setEnabled(eng == "chatterbox")
+        self.cfg_spin.setEnabled(eng == "chatterbox")
+        self.rep_spin.setEnabled(eng == "chatterbox")
+        self.norm_loudness_chk.setEnabled(eng == "chatterbox")
         
-        # Atualiza a lista de vozes do AudioTab
+        # Atualiza a lista de vozes e a UI de Engine do AudioTab
         main_win = self.window()
         if hasattr(main_win, "audio_tab"):
             main_win.audio_tab._populate_voices()
+            main_win.audio_tab._update_engine_ui(eng)
         
         self._trigger_preload()
 
@@ -621,13 +653,27 @@ class TtsConfigTab(QWidget):
             "similarity_threshold": self.sim_spin.value(),
             "use_spacy": self.spacy_chk.isChecked(),
             "ref_vad_trimming": self.vad_chk.isChecked(),
-            "fx_noise_reduction": self.fx_nr_chk.isChecked(),
+            # CORRIGIDO: usar nomes corretos dos widgets criados em _setup_ui()
+            # (fx_nr_chk, fx_eq_chk, fx_enhancer_chk, fx_norm_chk não existem)
+            "fx_highpass":   self.fx_highpass_chk.isChecked(),
+            "fx_deesser":    self.fx_deesser_chk.isChecked(),
             "fx_compressor": self.fx_comp_chk.isChecked(),
-            "fx_eq": self.fx_eq_chk.isChecked(),
-            "fx_reverb": self.fx_reverb_chk.isChecked(),
-            "fx_enhancer": self.fx_enhancer_chk.isChecked(),
-            "fx_normalize": self.fx_norm_chk.isChecked(),
+            "fx_silence":    self.fx_silence_chk.isChecked(),
+            "fx_reverb":     self.fx_reverb_chk.isChecked(),
+            "fx_loudnorm":   self.fx_loudnorm_chk.isChecked(),
         }
+        
+        # Get Qwen params explicitly (since they belong to AudioTab but are vital for pipeline)
+        main_win = self.window()
+        if hasattr(main_win, "audio_tab"):
+            data["qwen_task"] = main_win.audio_tab.qwen_task_combo.currentText()
+            data["qwen_instruct"] = main_win.audio_tab.qwen_instruct.text().strip()
+            data["qwen_ref_text"] = main_win.audio_tab.qwen_ref_text.text().strip()
+        else:
+            data["qwen_task"] = "CustomVoice"
+            data["qwen_instruct"] = ""
+            data["qwen_ref_text"] = ""
+        return data
 
     def load_session(self, data):
         if "tts_engine" in data:
@@ -656,19 +702,23 @@ class TtsConfigTab(QWidget):
         if "similarity_threshold" in data: self.sim_spin.setValue(data["similarity_threshold"])
         if "use_spacy" in data: self.spacy_chk.setChecked(data["use_spacy"])
         if "ref_vad_trimming" in data: self.vad_chk.setChecked(data["ref_vad_trimming"])
-        if "fx_noise_reduction" in data: self.fx_nr_chk.setChecked(data["fx_noise_reduction"])
+        # CORRIGIDO: usar nomes corretos dos widgets; mapeamento de session keys antigas/novas
+        if "fx_highpass" in data: self.fx_highpass_chk.setChecked(data["fx_highpass"])
+        if "fx_deesser" in data: self.fx_deesser_chk.setChecked(data["fx_deesser"])
         if "fx_compressor" in data: self.fx_comp_chk.setChecked(data["fx_compressor"])
-        if "fx_eq" in data: self.fx_eq_chk.setChecked(data["fx_eq"])
+        if "fx_silence" in data: self.fx_silence_chk.setChecked(data["fx_silence"])
         if "fx_reverb" in data: self.fx_reverb_chk.setChecked(data["fx_reverb"])
-        if "fx_enhancer" in data: self.fx_enhancer_chk.setChecked(data["fx_enhancer"])
-        if "fx_normalize" in data: self.fx_norm_chk.setChecked(data["fx_normalize"])
+        if "fx_loudnorm" in data: self.fx_loudnorm_chk.setChecked(data["fx_loudnorm"])
+        # Mapeamento retrocompatível com sessões salvas antes da correção
+        if "fx_compressor" not in data and "fx_noise_reduction" in data:
+            self.fx_comp_chk.setChecked(data.get("fx_compressor", False))
 
     def reset_defaults(self):
         self.engine_combo.setCurrentIndex(0)
         self.temp_spin.setValue(0.65)
         self.speed_spin.setValue(1.0)
-        self.exag_spin.setValue(0.5)
-        self.cfg_spin.setValue(0.5)
+        self.exag_spin.setValue(0.55)
+        self.cfg_spin.setValue(0.60)
         self.seed_spin.setValue(3000)
         self.format_combo.setCurrentIndex(0)
         idx = self.sample_rate_combo.findData(24000)
@@ -683,12 +733,13 @@ class TtsConfigTab(QWidget):
         self.sim_spin.setValue(0.0)         # 0 = Whisper desabilitado (mais rápido)
         self.spacy_chk.setChecked(False)    # spaCy desabilitado por padrão
         self.vad_chk.setChecked(False)
-        self.fx_nr_chk.setChecked(False)
-        self.fx_comp_chk.setChecked(False)
-        self.fx_eq_chk.setChecked(False)
+        # CORRIGIDO: usar os nomes reais dos widgets de FX
+        self.fx_highpass_chk.setChecked(True)
+        self.fx_deesser_chk.setChecked(True)
+        self.fx_comp_chk.setChecked(True)
+        self.fx_silence_chk.setChecked(True)
         self.fx_reverb_chk.setChecked(False)
-        self.fx_enhancer_chk.setChecked(False)
-        self.fx_norm_chk.setChecked(False)
+        self.fx_loudnorm_chk.setChecked(True)
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +765,7 @@ class AudioTab(QWidget):
         self._current_run_all_project = ""
         self._playing_row = None
         self._chain_active = False
+        self._chain_index = 0   # CORRIGIDO: inicializar aqui para evitar AttributeError em _stop_audio
         self._setup_ui()
         self._player.playbackStateChanged.connect(self._on_playback_state)
 
@@ -781,6 +833,35 @@ class AudioTab(QWidget):
         lv.addWidget(vox_group)
         self._custom_voice_path = None
         
+        # --- Configurações Específicas do Qwen3 ---
+        self.qwen_group = QGroupBox("🧠 Instruções Qwen3")
+        qg = QGridLayout(self.qwen_group)
+        
+        qg.addWidget(QLabel("Módulo:"), 0, 0)
+        self.qwen_task_combo = QComboBox()
+        self.qwen_task_combo.addItems(["CustomVoice", "VoiceDesign", "VoiceClone"])
+        self.qwen_task_combo.setToolTip("CustomVoice=Presets; VoiceDesign=Criar do Zero; VoiceClone=Usar Referência")
+        qg.addWidget(self.qwen_task_combo, 0, 1)
+
+        qg.addWidget(QLabel("Prompt de Interpretação:"), 1, 0)
+        self.qwen_instruct = QLineEdit()
+        self.qwen_instruct.setPlaceholderText("Ex: Fale de forma assustada e ofegante...")
+        qg.addWidget(self.qwen_instruct, 1, 1)
+
+        self.lbl_qwen_ref_text = QLabel("Texto Referência:")
+        qg.addWidget(self.lbl_qwen_ref_text, 2, 0)
+        self.qwen_ref_text = QLineEdit()
+        self.qwen_ref_text.setPlaceholderText("Texto exato do áudio clonado (Para VoiceClone)")
+        qg.addWidget(self.qwen_ref_text, 2, 1)
+
+        self.btn_save_qwen = QPushButton("💾 Salvar Voz Atual (Prompt)")
+        self.btn_save_qwen.clicked.connect(self._save_qwen_voice)
+        qg.addWidget(self.btn_save_qwen, 3, 0, 1, 2)
+
+        lv.addWidget(self.qwen_group)
+        self.qwen_group.setVisible(False)
+        self.qwen_task_combo.currentIndexChanged.connect(self._on_qwen_task_change)
+
         # --- Preview de Voz ---
         preview_group = QGroupBox("Teste Rápido de Voz")
         p_layout = QHBoxLayout(preview_group)
@@ -934,15 +1015,17 @@ class AudioTab(QWidget):
             repetition_penalty=cfg.get("repetition_penalty", 1.2),
             norm_loudness=cfg.get("norm_loudness", True),
             ref_vad_trimming=cfg.get("ref_vad_trimming", False),
-            fx_noise_reduction=cfg.get("fx_noise_reduction", False),
+            # CORRIGIDO: usar novas chaves canonicas de FX (get_session retorna fx_highpass, fx_deesser, etc.)
+            fx_noise_reduction=cfg.get("fx_highpass", False),
             fx_compressor=cfg.get("fx_compressor", False),
-            fx_eq=cfg.get("fx_eq", False),
+            fx_eq=cfg.get("fx_deesser", False),
             fx_reverb=cfg.get("fx_reverb", False),
-            fx_enhancer=cfg.get("fx_enhancer", False),
-            fx_normalize=cfg.get("fx_normalize", False),
+            fx_enhancer=cfg.get("fx_silence", False),
+            fx_normalize=cfg.get("fx_loudnorm", False),
             use_spacy=cfg.get("use_spacy", False),
         )
         self._preview_thread = QThread()
+        self._preview_thread.setStackSize(16 * 1024 * 1024)  # Evita stack overflow silencioso com modelos grandes (Qwen)
         self._preview_pipeline.moveToThread(self._preview_thread)
         self._preview_thread.started.connect(self._preview_pipeline.run)
         
@@ -951,11 +1034,34 @@ class AudioTab(QWidget):
         self._preview_thread.start()
 
     def _on_preview_finished(self, success, msg):
-        self._preview_thread.quit()
-        self._preview_thread.wait()
+        if self._preview_thread:
+            self._preview_thread.quit()
+            self._preview_thread.wait()
+            self._preview_thread.deleteLater()
+            self._preview_thread = None
+            
+        if self._preview_pipeline:
+            self._preview_pipeline.deleteLater()
+            self._preview_pipeline = None
+
         
         self.btn_preview.setEnabled(True)
         self.btn_preview.setText("▶ Testar Voz")
+
+        # CORRIGIDO: limpar CUDA após preview para evitar estado corrompido
+        # O Chatterbox deixa tensores internos na stream CUDA após cada síntese.
+        # Sem este flush, após 2+ previews o próximo pipeline falha com
+        # cudaErrorDeviceSideAssert em embed_ref() → ref_wav.to(device).
+        try:
+            import torch, gc as _gc
+            if torch.cuda.is_available():
+                _gc.collect()
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        # Null out pipeline/thread refs já limpos
+
 
         if success:
             audios_dir = Path(self._preview_dir) / "preview" / "audios"
@@ -973,6 +1079,7 @@ class AudioTab(QWidget):
                 self._preview_effect.play()
         else:
             QMessageBox.warning(self, "Erro no Preview", f"Falha ao gerar o preview:\n{msg}")
+
 
     def _populate_voices(self):
         # Backup the current path so we can restore it if it's still available
@@ -997,9 +1104,9 @@ class AudioTab(QWidget):
                 def format_name_chatterbox(p):
                     return p.stem.replace("_", " ").title()
                     
-                for path in sorted(standard):
+                for path in sorted(standard, key=natural_sort_key):
                     self.preset_voice_combo.addItem(f"🔊 {format_name_chatterbox(path)}", str(path))
-                for path in sorted(cloned):
+                for path in sorted(cloned, key=natural_sort_key):
                     self.preset_voice_combo.addItem(f"👤 {format_name_chatterbox(path)} (Clonada)", str(path))
                     
         elif engine == "kokoro":
@@ -1021,26 +1128,129 @@ class AudioTab(QWidget):
                     return mapping.get(prefix, '[EN-US]')
 
                 voices = list(base_dir.glob("*.pt"))
-                for path in sorted(voices):
+                for path in sorted(voices, key=natural_sort_key):
                     name = path.stem
                     lang = get_kokoro_lang_str(name)
                     self.preset_voice_combo.addItem(f"✨ {lang} {name}", str(path))
+                    
+        elif engine == "qwen":
+            self.preset_voice_combo.addItem("Vivian (Female, Chinese, Lively)", "Vivian")
+            self.preset_voice_combo.addItem("Serena (Female, Chinese, Gentle)", "Serena")
+            self.preset_voice_combo.addItem("Uncle_Fu (Male, Chinese, Mellow)", "Uncle_Fu")
+            self.preset_voice_combo.addItem("Dylan (Male, Beijing Dialect, Clear)", "Dylan")
+            self.preset_voice_combo.addItem("Eric (Male, Sichuan Dialect, Bright)", "Eric")
+            self.preset_voice_combo.addItem("Ryan (Male, English, Dynamic)", "Ryan")
+            self.preset_voice_combo.addItem("Aiden (Male, English, Clear)", "Aiden")
+            self.preset_voice_combo.addItem("Ono_Anna (Female, Japanese, Playful)", "Ono_Anna")
+            self.preset_voice_combo.addItem("Sohee (Female, Korean, Warm)", "Sohee")
+            
+            qwen_dir = Path(__file__).parent / "qwen_voices"
+            if qwen_dir.exists():
+                for pt_file in sorted(qwen_dir.glob("*.pt"), key=natural_sort_key):
+                    self.preset_voice_combo.addItem(f"💾 {pt_file.stem} (Voz Salva)", str(pt_file))
                     
         if old_val:
             idx = self.preset_voice_combo.findData(old_val)
             if idx >= 0:
                 self.preset_voice_combo.setCurrentIndex(idx)
 
+    def _update_engine_ui(self, engine_mode: str):
+        # Oculta botões inuteis no Qwen
+        self.qwen_group.setVisible(engine_mode == "qwen")
+        self._on_qwen_task_change()
+
+    def _on_qwen_task_change(self):
+        task = self.qwen_task_combo.currentText()
+        is_clone = task == "VoiceClone"
+        self.lbl_qwen_ref_text.setVisible(is_clone)
+        self.qwen_ref_text.setVisible(is_clone)
+
+    def _save_qwen_voice(self):
+        task = self.qwen_task_combo.currentText()
+        if task == "CustomVoice":
+            QMessageBox.information(self, "Aviso", "CustomVoice usa presets nativos. Selecione VoiceDesign ou VoiceClone para salvar uma nova voz.")
+            return
+            
+        name, ok = QInputDialog.getText(self, "Salvar Voz", "Nome da voz (sem espaços curtos, ex: meu_narrador):")
+        if not ok or not name.strip():
+            return
+            
+        import re
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', name.strip())
+        save_path = Path(__file__).parent / "qwen_voices" / f"{safe_name}.pt"
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        ref_t = self.qwen_ref_text.text().strip()
+        ref_a = self._custom_voice_path
+        inst = self.qwen_instruct.text().strip()
+        
+        if task == "VoiceClone" and (not ref_a or not ref_t):
+            QMessageBox.warning(self, "Aviso", "Para salvar um VoiceClone, você precisa carregar um arquivo de áudio de referência e digitar o texto exato falado nele.")
+            return
+            
+        QMessageBox.information(self, "Salvando...", "A extração da assinatura vocal começará no fundo. Aguarde a mensagem de sucesso!")
+        
+        class SaveThread(QThread):
+            finished_ok = Signal(bool, str)
+            def __init__(self, s_path, tsk, r_t, r_a, ins):
+                super().__init__()
+                self.s_path = s_path
+                self.tsk = tsk
+                self.r_t = r_t
+                self.r_a = r_a
+                self.ins = ins
+            def run(self):
+                try:
+                    import torch
+                    from manhwa_app.audio_pipeline import _get_qwen_model
+                    if self.tsk == "VoiceClone":
+                        q_model = _get_qwen_model("VoiceClone")
+                        if not q_model:
+                            self.finished_ok.emit(False, "Falha ao carregar Base Model")
+                            return
+                        prompt = q_model.create_voice_clone_prompt(ref_audio=str(self.r_a), ref_text=self.r_t)
+                    else:
+                        design_model = _get_qwen_model("VoiceDesign")
+                        q_model = _get_qwen_model("VoiceClone")
+                        if not design_model or not q_model:
+                            self.finished_ok.emit(False, "Falha ao carregar Modelos Qwen")
+                            return
+                        with torch.inference_mode():
+                            ref_wavs, sr = design_model.generate_voice_design(
+                                text="Esta é a assinatura vocal primária estabelecida.",
+                                language="Auto",
+                                instruct=self.ins or "Uma voz padrão."
+                            )
+                        prompt = q_model.create_voice_clone_prompt(ref_audio=(ref_wavs[0], sr), ref_text="Esta é a assinatura vocal primária estabelecida.")
+                    
+                    torch.save(prompt, str(self.s_path))
+                    self.finished_ok.emit(True, f"Voz salva em: {self.s_path.name}")
+                except Exception as e:
+                    self.finished_ok.emit(False, str(e))
+                    
+        self._qwen_save_thread = SaveThread(save_path, task, ref_t, ref_a, inst)
+        self._qwen_save_thread.setStackSize(16 * 1024 * 1024)
+        def _on_save_done(ok, msg):
+            if ok:
+                QMessageBox.information(self, "Sucesso", msg)
+                self._populate_voices()
+            else:
+                QMessageBox.critical(self, "Erro", msg)
+        self._qwen_save_thread.finished_ok.connect(_on_save_done)
+        self._qwen_save_thread.start()
+
     def _add_files(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Selecionar Textos", "", "Textos (*.txt)")
-        for p in paths:
-            self._files.append({"path": p})
-        self._refresh_list()
+        if paths:
+            paths = sorted(paths, key=natural_sort_key)
+            for p in paths:
+                self._files.append({"path": p})
+            self._refresh_list()
 
     def _add_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Selecionar Pasta de Textos")
         if folder:
-            paths = sorted([str(p) for p in Path(folder).glob("*.txt")])
+            paths = sorted([str(p) for p in Path(folder).glob("*.txt")], key=natural_sort_key)
             for p in paths:
                 self._files.append({"path": p})
             self._refresh_list()
@@ -1098,6 +1308,9 @@ class AudioTab(QWidget):
 
     def _start_pipeline(self, configs, project_override=None):
         if not configs: return
+        # CORRIGIDO: evitar double-start se pipeline já estiver rodando
+        if self._worker_thread and self._worker_thread.isRunning():
+            return
         self.btn_generate.setEnabled(False)
         self.btn_run_all.setEnabled(False)
         self.btn_cancel.setEnabled(True)
@@ -1130,15 +1343,19 @@ class AudioTab(QWidget):
             repetition_penalty=cfg.get("repetition_penalty", 1.2),
             norm_loudness=cfg.get("norm_loudness", True),
             ref_vad_trimming=cfg.get("ref_vad_trimming", False),
-            fx_noise_reduction=cfg.get("fx_noise_reduction", False),
+            # CORRIGIDO: usar novas chaves de FX emitidas por get_session()
+            # AudioPipeline espera: fx_noise_reduction, fx_compressor, fx_reverb, fx_normalize, fx_enhancer
+            # Mapeamento: get_session() novo → AudioPipeline param
+            fx_noise_reduction=cfg.get("fx_highpass", False),   # highpass → noise_reduction (ativador geral de limpeza)
             fx_compressor=cfg.get("fx_compressor", False),
-            fx_eq=cfg.get("fx_eq", False),
+            fx_eq=cfg.get("fx_deesser", False),                  # deesser → eq slot
             fx_reverb=cfg.get("fx_reverb", False),
-            fx_enhancer=cfg.get("fx_enhancer", False),
-            fx_normalize=cfg.get("fx_normalize", False),
+            fx_enhancer=cfg.get("fx_silence", False),            # silence removal → enhancer slot
+            fx_normalize=cfg.get("fx_loudnorm", False),          # fx_loudnorm → normalize
             use_spacy=cfg.get("use_spacy", False),
         )
         self._worker_thread = QThread(self)
+        self._worker_thread.setStackSize(16 * 1024 * 1024)
         self._pipeline.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._pipeline.run)
         self._pipeline.log_message.connect(self._on_log)
@@ -1168,11 +1385,19 @@ class AudioTab(QWidget):
     @Slot(bool, str)
     def _on_done(self, success: bool, message: str):
         # Parar e aguardar a thread com timeout seguro
-        if self._worker_thread and self._worker_thread.isRunning():
-            self._worker_thread.quit()
-            if not self._worker_thread.wait(5000):  # 5s timeout
-                self._worker_thread.terminate()  # force if stuck
-                self._worker_thread.wait(2000)
+        if self._worker_thread:
+            if self._worker_thread.isRunning():
+                self._worker_thread.quit()
+                if not self._worker_thread.wait(5000):  # 5s timeout
+                    self._worker_thread.terminate()  # force if stuck
+                    self._worker_thread.wait(2000)
+            self._worker_thread.deleteLater()
+            self._worker_thread = None
+            
+        if self._pipeline:
+            self._pipeline.deleteLater()
+            self._pipeline = None
+            
         if success:
             self.progress_bar.setValue(100)
             paths = [g[1] for g in self._generated]
@@ -1270,11 +1495,14 @@ class AudioTab(QWidget):
             cfg_weight=cfg.get("cfg_weight", 0.5),
             seed=cfg.get("seed", 0)
         )
-        thread = QThread(self)
-        pipeline.moveToThread(thread)
+        self._regen_thread = QThread(self)
+        self._regen_pipeline = pipeline
+        self._regen_pipeline.moveToThread(self._regen_thread)
         def _on_regen_done(success, msg):
             Path(tmp_txt).unlink(missing_ok=True)
-            thread.quit()
+            self._regen_thread.quit()
+            # CORRIGIDO: aguardar a thread terminar para evitar 'QThread destroyed while running'
+            thread.wait(3000)   # timeout de 3s
             new_wav = (Path(self.output_root_edit.text().strip() or "output") / project / "audios" / "audio_1.wav")
             if success and new_wav.exists():
                 import shutil
@@ -1282,11 +1510,11 @@ class AudioTab(QWidget):
                 _append_log(self.log_text, f"✓ Áudio #{idx} regravado.")
             else:
                 _append_log(self.log_text, f"✗ Falha ao regravar #{idx}.")
-        thread.started.connect(pipeline.run)
-        pipeline.log_message.connect(self._on_log)
-        pipeline.finished.connect(_on_regen_done)
+        self._regen_thread.started.connect(self._regen_pipeline.run)
+        self._regen_pipeline.log_message.connect(self._on_log)
+        self._regen_pipeline.finished.connect(_on_regen_done)
         _append_log(self.log_text, f"↻ Regravando parágrafo #{idx}…")
-        thread.start()
+        self._regen_thread.start()
 
     def _open_output_folder(self):
         project = self.project_edit.text().strip() or "projeto"
@@ -1452,6 +1680,7 @@ class ImagesTab(QWidget):
             if Path(p).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
                 paths.append(p)
         if paths:
+            paths = sorted(paths, key=natural_sort_key)
             self._add_paths(paths)
             event.acceptProposedAction()
 
@@ -1460,7 +1689,9 @@ class ImagesTab(QWidget):
             self, "Selecionar imagens", "",
             "Imagens (*.png *.jpg *.jpeg *.webp *.bmp)"
         )
-        self._add_paths(paths)
+        if paths:
+            paths = sorted(paths, key=natural_sort_key)
+            self._add_paths(paths)
 
     def _load_from_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Selecionar pasta de imagens")
@@ -1470,7 +1701,7 @@ class ImagesTab(QWidget):
         paths = sorted(
             [str(p) for p in Path(folder).iterdir()
              if p.is_file() and p.suffix.lower() in exts],
-            key=lambda x: x.lower()
+            key=natural_sort_key
         )
         self._add_paths(paths)
 
@@ -1611,6 +1842,7 @@ class VideoTab(QWidget):
         self._image_paths: List[str] = []
         self._worker_thread: Optional[QThread] = None
         self._pipeline: Optional[VideoPipeline] = None
+        self._last_preview_path: Optional[str] = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -1699,6 +1931,34 @@ class VideoTab(QWidget):
         fxv.addLayout(trans_row)
         lv.addWidget(fx_group)
 
+        # Filtros de Vídeo e Movimentação (Production)
+        prod_group = QGroupBox("✨ Qualidade Visual & Movimento")
+        prod_v = QVBoxLayout(prod_group)
+        prod_grid = QGridLayout()
+        
+        self.chk_better_easing = QCheckBox("Easing Cinemático (Parabólico)")
+        self.chk_better_easing.setChecked(True)
+        self.chk_better_easing.setToolTip("Habilita movimento de câmera mais suave e natural nas extremidades")
+        prod_grid.addWidget(self.chk_better_easing, 0, 0, 1, 2)
+        
+        self.chk_color_grading = QCheckBox("Color Grading")
+        self.chk_color_grading.setChecked(True)
+        self.chk_color_grading.setToolTip("Contraste suave e saturação viva (evita imagem lavada)")
+        prod_grid.addWidget(self.chk_color_grading, 1, 0)
+        
+        self.chk_sharpen = QCheckBox("Sharpen")
+        self.chk_sharpen.setChecked(True)
+        self.chk_sharpen.setToolTip("Realça contornos levemente e nitidez geral")
+        prod_grid.addWidget(self.chk_sharpen, 1, 1)
+
+        self.chk_grain = QCheckBox("Film Grain Sutil")
+        self.chk_grain.setChecked(False)
+        self.chk_grain.setToolTip("Adiciona ruído cinematográfico de alta frequência à imagem final")
+        prod_grid.addWidget(self.chk_grain, 2, 0)
+        
+        prod_v.addLayout(prod_grid)
+        lv.addWidget(prod_group)
+
         # Música de Fundo
         bgm_group = QGroupBox("Música de Fundo (Opcional)")
         bgmv = QVBoxLayout(bgm_group)
@@ -1719,6 +1979,12 @@ class VideoTab(QWidget):
         self.bgm_vol_spin.setValue(10)
         self.bgm_vol_spin.setToolTip("Volume da música de fundo (padrão: 10%)")
         vol_row.addWidget(self.bgm_vol_spin)
+        
+        self.chk_auto_ducking = QCheckBox("Auto-Ducking")
+        self.chk_auto_ducking.setChecked(True)
+        self.chk_auto_ducking.setToolTip("Abaixa o volume da música automaticamente quando há narração")
+        vol_row.addWidget(self.chk_auto_ducking)
+        
         vol_row.addStretch()
         bgmv.addLayout(vol_row)
         lv.addWidget(bgm_group)
@@ -1737,11 +2003,21 @@ class VideoTab(QWidget):
         ov.addLayout(out_row)
         lv.addWidget(out_group)
 
+        # Botoes de Controle
+        buttons_layout = QHBoxLayout()
+        
+        self.btn_preview = QPushButton("👀 Preview (3 Cenas)")
+        self.btn_preview.setMinimumHeight(38)
+        self.btn_preview.clicked.connect(self._start_preview)
+        buttons_layout.addWidget(self.btn_preview)
+        
         self.btn_generate = QPushButton("🎬 Gerar Vídeo")
         self.btn_generate.setObjectName("primary")
         self.btn_generate.setMinimumHeight(38)
         self.btn_generate.clicked.connect(self._start_generation)
-        lv.addWidget(self.btn_generate)
+        buttons_layout.addWidget(self.btn_generate)
+        
+        lv.addLayout(buttons_layout)
 
         self.btn_cancel = QPushButton("✖ Cancelar")
         self.btn_cancel.setEnabled(False)
@@ -1750,7 +2026,7 @@ class VideoTab(QWidget):
         lv.addStretch()
         root.addWidget(left)
 
-        # Painel direito: progresso + log
+        # Painel direito: progresso + log + preview
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
@@ -1762,6 +2038,37 @@ class VideoTab(QWidget):
         self.progress_bar.setValue(0)
         pgv.addWidget(self.progress_bar)
         rv.addWidget(prog_group)
+
+        # QMediaPlayer embutido
+        self.video_group = QGroupBox("Player de Preview")
+        vpv = QVBoxLayout(self.video_group)
+        self.video_widget = QVideoWidget()
+        # Fixando explicitamente o tamanho em 16:9 (480x270) conforme pedido
+        self.video_widget.setFixedSize(480, 270)
+        # Player Backend
+        self.vp_player = QMediaPlayer()
+        self.vp_audio = QAudioOutput()
+        self.vp_player.setAudioOutput(self.vp_audio)
+        self.vp_player.setVideoOutput(self.video_widget)
+        self.vp_audio.setVolume(0.8)
+        
+        # Botões do Player
+        vp_btns = QHBoxLayout()
+        self.btn_vp_play = QPushButton("▶ Play")
+        self.btn_vp_pause = QPushButton("⏸ Pause")
+        self.btn_vp_stop = QPushButton("⏹ Stop")
+        self.btn_vp_play.clicked.connect(self.vp_player.play)
+        self.btn_vp_pause.clicked.connect(self.vp_player.pause)
+        self.btn_vp_stop.clicked.connect(self.vp_player.stop)
+        
+        for b in [self.btn_vp_play, self.btn_vp_pause, self.btn_vp_stop]:
+            b.setFixedWidth(80)
+            vp_btns.addWidget(b)
+        vp_btns.addStretch()
+
+        vpv.addWidget(self.video_widget)
+        vpv.addLayout(vp_btns)
+        rv.addWidget(self.video_group)
 
         log_group = QGroupBox("Log")
         logv = QVBoxLayout(log_group)
@@ -1775,11 +2082,7 @@ class VideoTab(QWidget):
         root.addWidget(right)
 
     def update_audio_paths(self, paths: List[str]):
-        import re
-        def _num(p):
-            m = re.search(r'audio_(\d+)', Path(p).name)
-            return int(m.group(1)) if m else 0
-        self._audio_paths = sorted(paths, key=_num)
+        self._audio_paths = sorted(paths, key=natural_sort_key)
         self._refresh_pairs()
 
     def update_image_paths(self, paths: List[str]):
@@ -1924,11 +2227,11 @@ class VideoTab(QWidget):
         p = Path(folder)
         audio_files = sorted(
             [str(f) for f in p.rglob("*") if f.is_file() and f.suffix.lower() in self._AUDIO_EXTS],
-            key=lambda x: x.lower()
+            key=natural_sort_key
         )
         image_files = sorted(
             [str(f) for f in p.rglob("*") if f.is_file() and f.suffix.lower() in self._IMAGE_EXTS],
-            key=lambda x: x.lower()
+            key=natural_sort_key
         )
         if not audio_files and not image_files:
             QMessageBox.information(self, "Pasta Vazia", "Nenhum arquivo de áudio ou imagem encontrado.")
@@ -1956,7 +2259,7 @@ class VideoTab(QWidget):
         p = Path(folder)
         audio_files = sorted(
             [str(f) for f in p.rglob("*") if f.is_file() and f.suffix.lower() in self._AUDIO_EXTS],
-            key=lambda x: x.lower()
+            key=natural_sort_key
         )
         if not audio_files:
             QMessageBox.information(self, "Sem Áudios", "Nenhum arquivo de áudio encontrado nessa pasta.")
@@ -1978,7 +2281,7 @@ class VideoTab(QWidget):
         p = Path(folder)
         image_files = sorted(
             [str(f) for f in p.rglob("*") if f.is_file() and f.suffix.lower() in self._IMAGE_EXTS],
-            key=lambda x: x.lower()
+            key=natural_sort_key
         )
         if not image_files:
             QMessageBox.information(self, "Sem Imagens", "Nenhuma imagem encontrada nessa pasta.")
@@ -2009,7 +2312,10 @@ class VideoTab(QWidget):
         if path:
             self.bgm_path_edit.setText(path)
 
-    def _start_generation(self):
+    def _start_preview(self):
+        self._start_generation(is_preview=True)
+
+    def _start_generation(self, is_preview=False):
         mode = self.layout_combo.currentData()
         if mode == "split":
             n = min(len(self._audio_paths) // 2, len(self._image_paths) // 2)
@@ -2041,13 +2347,28 @@ class VideoTab(QWidget):
                 output_path = str(proj_dir / f"{proj_name}_final.mp4")
             else:
                 output_path = "output/video.mp4"
+        # Preview Mode: Limita severamente o lote as 3 primeiras cenas e renomeia
+        if is_preview:
+            pairs = pairs[:3]
+            if not pairs:
+                QMessageBox.warning(self, "Sem pares", "Não há cenas suficientes para preview.")
+                return
+            p_out = Path(output_path)
+            output_path = str(p_out.with_name(f"{p_out.stem}_preview{p_out.suffix}"))
+            self.log_text.append("👀 MODO PREVIEW ATIVADO: Gerando apenas as primeiras 3 cenas!")
+            self._last_preview_path = output_path
+        else:
+            self._last_preview_path = None
+
         effect_mode = self.effect_combo.currentData() or "auto"
         transition_mode = self.transition_combo.currentData() or "fade"
         transition_time = self.transition_time_spin.value()
 
         self.btn_generate.setEnabled(False)
+        self.btn_preview.setEnabled(False)
         self.btn_cancel.setEnabled(True)
-        self.log_text.clear()
+        if not is_preview:
+            self.log_text.clear()
         self.progress_bar.setValue(0)
 
         bgm_path = self.bgm_path_edit.text().strip()
@@ -2058,7 +2379,8 @@ class VideoTab(QWidget):
                                        transition_mode=transition_mode,
                                        transition_time=transition_time,
                                        bg_music_path=bgm_path,
-                                       bg_music_volume=bgm_vol)
+                                       bg_music_volume=bgm_vol,
+                                       config=self.get_session())
         self._worker_thread = QThread(self)
         self._pipeline.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._pipeline.run)
@@ -2104,7 +2426,8 @@ class VideoTab(QWidget):
         self._pipeline = VideoPipeline(pairs=pairs, output_path=str(out_mp4),
                                        effect_mode=effect_mode,
                                        bg_music_path=bgm_path,
-                                       bg_music_volume=bgm_vol)
+                                       bg_music_volume=bgm_vol,
+                                       config=self.get_session())
         self._worker_thread = QThread(self)
         self._pipeline.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._pipeline.run)
@@ -2115,10 +2438,16 @@ class VideoTab(QWidget):
 
     @Slot(bool, str)
     def _on_done_run_all(self, success: bool, message: str):
-        self._worker_thread.quit()
-        self._worker_thread.wait()
-        self._worker_thread = None
-        self._pipeline = None
+        if self._worker_thread:
+            self._worker_thread.quit()
+            self._worker_thread.wait()
+            self._worker_thread.deleteLater()
+            self._worker_thread = None
+            
+        if self._pipeline:
+            self._pipeline.deleteLater()
+            self._pipeline = None
+            
         self.btn_generate.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         if success:
@@ -2143,14 +2472,32 @@ class VideoTab(QWidget):
 
     @Slot(bool, str)
     def _on_done(self, success: bool, message: str):
-        self._worker_thread.quit()
-        self._worker_thread.wait()
+        if self._worker_thread:
+            self._worker_thread.quit()
+            self._worker_thread.wait()
+            self._worker_thread.deleteLater()
+            self._worker_thread = None
+            
+        if self._pipeline:
+            self._pipeline.deleteLater()
+            self._pipeline = None
+            
         self.btn_generate.setEnabled(True)
+        self.btn_preview.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        
         if success:
             self.progress_bar.setValue(100)
             self.progress_bar.setFormat("Concluído!")
-            QMessageBox.information(self, "Vídeo Pronto", f"Vídeo salvo em:\n{message}")
+            
+            # Toca o Preview automaticamente se foi ativado
+            if self._last_preview_path and Path(self._last_preview_path).exists():
+                from PySide6.QtCore import QUrl
+                self.vp_player.setSource(QUrl.fromLocalFile(self._last_preview_path))
+                self.vp_player.play()
+                self._on_log(f"▶ Reproduzindo Preview na janela: {Path(self._last_preview_path).name}")
+            else:
+                QMessageBox.information(self, "Vídeo Pronto", f"Vídeo salvo em:\n{message}")
         else:
             QMessageBox.critical(self, "Falha na geração", message)
 
@@ -2171,8 +2518,21 @@ class VideoTab(QWidget):
             "effect": self.effect_combo.currentData(),
             "transition": self.transition_combo.currentData(),
             "transition_time": self.transition_time_spin.value(),
-            "bg_music_path": getattr(self, "bgm_path_edit", QLineEdit()).text().strip(),
-            "bg_music_volume": getattr(self, "bgm_vol_spin", QSpinBox()).value() if hasattr(self, "bgm_vol_spin") else 10
+            "bg_music_path": self.bgm_path_edit.text().strip() if hasattr(self, "bgm_path_edit") else "",
+            "bg_music_volume": self.bgm_vol_spin.value() if hasattr(self, "bgm_vol_spin") else 10,
+            "production": {
+                "video": {
+                    # CORRIGIDO: getattr(self, "chk_x", QCheckBox()).isChecked() criava widget descartável
+                    # que sempre retornava False. Usar hasattr + fallback True para valores de qualidade
+                    "better_easing":  self.chk_better_easing.isChecked() if hasattr(self, "chk_better_easing") else True,
+                    "color_grading":  self.chk_color_grading.isChecked() if hasattr(self, "chk_color_grading") else True,
+                    "sharpen":        self.chk_sharpen.isChecked() if hasattr(self, "chk_sharpen") else True,
+                    "film_grain":     self.chk_grain.isChecked() if hasattr(self, "chk_grain") else False,
+                },
+                "sound_design": {
+                    "auto_ducking":   self.chk_auto_ducking.isChecked() if hasattr(self, "chk_auto_ducking") else False,
+                }
+            }
         }
 
     def load_session(self, data: dict):
@@ -2191,6 +2551,21 @@ class VideoTab(QWidget):
             self.bgm_path_edit.setText(data["bg_music_path"])
         if hasattr(self, "bgm_vol_spin") and "bg_music_volume" in data:
             self.bgm_vol_spin.setValue(data["bg_music_volume"])
+            
+        prod = data.get("production", {})
+        vid = prod.get("video", {})
+        snd = prod.get("sound_design", {})
+        
+        if hasattr(self, "chk_better_easing"):
+            self.chk_better_easing.setChecked(vid.get("better_easing", True))
+        if hasattr(self, "chk_color_grading"):
+            self.chk_color_grading.setChecked(vid.get("color_grading", True))
+        if hasattr(self, "chk_sharpen"):
+            self.chk_sharpen.setChecked(vid.get("sharpen", True))
+        if hasattr(self, "chk_grain"):
+            self.chk_grain.setChecked(vid.get("film_grain", False))
+        if hasattr(self, "chk_auto_ducking"):
+            self.chk_auto_ducking.setChecked(snd.get("auto_ducking", True))
 
     def reset_defaults(self):
         self.layout_combo.setCurrentIndex(0)
@@ -2202,6 +2577,17 @@ class VideoTab(QWidget):
             self.bgm_path_edit.setText("")
         if hasattr(self, "bgm_vol_spin"):
             self.bgm_vol_spin.setValue(10)
+        
+        if hasattr(self, "chk_better_easing"):
+            self.chk_better_easing.setChecked(True)
+        if hasattr(self, "chk_color_grading"):
+            self.chk_color_grading.setChecked(True)
+        if hasattr(self, "chk_sharpen"):
+            self.chk_sharpen.setChecked(True)
+        if hasattr(self, "chk_grain"):
+            self.chk_grain.setChecked(False)
+        if hasattr(self, "chk_auto_ducking"):
+            self.chk_auto_ducking.setChecked(True)
 
 
 # ---------------------------------------------------------------------------
@@ -2220,11 +2606,11 @@ class MainWindow(QMainWindow):
         self._bg_overlay_alpha = 180  # 0-255 (dark themes ~180, light ~100)
         self._current_theme_key = "\U0001f311 Dark (Padr\u00e3o)"
         self._setup_ui()
+        self._loader_thread = None
         self._check_model_in_background()
         self._restore_session()
         
-        self._loader_thread = None
-        # Inicia primeiro preload
+        # Inicia primeiro preload (a checagem interna bloqueia duplicatas)
         self.trigger_model_preload()
 
     def trigger_model_preload(self):
@@ -2235,13 +2621,14 @@ class MainWindow(QMainWindow):
         engine_name = cfg.get("tts_engine", "chatterbox")
         model_type = cfg.get("model_type", "turbo")
 
-        if self._loader_thread and self._loader_thread.isRunning():
+        if hasattr(self, "_loader_thread") and self._loader_thread and self._loader_thread.isRunning():
             return # Já carregando
 
         self.model_status_label.setText("TTS: carregando…")
         self.model_status_label.setStyleSheet("color:#f0b040;font-size:11px;")
         
         self._loader_thread = ModelLoaderThread(engine_name, model_type)
+        self._loader_thread.setStackSize(16 * 1024 * 1024)
         self._loader_thread.finished_loading.connect(self._on_model_preloaded)
         self._loader_thread.start()
 
@@ -2498,11 +2885,9 @@ class MainWindow(QMainWindow):
                     if engine is None or not _ENGINE_AVAILABLE:
                         self_t.result.emit(False, "cpu", "engine não disponível")
                         return
-                    if not engine.MODEL_LOADED:
-                        ok = engine.load_model()
-                    else:
-                        ok = True
-                    device = engine.model_device or "cpu"
+                    
+                    ok = True
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
                     vram_info = ""
                     if torch.cuda.is_available():
                         props = torch.cuda.get_device_properties(0)
@@ -2544,6 +2929,7 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def _on_images_changed(self, paths: List[str]):
+        self.video_tab.update_image_paths(paths)
         self.images_tab.update_parity(
             len(self.audio_tab.get_generated_paths()),
             self.video_tab.get_images_per_audio()
@@ -2596,6 +2982,16 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         _save_session(self.get_session())
+        
+        # Força o encerramento de qualquer geração em andamento
+        for tab in [self.audio_tab, self.video_tab]:
+            if hasattr(tab, "_pipeline") and tab._pipeline:
+                tab._pipeline.cancel()
+            if hasattr(tab, "_worker_thread") and tab._worker_thread:
+                tab._worker_thread.quit()
+                tab._worker_thread.wait(2000)
+                
+
         try:
             import engine
             if engine.MODEL_LOADED and engine.chatterbox_model is not None:

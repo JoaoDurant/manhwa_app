@@ -16,6 +16,14 @@ import sys
 import os
 from pathlib import Path
 
+# -----------------------------------------------------------------------
+# NOTA: A variável CUDA_LAUNCH_BLOCKING=1 foi removida pois alterava o
+# scheduling interno do Chatterbox TTS causando device-side asserts.
+# Para resolver o cudaErrorLaunchTimeout (Windows WDDM TDR timeout),
+# a solução definitiva é aumentar o TdrDelay no registro do Windows:
+#   reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v TdrDelay /t REG_DWORD /d 60 /f
+#   (Reiniciar o PC após aplicar)
+
 # Ensure this file's directory (repo root) is on sys.path so that
 # engine.py, config.py, utils.py etc. are importable.
 ROOT_DIR = Path(__file__).resolve().parent

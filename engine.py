@@ -81,7 +81,7 @@ TURBO_PARALINGUISTIC_TAGS = [
     "shush",
 ]
 
-# --- Global Module Variables ---
+# --- Global Module Variables (Chatterbox) ---
 chatterbox_model: Optional[ChatterboxTTS] = None
 MODEL_LOADED: bool = False
 model_device: Optional[str] = (
@@ -91,7 +91,22 @@ model_device: Optional[str] = (
 # Track which model type is loaded
 loaded_model_type: Optional[str] = None  # "original" or "turbo"
 loaded_model_class_name: Optional[str] = None  # "ChatterboxTTS" or "ChatterboxTurboTTS"
-_synthesis_lock = threading.Lock()  # Lock para garantir que a GPU processe um por vez sem conflitos internos
+
+# FIX 1: _synthesis_lock é compartilhado entre Chatterbox e Qwen.
+# Garante que apenas UM modelo use a GPU por vez (previne corridas de VRAM e crash CUDA).
+_synthesis_lock = threading.Lock()
+
+# --- Global Module Variables (Qwen TTS Singleton) — FIX 5 ---
+try:
+    from qwen_tts import Qwen3TTSModel as _Qwen3TTSModel
+    _QWEN_TTS_CLASS_AVAILABLE = True
+except ImportError:
+    _Qwen3TTSModel = None  # type: ignore
+    _QWEN_TTS_CLASS_AVAILABLE = False
+
+qwen_model = None
+QWEN_LOADED: bool = False
+qwen_model_device: Optional[str] = None
 
 
 def set_seed(seed_value: int):
@@ -425,19 +440,11 @@ def load_model() -> bool:
             MODEL_LOADED = False
             return False
 
-        # --- torch.compile: compila o modelo para eliminar overhead de dispatch CUDA ---
-        # Modo 'reduce-overhead': ideal para inferência TTS com formas dinâmicas.
-        # fullgraph=False: mais seguro para modelos com control flow dinâmico.
-        if model_device == "cuda" and hasattr(torch, 'compile'):
-            try:
-                chatterbox_model.t3 = torch.compile(
-                    chatterbox_model.t3,
-                    mode="reduce-overhead",
-                    fullgraph=False,
-                )
-                logger.info("torch.compile aplicado ao modelo T3 (reduce-overhead). Primeira inferência compila JIT.")
-            except Exception as e_compile:
-                logger.warning(f"torch.compile falhou (não crítico): {e_compile}")
+        # FIX 2: torch.compile foi REMOVIDO daqui e movido para warmup_model().
+        # Razão: compile() é lazy — compila na 1ª forward pass, não na chamada.
+        # Se compile fosse feito antes do warmup, o warmup aqueceria o caminho não-compilado
+        # e a 1ª síntese real do usuário ainda dispararia o JIT (travamento de 10-30s).
+        # Agora: load_model() só carrega os pesos. warmup_model() aplica compile → faz forward dummy.
 
         return True
 
@@ -452,21 +459,82 @@ def load_model() -> bool:
 
 def warmup_model():
     """
-    Executa uma síntese dummy para eliminar a latência de cold-start do CUDA.
+    FIX 2 + FIX 3 + FIX 4: Executa warmup completo com torch.compile aplicado ANTES do forward dummy.
+    Cobre dois caminhos: síntese sem referência e síntese com clonagem de voz.
     Chame imediatamente após load_model() no thread de background.
     """
     global chatterbox_model, MODEL_LOADED, model_device
     if not MODEL_LOADED or chatterbox_model is None:
         return
+
+    # FIX 2 + FIX 4: Aplica torch.compile AQUI, antes do forward dummy.
+    # Agora o warmup dispara a compilação JIT — não a 1ª síntese real do usuário.
+    if model_device == "cuda" and hasattr(torch, 'compile'):
+        # Compila t3 (transformer de tokens)
+        if hasattr(chatterbox_model, 't3'):
+            try:
+                chatterbox_model.t3 = torch.compile(
+                    chatterbox_model.t3,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                )
+                logger.info("torch.compile aplicado ao T3. Warmup irá triggar compilação JIT.")
+            except Exception as e:
+                logger.warning(f"torch.compile no T3 falhou (não crítico): {e}")
+
+        # FIX 4: Tenta compilar s3gen (vocoder/flow-matching) com mode mais permissivo.
+        # s3gen pode ter control-flow dinâmico, por isso fullgraph=False é essencial.
+        if hasattr(chatterbox_model, 's3gen'):
+            try:
+                chatterbox_model.s3gen = torch.compile(
+                    chatterbox_model.s3gen,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                )
+                logger.info("torch.compile aplicado ao S3Gen.")
+            except Exception as e:
+                logger.warning(f"torch.compile no S3Gen falhou (não crítico, s3gen tem dynamic control flow): {e}")
+
+    # Warmup 1: síntese sem referência de áudio
     try:
-        logger.info("Warmup: executando síntese dummy para pre-alocar buffers CUDA...")
-        with torch.inference_mode():
-            chatterbox_model.generate("Hello.") if hasattr(chatterbox_model, 'generate') else None
+        logger.info("Warmup (sem ref): executando síntese dummy...")
+        with _synthesis_lock:  # FIX 1: usa o lock durante o warmup também
+            with torch.inference_mode():
+                if hasattr(chatterbox_model, 'generate'):
+                    chatterbox_model.generate("Hello.")
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        logger.info("Warmup concluído. GPU pronta para inferência.")
+        logger.info("Warmup sem referência concluído.")
     except Exception as e:
-        logger.warning(f"Warmup falhou (não crítico): {e}")
+        logger.warning(f"Warmup sem referência falhou (não crítico): {e}")
+
+    # FIX 3: Warmup 2 — cobre o caminho de clonagem de voz (encoder de speaker).
+    # A 1ª síntese real com áudio de referência não terá mais cold-start.
+    try:
+        import tempfile
+        import soundfile as sf
+        logger.info("Warmup (com ref simulada): aquecendo encoder de speaker...")
+        dummy_sr = chatterbox_model.sr if hasattr(chatterbox_model, 'sr') else 24000
+        dummy_audio_np = np.zeros(dummy_sr * 3, dtype=np.float32)  # 3s de silêncio
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        sf.write(tmp_path, dummy_audio_np, dummy_sr)
+        try:
+            with _synthesis_lock:  # FIX 1: usa o lock
+                with torch.inference_mode():
+                    if hasattr(chatterbox_model, 'generate'):
+                        chatterbox_model.generate("Hello.", audio_prompt_path=tmp_path)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            logger.info("Warmup com referência simulada concluído.")
+        finally:
+            import os
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"Warmup com referência falhou (não crítico): {e}")
 
 
 def synthesize(
@@ -529,42 +597,45 @@ def synthesize(
         else:
             autocast_ctx = contextlib.nullcontext()
 
-        with torch.inference_mode():
-            with autocast_ctx:
-                if loaded_model_type == "multilingual":
-                    wav_tensor = chatterbox_model.generate(
-                        text=text,
-                        language_id=language,
-                        audio_prompt_path=audio_prompt_path,
-                        temperature=temperature,
-                        exaggeration=exaggeration,
-                        cfg_weight=cfg_weight,
-                        min_p=min_p,
-                        top_p=top_p,
-                        repetition_penalty=repetition_penalty,
-                    )
-                elif loaded_model_type == "turbo":
-                    wav_tensor = chatterbox_model.generate(
-                        text=text,
-                        audio_prompt_path=audio_prompt_path,
-                        temperature=temperature,
-                        min_p=min_p,
-                        top_p=top_p,
-                        top_k=top_k,
-                        repetition_penalty=repetition_penalty,
-                        norm_loudness=norm_loudness,
-                    )
-                else:  # original
-                    wav_tensor = chatterbox_model.generate(
-                        text=text,
-                        audio_prompt_path=audio_prompt_path,
-                        temperature=temperature,
-                        exaggeration=exaggeration,
-                        cfg_weight=cfg_weight,
-                        min_p=min_p,
-                        top_p=top_p,
-                        repetition_penalty=repetition_penalty,
-                    )
+        # FIX 1: Envolve toda a geração com _synthesis_lock.
+        # Impede que 2 chamadas simultâneas a synthesize() colidam na GPU.
+        with _synthesis_lock:
+            with torch.inference_mode():
+                with autocast_ctx:
+                    if loaded_model_type == "multilingual":
+                        wav_tensor = chatterbox_model.generate(
+                            text=text,
+                            language_id=language,
+                            audio_prompt_path=audio_prompt_path,
+                            temperature=temperature,
+                            exaggeration=exaggeration,
+                            cfg_weight=cfg_weight,
+                            min_p=min_p,
+                            top_p=top_p,
+                            repetition_penalty=repetition_penalty,
+                        )
+                    elif loaded_model_type == "turbo":
+                        wav_tensor = chatterbox_model.generate(
+                            text=text,
+                            audio_prompt_path=audio_prompt_path,
+                            temperature=temperature,
+                            min_p=min_p,
+                            top_p=top_p,
+                            top_k=top_k,
+                            repetition_penalty=repetition_penalty,
+                            norm_loudness=norm_loudness,
+                        )
+                    else:  # original
+                        wav_tensor = chatterbox_model.generate(
+                            text=text,
+                            audio_prompt_path=audio_prompt_path,
+                            temperature=temperature,
+                            exaggeration=exaggeration,
+                            cfg_weight=cfg_weight,
+                            min_p=min_p,
+                            top_p=top_p,
+                            repetition_penalty=repetition_penalty,
+                        )
 
         # Ensure tensor is cast to float32 upon return so PySoundFile accepts it
         if wav_tensor is not None:
@@ -625,6 +696,201 @@ def reload_model() -> bool:
     # 6. Reload model from the (now updated) configuration
     logger.info("Memory cleared. Reloading model from updated config...")
     return load_model()
+
+
+
+# =============================================================================
+# FIX 5: Qwen TTS Singleton — espelha exatamente o padrão do Chatterbox.
+# O Qwen para de recarregar a cada chunk (x10-30 mais rápido).
+# =============================================================================
+
+def load_qwen_model() -> bool:
+    """
+    Carrega o Qwen3-TTS como singleton, espelhando o padrão do load_model() do Chatterbox.
+    Deve ser chamado UMA VEZ na inicialização, em thread de background.
+    O modelo persiste na VRAM até unload_qwen_model() ser chamado.
+    """
+    global qwen_model, QWEN_LOADED, qwen_model_device
+
+    if QWEN_LOADED:
+        logger.info("Qwen TTS já está carregado.")
+        return True
+
+    if not _QWEN_TTS_CLASS_AVAILABLE or _Qwen3TTSModel is None:
+        logger.error(
+            "qwen_tts.Qwen3TTSModel não disponível. "
+            "Execute: pip install --upgrade qwen-tts"
+        )
+        return False
+
+    try:
+        if _test_cuda_functionality():
+            qwen_model_device = "cuda"
+        else:
+            qwen_model_device = "cpu"
+
+        _optimize_for_device(qwen_model_device)
+
+        logger.info(f"Carregando Qwen3-TTS em {qwen_model_device}...")
+
+        # Detectar suporte bfloat16 antes de entrar em qualquer context CUDA
+        try:
+            bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        except Exception:
+            bf16_ok = False
+
+        qwen_model = _Qwen3TTSModel.from_pretrained(
+            "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            device_map="cuda:0" if qwen_model_device == "cuda" else "cpu",
+            dtype=torch.bfloat16 if bf16_ok else torch.float16,
+            attn_implementation="sdpa",  # SDPA: muito mais rápido em torch 2.1+
+        )
+
+        QWEN_LOADED = True
+        logger.info(f"Qwen3-TTS carregado com sucesso em {qwen_model_device}.")
+        return True
+
+    except Exception as e:
+        logger.error(f"Erro ao carregar Qwen3-TTS: {e}", exc_info=True)
+        QWEN_LOADED = False
+        return False
+
+
+def synthesize_qwen(
+    text: str,
+    speaker: str = "Ryan",
+    language: str = "Auto",
+    instruct: str = "",
+    voice_clone_prompt=None,
+) -> Tuple[Optional[torch.Tensor], Optional[int]]:
+    """
+    Sintetiza áudio com o Qwen3-TTS (singleton, mesmo padrão do Chatterbox).
+    O modelo deve já ter sido carregado por load_qwen_model().
+    Compartilha o _synthesis_lock com o Chatterbox — nunca rodam simultaneamente.
+    """
+    global qwen_model
+
+    if not QWEN_LOADED or qwen_model is None:
+        logger.error("Qwen3-TTS não está carregado. Chame load_qwen_model() primeiro.")
+        return None, None
+
+    use_cuda = (qwen_model_device == "cuda")
+    try:
+        bf16_ok = use_cuda and torch.cuda.is_bf16_supported()
+    except Exception:
+        bf16_ok = False
+
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if bf16_ok
+        else contextlib.nullcontext()
+    )
+
+    try:
+        # FIX 1: usa o mesmo _synthesis_lock do Chatterbox — nunca ambos na GPU
+        with _synthesis_lock:
+            with torch.inference_mode():
+                with autocast_ctx:
+                    if voice_clone_prompt is not None:
+                        res_wavs, sr = qwen_model.generate_voice_clone(
+                            text=text,
+                            language=language,
+                            voice_clone_prompt=voice_clone_prompt,
+                        )
+                    elif instruct:
+                        res_wavs, sr = qwen_model.generate_voice_design(
+                            text=text,
+                            language=language,
+                            instruct=instruct,
+                        )
+                    else:
+                        res_wavs, sr = qwen_model.generate_custom_voice(
+                            text=text,
+                            language=language,
+                            speaker=speaker,
+                        )
+
+        if res_wavs and len(res_wavs) > 0:
+            wav_np = res_wavs[0]
+            wav_tensor = torch.tensor(wav_np, dtype=torch.float32).unsqueeze(0)
+            return wav_tensor, sr
+
+        return None, None
+
+    except Exception as e:
+        logger.error(f"Erro na síntese Qwen3-TTS: {e}", exc_info=True)
+        return None, None
+
+
+def unload_qwen_model():
+    """
+    FIX 6: Libera o Qwen3-TTS da VRAM.
+    Chame antes de carregar Whisper para verificação de qualidade,
+    evitando conflito de VRAM (Qwen ~7-14GB + Whisper ~3GB = OOM em GPUs <=16GB).
+    """
+    global qwen_model, QWEN_LOADED, qwen_model_device
+
+    if qwen_model is not None:
+        del qwen_model
+        qwen_model = None
+    QWEN_LOADED = False
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    logger.info("Qwen3-TTS descarregado da VRAM.")
+
+
+# =============================================================================
+# FIX 6: Orquestração de VRAM — garante que apenas 1 modelo use a GPU por vez.
+# Evita OOM silencioso em GPUs de 12-16 GB quando Qwen + Chatterbox + Whisper
+# tentam coexistir (combinação que excede ~16 GB de VRAM facilmente).
+# =============================================================================
+
+def get_vram_free_gb() -> float:
+    """Retorna VRAM livre em GB. Retorna 999.0 se não for CUDA."""
+    if not torch.cuda.is_available():
+        return 999.0
+    free, _ = torch.cuda.mem_get_info()
+    return free / 1e9
+
+
+def ensure_only_chatterbox_loaded():
+    """
+    Garante que só o Chatterbox está na VRAM.
+    Descarrega o Qwen se necessário antes de carregar/usar o Chatterbox.
+
+    Uso:
+        ensure_only_chatterbox_loaded()
+        wav, sr = synthesize(text, ...)
+    """
+    if QWEN_LOADED:
+        logger.info("Descarregando Qwen3-TTS para liberar VRAM para Chatterbox...")
+        unload_qwen_model()
+
+
+def ensure_only_qwen_loaded():
+    """
+    Garante que só o Qwen3-TTS está na VRAM.
+    Descarrega o Chatterbox se necessário antes de carregar/usar o Qwen.
+
+    Uso:
+        ensure_only_qwen_loaded()
+        if not QWEN_LOADED:
+            load_qwen_model()
+        wav, sr = synthesize_qwen(text, ...)
+    """
+    global chatterbox_model, MODEL_LOADED
+    if MODEL_LOADED and chatterbox_model is not None:
+        logger.info("Descarregando Chatterbox para liberar VRAM para Qwen3-TTS...")
+        del chatterbox_model
+        chatterbox_model = None
+        MODEL_LOADED = False
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # --- End File: engine.py ---

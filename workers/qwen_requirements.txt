@@ -1,0 +1,17 @@
+# PyTorch com CUDA 12.8 para RTX 5070 Ti (Blackwell)
+# Instalar ANTES dos outros pacotes:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# Qwen3-TTS e dependencias modernas
+qwen-tts>=0.2.0
+transformers>=4.44.0
+accelerate>=0.30.0
+numpy>=2.0.0
+
+# Servidor worker
+flask>=3.0.0
+soundfile>=0.12.1
+
+# Otimizacoes de atencao (instalar separado — precisa de compilacao C)
+# flash-attn: pip install flash-attn --no-build-isolation
+# (opcional mas reduz tempo de geracao em ~40%)

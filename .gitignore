@@ -28,6 +28,7 @@ venv/
 */venv/
 env/
 */env/
+venv_*/
 
 # Ignore sensitive environment file
 .env
@@ -58,3 +59,4 @@ session_config.json
 error.txt
 .gemini/
 .agents/
+*.wav

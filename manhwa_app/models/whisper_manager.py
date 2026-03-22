@@ -72,8 +72,28 @@ def get_whisper_model(model_name: str = "base"):
                 logger.error("Nenhuma biblioteca Whisper disponível.")
                 return None, None
         except Exception as e:
-            logger.error(f"Falha ao carregar Whisper: {e}", exc_info=True)
-            return None, None
+            error_msg = str(e)
+            if "no kernel image" in error_msg or "sm_120" in error_msg or "sm_100" in error_msg:
+                logger.warning(
+                    f"INCOMPATIBILIDADE GPU DETECTADA NO WHISPER (RTX 50): {error_msg}. "
+                    "Tentando carregamento em CPU..."
+                )
+                try:
+                    if _FASTER_WHISPER_AVAILABLE:
+                        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+                    elif _OPENAI_WHISPER_AVAILABLE:
+                        model = whisper.load_model(model_name, device="cpu")
+                    _whisper_model = model
+                    _whisper_device = "cpu"
+                    _whisper_model_name_loaded = model_name
+                    logger.info(f"Whisper carregado em CPU com sucesso.")
+                    return _whisper_model, _whisper_device
+                except Exception as e_cpu:
+                    logger.error(f"Falha total no Whisper (GPU e CPU): {e_cpu}")
+                    return None, None
+            else:
+                logger.error(f"Falha ao carregar Whisper: {e}", exc_info=True)
+                return None, None
 
 
 def unload_whisper():

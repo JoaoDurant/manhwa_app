@@ -69,47 +69,38 @@ class ModelLoaderThread(QThread):
                 self.finished_loading.emit(False, "Engine não disponível")
                 return
 
-            # Atualiza config se necessário
+            # Para Chatterbox, o engine real é o subtipo (turbo, multilingual, original)
+            target = self.tts_engine
             if self.tts_engine == "chatterbox":
-                current = _config_manager.get_string("model.repo_id", "")
-                if current != self.model_type:
-                    _config_manager.update_and_save({"model": {"repo_id": self.model_type}})
+                target = self.model_type
+
+            logger.info(f"ModelLoaderThread: trocando para {target}")
+            
+            if _engine.switch_to_engine(target):
+                name_map = {
+                    "turbo": "Chatterbox Turbo",
+                    "multilingual": "Chatterbox Multilingual",
+                    "original": "Chatterbox Original",
+                    "qwen": "Qwen3-TTS",
+                    "indextts": "IndexTTS",
+                    "kokoro": "Kokoro TTS"
+                }
+                display_name = name_map.get(target, target.capitalize())
                 
-                # Se já carregado mas tipo diferente, limpa
-                if _engine.MODEL_LOADED and _engine.loaded_model_type != self.model_type:
-                    _engine.chatterbox_model = None
-                    _engine.MODEL_LOADED = False
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        gc.collect()
-
-                # Carrega
-                if not _engine.MODEL_LOADED:
-                    if _engine.load_model():
-                        self.finished_loading.emit(True, f"Chatterbox ({self.model_type})")
-                    else:
-                        self.finished_loading.emit(False, "Falha Chatterbox")
-                else:
-                    self.finished_loading.emit(True, f"Reutilizando {_engine.loaded_model_type}")
-
-            elif self.tts_engine == "qwen":
-                from manhwa_app.audio_pipeline import _get_qwen_model
-                q_model = _get_qwen_model("CustomVoice") # Always preload the cheapest one to initialize memory
-                if q_model is not None:
-                    self.finished_loading.emit(True, "Qwen3-TTS (CustomVoice/Base)")
-                else:
-                    self.finished_loading.emit(False, "Falha Qwen-TTS")
-
-            elif self.tts_engine == "kokoro":
-                # Kokoro local load check
-                kokoro_path = Path(__file__).resolve().parent.parent / "Kokoro-TTS-Local-master"
-                if str(kokoro_path) not in sys.path:
-                    sys.path.append(str(kokoro_path))
-                import models as k_models
-                # Apenas valida importação e disponibilidade
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                self.finished_loading.emit(True, f"Kokoro ({device.upper()})")
+                # Detect the actual device used (could be CPU fallback)
+                actual_device = "GPU"
+                try:
+                    if hasattr(_engine, "engine") and _engine.engine and hasattr(_engine.engine, "device"):
+                         if str(_engine.engine.device) == "cpu":
+                             actual_device = "CPU (Fallback)"
+                except: pass
+                
+                self.finished_loading.emit(True, f"{display_name} [{actual_device}]")
+            else:
+                self.finished_loading.emit(False, f"Falha ao carregar {target}")
+                
         except Exception as e:
+            logger.error(f"Erro no ModelLoaderThread: {e}", exc_info=True)
             self.finished_loading.emit(False, str(e))
 
 # ---------------------------------------------------------------------------
@@ -341,6 +332,7 @@ class TtsConfigTab(QWidget):
         self.engine_combo.addItem("Chatterbox TTS", "chatterbox")
         self.engine_combo.addItem("Kokoro TTS", "kokoro")
         self.engine_combo.addItem("Qwen3-TTS (All)", "qwen")
+        self.engine_combo.addItem("IndexTTS (Zero-Shot)", "indextts")
         self.engine_combo.setToolTip("Qual motor gerador base usar.")
         self.engine_combo.setMinimumHeight(32)
         mg.addWidget(self.engine_combo, 0, 1)
@@ -633,7 +625,7 @@ class TtsConfigTab(QWidget):
             main_win.trigger_model_preload()
 
     def get_session(self):
-        return {
+        data = {
             "tts_engine": self.engine_combo.currentData(),
             "model_type": self.model_combo.currentData(),
             "temperature": self.temp_spin.value(),
@@ -653,8 +645,6 @@ class TtsConfigTab(QWidget):
             "similarity_threshold": self.sim_spin.value(),
             "use_spacy": self.spacy_chk.isChecked(),
             "ref_vad_trimming": self.vad_chk.isChecked(),
-            # CORRIGIDO: usar nomes corretos dos widgets criados em _setup_ui()
-            # (fx_nr_chk, fx_eq_chk, fx_enhancer_chk, fx_norm_chk não existem)
             "fx_highpass":   self.fx_highpass_chk.isChecked(),
             "fx_deesser":    self.fx_deesser_chk.isChecked(),
             "fx_compressor": self.fx_comp_chk.isChecked(),
@@ -992,6 +982,8 @@ class AudioTab(QWidget):
         voice_val = self.preset_voice_combo.currentData()
         lang_val = self.preset_lang_combo.currentText()
         
+        print(f"[UI] Início do Preview | Engine: {cfg.get('tts_engine', 'chatterbox')} | Texto: {len(txt)} chars | Lang: {lang_val} | Voice: {voice_val}")
+        
         preview_configs = [{"path": str(tmp_txt_path), "voice": voice_val, "lang": lang_val}]
 
         self._preview_pipeline = AudioPipeline(
@@ -1031,9 +1023,12 @@ class AudioTab(QWidget):
         
         self._preview_pipeline.log_message.connect(lambda msg: _append_log(self.log_text, "[PREVIEW] " + msg))
         self._preview_pipeline.finished.connect(self._on_preview_finished)
+        
+        print("[UI] Criando thread de background para o AudioPipeline...")
         self._preview_thread.start()
 
     def _on_preview_finished(self, success, msg):
+        print(f"[UI] Fim do Preview | Sucesso: {success} | Msg: {msg}")
         if self._preview_thread:
             self._preview_thread.quit()
             self._preview_thread.wait()
@@ -1148,6 +1143,15 @@ class AudioTab(QWidget):
             if qwen_dir.exists():
                 for pt_file in sorted(qwen_dir.glob("*.pt"), key=natural_sort_key):
                     self.preset_voice_combo.addItem(f"💾 {pt_file.stem} (Voz Salva)", str(pt_file))
+        
+        elif engine == "indextts":
+            # IndexTTS usa .wav como prompt para zero-shot
+            presets_dir = Path("presets")
+            if presets_dir.exists():
+                for wav_file in sorted(presets_dir.glob("*.wav"), key=natural_sort_key):
+                    self.preset_voice_combo.addItem(f"👤 {wav_file.stem} (Clone WAV)", str(wav_file))
+            else:
+                self.preset_voice_combo.addItem("Nenhuma voz (.wav) em presets/", "")
                     
         if old_val:
             idx = self.preset_voice_combo.findData(old_val)
@@ -1158,6 +1162,8 @@ class AudioTab(QWidget):
         # Oculta botões inuteis no Qwen
         self.qwen_group.setVisible(engine_mode == "qwen")
         self._on_qwen_task_change()
+        # Se for IndexTTS, garantir que o grupo de clonagem (se houver) esteja visível ou o modo correto
+        # (Neste app, IndexTTS usa o seletor comum de vozes que já populamos acima)
 
     def _on_qwen_task_change(self):
         task = self.qwen_task_combo.currentText()

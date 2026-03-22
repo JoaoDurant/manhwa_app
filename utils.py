@@ -368,6 +368,60 @@ def encode_audio(
         return None
 
 
+def normalize_audio_output(audio: Any) -> np.ndarray:
+    """
+    Normaliza o retorno de qualquer engine para um array NumPy mono float32.
+    Lida com Tensors, listas, dicts e tuplas.
+    """
+    if audio is None:
+        raise ValueError("Engine retornou None")
+
+    # 1. Se for Dict (como o retorno bruto de alguns modelos)
+    if isinstance(audio, dict):
+        for key in ["audio", "wav", "waveform", "output"]:
+            if key in audio:
+                audio = audio[key]
+                break
+
+    # 2. Se for Tupla ou Lista (muitas vezes retorna (audio, sr))
+    if isinstance(audio, (tuple, list)):
+        if len(audio) > 0:
+            audio = audio[0]
+        else:
+            raise ValueError("Engine retornou tupla/lista vazia")
+
+    # 3. Converter Tensor para NumPy
+    if torch.is_tensor(audio):
+        audio = audio.detach().cpu().numpy()
+
+    # 4. Garantir que e um array NumPy
+    if not isinstance(audio, np.ndarray):
+        audio = np.array(audio)
+
+    # 5. Garantir float32 e range [-1, 1]
+    if audio.dtype != np.float32:
+        if np.issubdtype(audio.dtype, np.integer):
+            max_val = np.iinfo(audio.dtype).max
+            audio = audio.astype(np.float32) / max_val
+        else:
+            audio = audio.astype(np.float32)
+
+    # 6. Remover dimensoes extras (Squeeze), mas manter pelo menos 1D
+    audio = np.squeeze(audio)
+    if audio.ndim == 0:
+        audio = np.expand_dims(audio, 0)
+
+    # 7. Garantir Mono (se stereo -> media dos canais)
+    if audio.ndim > 1:
+        logger.warning(f"[NORMALIZER] Audio multicanal detectado (shape {audio.shape}). Convertendo para mono.")
+        audio = np.mean(audio, axis=1 if audio.shape[1] < audio.shape[0] else 0)
+
+    if audio.size == 0:
+        raise ValueError("Audio normalizado resultou em array vazio")
+
+    return audio.astype(np.float32)
+
+
 def save_audio_to_file(
     audio_array: np.ndarray, sample_rate: int, file_path_str: str
 ) -> bool:
@@ -1244,6 +1298,294 @@ def validate_reference_audio(
             )
     return True, "Reference audio appears valid."
 
+# --- Constantes de chunking para Qwen e IndexTTS ---
+# Baseado em TTS-Story: _create_text_processor_for_engine()
+# qwen3_chunk_size = 500, hard_limit = chunk_size + 50
+QWEN_CHAR_SOFT_LIMIT   = 500
+QWEN_CHAR_HARD_LIMIT   = 550
+INDEX_CHAR_SOFT_LIMIT  = 400   # IndexTTS e mais restrito por ser GPT-style
+INDEX_CHAR_HARD_LIMIT  = 500
+
+
+def chunk_text_for_qwen(text: str) -> List[str]:
+    """
+    Divide texto em chunks seguros para Qwen3-TTS.
+    Evita TDR do Windows ao limitar tempo de kernel CUDA por chamada.
+    Baseado em TextProcessor(char_soft_limit=500) do TTS-Story.
+
+    Usa split_into_sentences() que ja existe neste utils.py.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= QWEN_CHAR_SOFT_LIMIT:
+        return [text]
+
+    sentences = split_into_sentences(text)
+    if not sentences:
+        return [text]
+
+    chunks = []
+    current = ""
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        # Sentenca sozinha ja ultrapassa o hard limit — forcar divisao
+        if len(sentence) > QWEN_CHAR_HARD_LIMIT:
+            if current.strip():
+                chunks.append(current.strip())
+                current = ""
+            # Dividir por virgula como ultimo recurso
+            sub_chunk = ""
+            for part in sentence.split(", "):
+                candidate = (sub_chunk + ", " + part).strip(", ") if sub_chunk else part
+                if len(candidate) <= QWEN_CHAR_HARD_LIMIT:
+                    sub_chunk = candidate
+                else:
+                    if sub_chunk:
+                        chunks.append(sub_chunk.strip())
+                    sub_chunk = part
+            if sub_chunk.strip():
+                chunks.append(sub_chunk.strip())
+            continue
+
+        candidate = (current + " " + sentence).strip() if current else sentence
+        if len(candidate) <= QWEN_CHAR_SOFT_LIMIT:
+            current = candidate
+        elif len(candidate) <= QWEN_CHAR_HARD_LIMIT:
+            # Cabe no limite absoluto — fechar aqui
+            chunks.append(candidate.strip())
+            current = ""
+        else:
+            # Nao cabe — fechar chunk atual, comecar novo
+            if current.strip():
+                chunks.append(current.strip())
+            current = sentence
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks if chunks else [text]
+
+
+def chunk_text_for_indextts(text: str) -> List[str]:
+    """
+    Divide texto em chunks para IndexTTS.
+    Limite mais restrito (400 chars) pois IndexTTS e GPT-style e gera
+    mel-spectrograms — textos longos causam instabilidade de pronuncia.
+    Baseado em TTS-Story: index_tts_chunk_size=400, hard_limit=500.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= INDEX_CHAR_SOFT_LIMIT:
+        return [text]
+
+    # Reutiliza a mesma logica do Qwen mas com limites menores
+    sentences = split_into_sentences(text)
+    if not sentences:
+        return [text]
+
+    chunks = []
+    current = ""
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        if len(sentence) > INDEX_CHAR_HARD_LIMIT:
+            if current.strip():
+                chunks.append(current.strip())
+                current = ""
+            sub_chunk = ""
+            for part in sentence.split(", "):
+                candidate = (sub_chunk + ", " + part).strip(", ") if sub_chunk else part
+                if len(candidate) <= INDEX_CHAR_HARD_LIMIT:
+                    sub_chunk = candidate
+                else:
+                    if sub_chunk:
+                        chunks.append(sub_chunk.strip())
+                    sub_chunk = part
+            if sub_chunk.strip():
+                chunks.append(sub_chunk.strip())
+            continue
+
+        candidate = (current + " " + sentence).strip() if current else sentence
+        if len(candidate) <= INDEX_CHAR_SOFT_LIMIT:
+            current = candidate
+        elif len(candidate) <= INDEX_CHAR_HARD_LIMIT:
+            chunks.append(candidate.strip())
+            current = ""
+        else:
+            if current.strip():
+                chunks.append(current.strip())
+            current = sentence
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks if chunks else [text]
+
+
+def generate_paragraph_audio(
+    text: str,
+    output_path: str,
+    engine_name: str,
+    audio_prompt_path: str = None,
+    **kwargs
+) -> bool:
+    """
+    Dispatcher central unificado com padrao de interface via **kwargs.
+    Roteia para Kokoro, Qwen, IndexTTS ou Chatterbox/Turbo de modo seguro.
+    Garante logs explicitos para o inicio de geracao, retorno e formato invalido.
+    """
+    import time
+    from engine import (
+        synthesize,       MODEL_LOADED,       load_model,
+        synthesize_kokoro, KOKORO_LOADED,     load_kokoro_engine,
+        synthesize_qwen,   QWEN_LOADED,       load_qwen_model,
+        synthesize_indextts, INDEX_TTS_AVAILABLE,
+        logger
+    )
+    import numpy as np
+
+    text = text.strip()
+    if not text:
+        logger.error("[DISPATCHER] Texto vazio - cancelando envio para o engine.")
+        return False
+
+    if not engine_name:
+        logger.error("[DISPATCHER] Erro: engine_name e obrigatorio e nao foi fornecido.")
+        return False
+
+    e = engine_name.lower().replace("-", "_").replace(" ", "_")
+    print(f"[DISPATCHER] Engine solicitado: {e}")
+    logger.info(f"[DISPATCHER] Roteando para [{e}] | Texto len: {len(text)} | Prompt: {bool(audio_prompt_path)}")
+
+    # Extracao segura dos parametros independentes para cada modelo (sem conflito posicional)
+    kokoro_v    = kwargs.get("kokoro_voice", "af_heart")
+    kokoro_s    = kwargs.get("kokoro_speed", 1.0)
+    kokoro_lang = kwargs.get("kokoro_lang", "a")
+    qwen_spk    = kwargs.get("qwen_speaker", kwargs.get("qwen_speaker_alias", "Ryan"))
+    qwen_lang   = kwargs.get("qwen_language", kwargs.get("qwen_language_alias", "Auto"))
+    chatter_t   = kwargs.get("temperature", 0.8)
+    chatter_e   = kwargs.get("exaggeration", 0.5)
+    chatter_c   = kwargs.get("cfg_weight", 0.5)
+
+    audio_array = None
+    sample_rate = None
+
+    try:
+        t0_dispatch = time.time()
+
+        # =========================================================
+        # KOKORO
+        # =========================================================
+        if e in ("kokoro",):
+            if not KOKORO_LOADED:
+                if not load_kokoro_engine(lang_code=kokoro_lang):
+                    logger.error("[DISPATCHER] Abortado: Falha no carregamento do Kokoro.")
+                    return False
+            logger.info(f"[DISPATCHER] Iniciando geracao Kokoro | Voice: {kokoro_v}")
+            raw_output = synthesize_kokoro(
+                text, voice=kokoro_v, speed=kokoro_s, lang_code=kokoro_lang
+            )
+            logger.debug(f"[DISPATCHER] Retorno bruto Kokoro: {type(raw_output)}")
+            audio_array = normalize_audio_output(raw_output)
+            sample_rate = 24000 # Kokoro KPipeline default sr
+
+        # =========================================================
+        # QWEN TTS
+        # =========================================================
+        elif e in ("qwen", "qwen_custom", "qwen3"):
+            if not QWEN_LOADED:
+                if not load_qwen_model():
+                    logger.error("[DISPATCHER] Abortado: Falha no carregamento do Qwen.")
+                    return False
+            logger.info(f"[DISPATCHER] Iniciando geracao Qwen | Speaker: {qwen_spk}")
+            chunks = chunk_text_for_qwen(text)
+            parts = []
+            for idx, chunk in enumerate(chunks):
+                if not chunk.strip(): continue
+                raw = synthesize_qwen(chunk, speaker=qwen_spk, language=qwen_lang)
+                logger.debug(f"[DISPATCHER] Qwen chunk {idx} retorno bruto: {type(raw)}")
+                w = normalize_audio_output(raw)
+                parts.append(w)
+            if parts:
+                audio_array = np.concatenate(parts) if len(parts) > 1 else parts[0]
+                sample_rate = 24000
+
+        # =========================================================
+        # INDEXTTS
+        # =========================================================
+        # =========================================================
+        # INDEXTTS
+        # =========================================================
+        elif e in ("indextts", "indextts2", "index_tts"):
+            if not audio_prompt_path:
+                logger.error("[DISPATCHER] Abortado: IndexTTS exige 'audio_prompt_path'.")
+                return False
+            logger.info(f"[DISPATCHER] Iniciando geracao IndexTTS")
+            chunks = chunk_text_for_indextts(text)
+            parts = []
+            for idx, chunk in enumerate(chunks):
+                if not chunk.strip(): continue
+                raw = synthesize_indextts(chunk, audio_prompt_path)
+                logger.debug(f"[DISPATCHER] IndexTTS chunk {idx} retorno bruto: {type(raw)}")
+                w = normalize_audio_output(raw)
+                parts.append(w)
+            if parts:
+                audio_array = np.concatenate(parts) if len(parts) > 1 else parts[0]
+                sample_rate = 24000
+
+        # =========================================================
+        # CHATTERBOX / TURBO
+        # =========================================================
+        # =========================================================
+        # CHATTERBOX / TURBO
+        # =========================================================
+        elif e in ("chatterbox", "turbo", "multilingual", "chatterbox_turbo", "original"):
+            if not MODEL_LOADED:
+                if not load_model():
+                    logger.error("[DISPATCHER] Abortado: Falha no carregamento do Chatterbox.")
+                    return False
+            logger.info(f"[DISPATCHER] Iniciando geracao Chatterbox | Temp: {chatter_t}")
+            raw_output = synthesize(
+                text=text, audio_prompt_path=audio_prompt_path,
+                temperature=chatter_t, exaggeration=chatter_e, cfg_weight=chatter_c
+            )
+            logger.debug(f"[DISPATCHER] Retorno bruto Chatterbox: {type(raw_output)}")
+            audio_array = normalize_audio_output(raw_output)
+            sample_rate = 24000 # Default Chatterbox sr
+
+        else:
+            logger.error(f"[DISPATCHER] Falha de Roteamento! Motor desconhecido/nao mapeado: '{engine_name}'")
+            return False
+
+        # =========================================================
+        # VALIDACOES FINAIS E EXPORTACAO
+        # =========================================================
+        if audio_array is None:
+            logger.error(f"[DISPATCHER] Engine '{e}' falhou silenciosamente (retorno None).")
+            return False
+
+        # normalize_audio_output ja garante float32, mono e ndarray
+        success = save_audio_to_file(audio_array, sample_rate, output_path)
+        
+        num_samples = getattr(audio_array, "size", 0)
+        logger.info(f"[DISPATCHER] Audio valido recebido ({num_samples} samples).")
+        logger.info(f"[DISPATCHER] Dispatch completo para '{e}'. Salvo em: {output_path} | Sucesso: {success} | Tempo: {time.time() - t0_dispatch:.2f}s")
+        return success
+
+    except Exception as e_fatal:
+        logger.error(f"[DISPATCHER] 💥 Crash / Excecao critica processando '{engine_name}':\n{e_fatal}", exc_info=True)
+        return False
+
+
 
 # --- Performance Monitoring Utility ---
 class PerformanceMonitor:
@@ -1297,3 +1639,8 @@ class PerformanceMonitor:
         if self.logger:
             self.logger.log(log_level, full_report_str)
         return full_report_str
+
+
+# --- End of utils.py ---
+
+

@@ -16,6 +16,10 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Base directory for the Kokoro TTS Local module
+BASE_DIR = Path(__file__).resolve().parent
+VOICES_DIR = BASE_DIR / "voices"
+
 # Suppress warnings from pre-trained model
 warnings.filterwarnings("ignore", message="dropout option adds dropout after all but last recurrent layer")
 warnings.filterwarnings("ignore", message="`torch.nn.utils.weight_norm` is deprecated")
@@ -555,7 +559,7 @@ def build_model(model_path: str, device: str, repo_version: str = "main", lang_c
             # Try to load the first available voice with improved error handling
             voice_loaded = False
             for voice_file in downloaded_voices:
-                voice_path = os.path.abspath(os.path.join("voices", voice_file))
+                voice_path = VOICES_DIR / voice_file
                 if os.path.exists(voice_path):
                     try:
                         pipeline_instance.load_voice(voice_path)
@@ -583,7 +587,7 @@ def build_model(model_path: str, device: str, repo_version: str = "main", lang_c
 def list_available_voices() -> List[str]:
     """List all available voice models"""
     # Always use absolute path for consistency
-    voices_dir = Path(os.path.abspath("voices"))
+    voices_dir = VOICES_DIR
 
     # Create voices directory if it doesn't exist
     if not voices_dir.exists():
@@ -715,7 +719,7 @@ def generate_speech(
 
         # Format voice name and path
         voice_name = voice.replace('.pt', '')
-        voice_path = Path("voices").resolve() / f"{voice_name}.pt"
+        voice_path = VOICES_DIR / f"{voice_name}.pt"
 
         # Check if voice file exists
         if not voice_path.exists():

@@ -1,0 +1,15 @@
+# PyTorch com CUDA 12.8 (instalar primeiro)
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# IndexTTS — instalar do repo (mais confiavel que PyPI)
+# pip install -e path/to/index-tts  OU  pip install git+https://github.com/index-tts/index-tts.git
+transformers>=4.44.0
+accelerate>=0.30.0
+numpy>=2.0.0
+
+# Servidor worker
+flask>=3.0.0
+soundfile>=0.12.1
+
+# Normalizacao de texto (IndexTTS precisa para ingles/espanhol)
+# pynini: pip install pynini==2.1.6 --find-links https://github.com/kylebgorman/pynini/releases

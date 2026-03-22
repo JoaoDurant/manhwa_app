@@ -431,6 +431,8 @@ class AudioPipeline(QObject):
         return best_overall_index
 
     def _run_internal(self, start_time: float):
+        import time
+        print(f"[PIPELINE] Início do _run_internal | Engine alvo: {self.tts_engine} | StartTime: {start_time}")
         # Verificar se engine/utils/config foram importados com sucesso
         if not _ENGINE_AVAILABLE or _engine is None or _utils is None or _config_manager is None:
             self.log_message.emit("❌ Erro fatal: Dependências (engine, utils, config) não carregáveis.")
@@ -502,27 +504,29 @@ class AudioPipeline(QObject):
         self.log_message.emit(f"Pasta de saída: {out_dir.resolve()}")
 
         # -------- Garante que o modelo TTS está carregado --------
+        # O manager do dispatcher vai carregar sob demanda, mas logamos aqui para claridade
         if self.tts_engine == "chatterbox":
-            if not engine.MODEL_LOADED:
-                self.log_message.emit("Carregando modelo Chatterbox TTS… (primeira execução pode demorar)")
-                if not engine.load_model():
-                    self.finished.emit(False, "Falha ao carregar modelo TTS. Verifique os logs.")
-                    return
+            self.log_message.emit("Verificando/Carregando modelo Chatterbox TTS...")
+            if not engine.load_model():
+                self.finished.emit(False, "Falha ao carregar modelo Chatterbox. Verifique os logs.")
+                return
             device_str = (engine.model_device or "cpu").upper()
             model_type_log = engine.loaded_model_type or "original"
             self.log_message.emit(f"✓ Modelo Chatterbox pronto em {device_str} (tipo: {model_type_log}).")
+            
         elif self.tts_engine == "kokoro":
-            self.log_message.emit("Carregando motor Kokoro-TTS (Local)…")
-            kokoro_path = str(_REPO_ROOT / "Kokoro-TTS-Local-master")
-            if kokoro_path not in sys.path:
-                sys.path.append(kokoro_path)
-            try:
-                import models as kokoro_models
-                k_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                self.log_message.emit(f"✓ Módulo Kokoro pronto p/ inicialização. (Device: {k_device.upper()})")
-            except ImportError as e:
-                self.finished.emit(False, f"Falha ao importar dependências do Kokoro: {e}")
+            self.log_message.emit("Verificando/Carregando motor Kokoro TTS...")
+            if not engine.load_kokoro_engine():
+                self.finished.emit(False, "Falha ao carregar modelo Kokoro. Verifique os logs.")
                 return
+            self.log_message.emit("✓ Módulo Kokoro pronto.")
+            
+        elif self.tts_engine == "qwen":
+            self.log_message.emit("Verificando/Carregando motor Qwen TTS...")
+            if not engine.load_qwen_model():
+                self.finished.emit(False, "Falha ao carregar modelo Qwen. Verifique os logs.")
+                return
+            self.log_message.emit("✓ Módulo Qwen pronto.")
 
         # -------- Processa parágrafos SEQUENCIALMENTE (o engine.synthesize usa Lock global) --------
         # NOTA IMPORTANTE: o engine.synthesize() usa _synthesis_lock (threading.Lock global),
@@ -570,76 +574,15 @@ class AudioPipeline(QObject):
 
         kokoro_models_cache = {}
 
-        # -------- Sistema de Consistência Qwen3-TTS (Voice Clone Prompt Caching) --------
-        qwen_cached_prompt = None
-        is_saved_voice_preset = False
-        effective_task = self.qwen_task
-        
-        if self.tts_engine == "qwen" and all_paragraphs:
-            try:
-                # O primeiro parágrafo dita o voice_path global da geração
-                _, _, global_voice_path, _ = all_paragraphs[0]
-                
-                if global_voice_path and str(global_voice_path).endswith('.pt'):
-                    self.log_message.emit(f"🧠 [Qwen3] Carregando Preset de Voz Salva: {Path(global_voice_path).name}...")
-                    qwen_cached_prompt = torch.load(str(global_voice_path), weights_only=False)
-                    is_saved_voice_preset = True
-                    effective_task = "VoiceClone"
-                    self.log_message.emit("✓ [Qwen3] Voz Salva carregada na RAM com sucesso!")
-                
-                elif self.qwen_task == "VoiceClone" and self.qwen_ref_text and global_voice_path:
-                    self.log_message.emit("🧠 [Qwen3] Extraindo assinatura vocal do áudio de referência (Upfront Caching)...")
-                    q_model_base = get_qwen_model("VoiceClone")
-                    if q_model_base:
-                        qwen_cached_prompt = q_model_base.create_voice_clone_prompt(
-                            ref_audio=str(global_voice_path),
-                            ref_text=self.qwen_ref_text
-                        )
-                        self.log_message.emit("✓ [Qwen3] Assinatura salva em cache para consistência total.")
-                        
-                elif self.qwen_task == "VoiceDesign":
-                    self.log_message.emit("🧠 [Qwen3] Criando a voz a partir do zero no VoiceDesign...")
-                    design_model = get_qwen_model("VoiceDesign")
-                    
-                    if design_model is not None:
-                        # Fase 1: Gerar a voz mágica UMA VEZ
-                        dummy_text = "Esta é a assinatura vocal primária estabelecida para manter a consistência do projeto."
-                        with torch.inference_mode():
-                            ref_wavs, sr = design_model.generate_voice_design(
-                                text=dummy_text,
-                                language="Auto",
-                                instruct=self.qwen_instruct or "Uma voz padrão."
-                            )
-                        if ref_wavs and len(ref_wavs) > 0:
-                            # Fase 2: Mandar pro Base converter a gerada num Clone Prompt permanente
-                            self.log_message.emit("🧠 [Qwen3] Extraindo assinatura da voz recém-criada...")
-                            effective_task = "VoiceClone" # O resto da geração vai usar a voz clonada!
-                            self.qwen_task = "VoiceClone" # Atualiza a task global para VoiceClone
-                            q_model_base = get_qwen_model("VoiceClone")
-                            
-                            if q_model_base:
-                                qwen_cached_prompt = q_model_base.create_voice_clone_prompt(
-                                    ref_audio=(ref_wavs[0], sr),
-                                    ref_text=dummy_text
-                                )
-                                self.log_message.emit("✓ [Qwen3] Design base congelado e pronto para consistência.")
-                                
-            except Exception as qc_err:
-                self.log_message.emit(f"  ⚠ Erro ao preparar Qwen prompt prévio. Rodando instável: {qc_err}")
-                logger.error(f"Erro no cacher Qwen: {qc_err}", exc_info=True)
-                qwen_cached_prompt = None
 
-            # Pré-carrega APENAS o modelo efetivo para evitar 2 Loads seguidos que causam 1-2 min de atraso
-            self.log_message.emit(f"⚡ Preparando modelo principal Qwen3: {effective_task}")
-            _qwen_main = get_qwen_model(effective_task)
-            if _qwen_main and torch.cuda.is_available():
-                # Faz o block inference mode para compilar shaders SDPA/flash attention
-                with torch.inference_mode():
-                    try:
-                        self.log_message.emit("⚡ Executando Warmup do SDPA Attention Layer...")
-                        _qwen_main.generate_custom_voice(text="1", language="Auto", speaker="Ryan")
-                    except Exception:
-                        pass
+        # --- Engine Switch (Worker / Kokoro) if needed ---
+        if self.tts_engine in ("qwen", "indextts"):
+            self.log_message.emit(f"⚡ [Worker] Geração delegada ao worker isolado ({self.tts_engine}).")
+        elif self.tts_engine == "kokoro":
+            import engine as _eng
+            if _eng.get_active_engine() != "kokoro":
+                self.log_message.emit("Carregando motor Kokoro-TTS (Local)...")
+                _eng.switch_to_engine("kokoro")
 
         # -------- Sistema de Recovery / Continuação Automática --------
         start_index = 0
@@ -724,120 +667,44 @@ class AudioPipeline(QObject):
                 sample_rate = 24000
 
                 try:
-                    # 1. Chunking interno (para evitar TDR timeout e garantir 1 áudio final)
-                    MAX_CHUNK_LEN = 300
-                    text_chunks = [tts_text_input]
-                    if len(tts_text_input) > MAX_CHUNK_LEN:
-                        parts = re.split(r'(?<=[.!?])\s+', tts_text_input)
-                        text_chunks = []
-                        current_chunk = ""
-                        for p in parts:
-                            p = p.strip()
-                            if not p: continue
-                            if current_chunk and len(current_chunk) + len(p) + 1 > MAX_CHUNK_LEN:
-                                text_chunks.append(current_chunk)
-                                current_chunk = p
-                            else:
-                                current_chunk = current_chunk + " " + p if current_chunk else p
-                        if current_chunk:
-                            text_chunks.append(current_chunk)
+                    # 1. Estratégia de Síntese
+                    wav_tensor = None
+                    sample_rate = 24000
                     
-                    if len(text_chunks) > 1:
-                        self.log_message.emit(f"  ℹ [#{idx}] Texto muito longo. Dividido em {len(text_chunks)} partes internas.")
+                    import time
+                    t0_gen = time.time()
+                    print(f"[PIPELINE] Iniciando geração de áudio (Parágrafo {idx}) | Texto len: {len(tts_text_input)} chars | Engine: {self.tts_engine}")
+                    
+                    # --- NOVO DISPATCHER UNIFICADO (engine.py + utils.py) ---
+                    # Substitui os blocos If/Else fragmentados por um ponto único de entrada
+                    success = _utils.generate_paragraph_audio(
+                        text=tts_text_input,
+                        output_path=str(wav_tmp),
+                        engine_name=self.tts_engine,
+                        audio_prompt_path=voice_path,
+                        qwen_speaker=self.qwen_speaker if hasattr(self, 'qwen_speaker') else "Ryan",
+                        qwen_language="Auto",
+                        indextts_speed=getattr(self, 'speed', 1.0),
+                        temperature=self.temperature,
+                        exaggeration=self.exaggeration,
+                        cfg_weight=self.cfg_weight
+                    )
 
-                    all_wav_tensors = []
-
-                    for chunk_idx, chunk_text in enumerate(text_chunks):
-                        if self._cancelled: break
-                            
-                        chunk_wav = None
-                        if self.tts_engine == "chatterbox":
-                            chunk_wav, sample_rate = engine.synthesize(
-                                text=chunk_text,
-                                audio_prompt_path=voice_path,
-                                temperature=self.temperature,
-                                exaggeration=self.exaggeration,
-                                cfg_weight=self.cfg_weight,
-                                seed=0,  # seed setada globalmente
-                                language=lang,
-                                min_p=self.min_p,
-                                top_p=self.top_p,
-                                top_k=self.top_k,
-                                repetition_penalty=self.repetition_penalty,
-                                norm_loudness=self.norm_loudness,
-                            )
-                        elif self.tts_engine == "qwen":
-                            # effective_task já foi unificada e carregada globalmente antes do loop!
-                            q_model = get_qwen_model(effective_task)
-                            if q_model is not None:
-                                with torch.inference_mode():
-                                    try:
-                                        if qwen_cached_prompt is not None and (is_saved_voice_preset or self.qwen_task == "VoiceClone" or self.qwen_task == "VoiceDesign"):
-                                            # Roteando via Clone Gen usando o Prompt em Cache (Consistência Máxima e Muito Mais Rápido)
-                                            res_wavs, sr = q_model.generate_voice_clone(
-                                                text=chunk_text,
-                                                language="Auto",
-                                                voice_clone_prompt=qwen_cached_prompt
-                                            )
-                                        elif self.qwen_task == "VoiceClone" and self.qwen_ref_text and voice_path:
-                                            # Fallback sem cache
-                                            res_wavs, sr = q_model.generate_voice_clone(
-                                                text=chunk_text,
-                                                language="Auto",
-                                                ref_audio=str(voice_path),
-                                                ref_text=self.qwen_ref_text,
-                                            )
-                                        elif self.qwen_task == "VoiceDesign":
-                                            # Fallback sem cache (Nova voz será gereda, perdendo consistência!)
-                                            res_wavs, sr = q_model.generate_voice_design(
-                                                text=chunk_text,
-                                                language="Auto",
-                                                instruct=self.qwen_instruct,
-                                            )
-                                        else:
-                                            # CustomVoice (Presets)
-                                            # O valor do preset é passado como 'voice_path'
-                                            speaker_name = Path(voice_path).stem if voice_path else voice_path
-                                            # Trata fallback
-                                            if not speaker_name or speaker_name == "VoiceDesign" or Path(str(voice_path)).is_absolute():
-                                                speaker_name = "Vivian" # Fallback de segurança
-
-                                            res_wavs, sr = q_model.generate_custom_voice(
-                                                text=chunk_text,
-                                                language="Auto",
-                                                speaker=speaker_name,
-                                                instruct=self.qwen_instruct,
-                                            )
-                                        
-                                        if res_wavs and len(res_wavs) > 0:
-                                            # Transforma numpy -> float32 torch tensor em [1, samples]
-                                            chunk_wav = torch.tensor(res_wavs[0], dtype=torch.float32).unsqueeze(0)
-                                            sample_rate = sr
-                                    except Exception as qerr:
-                                        self.log_message.emit(f"  ✗ [Qwen] Falha na síntese do chunk: {qerr}")
-                                        logger.error(f"Erro no módulo Qwen3: {qerr}", exc_info=True)
-                        
-                        if chunk_wav is not None:
-                            all_wav_tensors.append(chunk_wav)
-                            
-                    if self._cancelled:
+                    if not success:
+                        print(f"[PIPELINE] Fim da geração (Parágrafo {idx}) | Sucesso: False | Tempo: {time.time() - t0_gen:.2f}s")
+                        self.log_message.emit(f"  ✗ Falha na síntese do parágrafo via {self.tts_engine}")
+                        _cleanup(wav_tmp)
                         continue
                         
-                    if all_wav_tensors:
-                        # Concatena todos os pedaços (chunks) em um único tensor (array de áudio final)
-                        wav_tensor = torch.cat(all_wav_tensors, dim=-1)
-                    else:
-                        wav_tensor = None
+                    print(f"[PIPELINE] Fim da geração (Parágrafo {idx}) | Sucesso: True | Tempo: {time.time() - t0_gen:.2f}s")
+                    
+                    # Carregar para verificação (se necessário) ou apenas para marcar sucesso
+                    # Como generate_paragraph_audio já salvou o arquivo, não precisamos re-salvar.
+                    # Mas o código abaixo espera wav_tensor != None para continuar.
+                    wav_tensor = True # Flag para o loop continuar
 
                     if wav_tensor is not None:
-                        utils.save_audio_tensor_to_file(wav_tensor, sample_rate, str(wav_tmp), output_format=self.output_format)
-                        
-                        # Limpeza leve (garbage collector), preservando a alocação CUDA
-                        del wav_tensor
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache() # Necessário no Windows para não exaurir VRAM
-                        
+                        # Geração bem-sucedida! (O arquivo já foi salvo pelo dispatcher em wav_tmp)
                         paragraph_end_time = time.time()
                         self.log_message.emit(f"  ⏱ ↳ Geração do parágrafo durou {paragraph_end_time - paragraph_start_time:.1f}s")
 

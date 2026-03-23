@@ -1,0 +1,57 @@
+{
+  "theme": "🌑 Dark (Padrão)",
+  "bg_overlay_alpha": 180,
+  "audio_tab": {
+    "project": "testeeee",
+    "output_root": "output"
+  },
+  "tts_tab": {
+    "tts_engine": "indextts",
+    "model_type": "turbo",
+    "temperature": 0.9,
+    "speed": 1.0,
+    "exaggeration": 0.65,
+    "cfg_weight": 0.5,
+    "seed": 3000,
+    "output_format": "wav",
+    "sample_rate": 44100,
+    "min_p": 0.0,
+    "top_p": 1.0,
+    "top_k": 1000,
+    "repetition_penalty": 1.2,
+    "norm_loudness": true,
+    "max_retries": 3,
+    "whisper_model": "base",
+    "similarity_threshold": 0.97,
+    "use_spacy": false,
+    "ref_vad_trimming": false,
+    "fx_highpass": true,
+    "fx_deesser": true,
+    "fx_compressor": false,
+    "fx_silence": true,
+    "fx_reverb": false,
+    "fx_loudnorm": true,
+    "qwen_task": "CustomVoice",
+    "qwen_instruct": "",
+    "qwen_ref_text": ""
+  },
+  "video_tab": {
+    "layout": "mixed",
+    "effect": "auto",
+    "transition": "fade",
+    "transition_time": 0.05,
+    "bg_music_path": "",
+    "bg_music_volume": 10,
+    "production": {
+      "video": {
+        "better_easing": true,
+        "color_grading": true,
+        "sharpen": false,
+        "film_grain": false
+      },
+      "sound_design": {
+        "auto_ducking": true
+      }
+    }
+  }
+}

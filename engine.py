@@ -69,6 +69,71 @@ except ImportError:
     SUPPORTED_LANGUAGES = {}
     MULTILINGUAL_AVAILABLE = False
 
+# =============================================================================
+# GLOBAL MONKEY PATCH — AlignmentStreamAnalyzer
+#
+# WHY THIS IS NEEDED:
+#   chatterbox/models/t3/t3.py does:
+#       from .inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
+#   That binding happens at import-time and lives in t3.py's OWN namespace.
+#   Patching the source module during generate() is too late — the name was
+#   already captured. The ONLY reliable fix is to overwrite the name in the
+#   exact module that instantiates it (t3.py) right after import.
+#
+# IMPACT ON SDPA:
+#   The original AlignmentStreamAnalyzer.__init__ calls _add_attention_spy(),
+#   which sets  tfmr.config.output_attentions = True.
+#   Transformers raises ValueError when attn_implementation == "sdpa".
+#   The DummyAnalyzer stub avoids all of that.
+# =============================================================================
+class _DummyAlignmentAnalyzer:
+    """No-op replacement for AlignmentStreamAnalyzer.
+    Skips the attention spy that is incompatible with SDPA.
+    Signature of real class: __init__(self, tfmr, queue, text_tokens_slice, alignment_layer_idx=9, eos_idx=0)
+    """
+    def __init__(self, *args, **kwargs):
+        # eos_idx is the 5th positional arg (index 4) or keyword 'eos_idx'
+        self.eos_idx        = kwargs.get("eos_idx", args[4] if len(args) > 4 else 0)
+        self.started        = True
+        self.complete       = False
+        self.text_position  = 0
+        self.curr_frame_pos = 0
+        # Neutralize output_attentions on the transformer (1st positional arg)
+        # This prevents the silent CUDA crash from SDPA + output_attentions=True
+        if args:
+            tfmr = args[0]
+            if hasattr(tfmr, "config"):
+                try: tfmr.config.output_attentions = False
+                except Exception: pass
+                try: tfmr.config.attn_implementation = "eager"
+                except Exception: pass
+
+    def step(self, logits, next_token=None, **kwargs):
+        return logits
+
+    def _add_attention_spy(self, *args, **kwargs):
+        pass
+
+# Inject into the source module AND into t3.py's captured namespace.
+# Force-import each module first so sys.modules always has it — otherwise
+# the patch silently does nothing if the import hasn't happened yet.
+import sys as _sys
+_analyzer_patches = {
+    "chatterbox.models.t3.inference.alignment_stream_analyzer": "AlignmentStreamAnalyzer",
+    "chatterbox.models.t3.t3":                                 "AlignmentStreamAnalyzer",
+    "chatterbox.mtl_tts":                                       "AlignmentStreamAnalyzer",
+}
+for _mod_path, _attr in _analyzer_patches.items():
+    try:
+        __import__(_mod_path)  # Force-import so the module is definitely in sys.modules
+    except Exception:
+        pass
+    _mod = _sys.modules.get(_mod_path)
+    if _mod is not None and hasattr(_mod, _attr):
+        setattr(_mod, _attr, _DummyAlignmentAnalyzer)
+        logger.info(f"[PATCH] AlignmentStreamAnalyzer substituido em {_mod_path}")
+del _mod_path, _attr, _mod, _analyzer_patches
+
 # Selecionar classe preferida: Turbo > Original
 if CHATTERBOX_TURBO_AVAILABLE:
     _ChatterboxClass  = _ChatterboxTurbo
@@ -222,6 +287,11 @@ loaded_model_class_name: Optional[str] = None
 
 # Lock compartilhado GPU — garante que apenas 1 modelo usa GPU por vez
 _synthesis_lock = threading.Lock()
+
+# Lock e Flags de Estado para prevencao de Race Conditions (PATCH)
+_engine_lock = threading.Lock()
+_is_loading = False
+_is_generating = False
 
 # Variaveis de estado de device
 FORCE_CPU = os.environ.get("MANHWA_FORCE_CPU", "0") == "1"
@@ -402,20 +472,33 @@ print(f"[ENGINE] Turbo disponível: {HAS_TURBO}")
 def load_turbo() -> bool:
     """Carrega Chatterbox Turbo com fallback automático para Original."""
     global chatterbox_model, MODEL_LOADED, model_device, loaded_model_type, loaded_model_class_name
-    print("[DEBUG] Solicitado: load_turbo")
+    global _is_loading, _is_generating
     
-    if not HAS_TURBO:
-        print("[ENGINE] Turbo não disponível nesta versão do chatterbox. Usando fallback (original).")
-        return load_original()
-
+    if _is_generating:
+        print("IGNORADO: geração já em andamento (turbo)")
+        return False
+        
     if loaded_model_type == "turbo" and MODEL_LOADED:
+        print("Já carregado, ignorando reload")
         return True
-    
-    unload_all_for_switch()
-    model_device = _get_chatterbox_device()
-    _optimize_for_device(model_device)
-    
+
+    with _engine_lock:
+        if _is_loading:
+            print("IGNORADO: já está carregando (turbo)")
+            return False
+        _is_loading = True
+        
     try:
+        print("[DEBUG] Solicitado: load_turbo")
+        if not HAS_TURBO:
+            print("[ENGINE] Turbo não disponível nesta versão do chatterbox. Usando fallback (original).")
+            _is_loading = False
+            return load_original()
+
+        unload_all_for_switch()
+        model_device = _get_chatterbox_device()
+        _optimize_for_device(model_device)
+        
         # Importacao ja tentada globalmente como _ChatterboxTurbo
         if _ChatterboxTurbo is None:
             # Segunda tentativa de importacao via path correto
@@ -428,71 +511,195 @@ def load_turbo() -> bool:
         loaded_model_class_name = "ChatterboxTurboTTS"
         MODEL_LOADED = True
         logger.info(f"Chatterbox Turbo carregado em {model_device}.")
+        if torch.cuda.is_available(): torch.cuda.synchronize()
         return True
     except Exception as e:
         logger.error(f"Falha ao carregar Turbo: {e}. Tentando fallback original.", exc_info=True)
+        _is_loading = False
         return load_original()
+    finally:
+        with _engine_lock:
+            _is_loading = False
 
 def load_original() -> bool:
     """Carrega especificamente o Chatterbox Original."""
     global chatterbox_model, MODEL_LOADED, model_device, loaded_model_type, loaded_model_class_name
-    print("[DEBUG] Solicitado: load_original")
+    global _is_loading, _is_generating
+    
+    if _is_generating:
+        print("IGNORADO: geração já em andamento (original)")
+        return False
+
     if loaded_model_type == "original" and MODEL_LOADED:
+        print("Já carregado, ignorando reload")
         return True
 
-    unload_all_for_switch()
-    model_device = _get_chatterbox_device()
-    _optimize_for_device(model_device)
+    with _engine_lock:
+        if _is_loading:
+            print("IGNORADO: já está carregando (original)")
+            return False
+        _is_loading = True
 
     try:
+        print("[DEBUG] Solicitado: load_original")
+        unload_all_for_switch()
+        model_device = _get_chatterbox_device()
+        _optimize_for_device(model_device)
+
         from chatterbox import ChatterboxTTS as _Original
         chatterbox_model = _Original.from_pretrained(device=model_device)
         loaded_model_type = "original"
         loaded_model_class_name = "ChatterboxTTS"
         MODEL_LOADED = True
         logger.info(f"Chatterbox Original carregado em {model_device}.")
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+
+        # Force eager attn on the Original model to prevent output_attentions crash
+        if hasattr(chatterbox_model, "t3") and hasattr(chatterbox_model.t3, "model"):
+            if hasattr(chatterbox_model.t3.model, "config"):
+                try:
+                    chatterbox_model.t3.model.config.attn_implementation = "eager"
+                    chatterbox_model.t3.model.config.output_attentions = False
+                except Exception: pass
+        if hasattr(chatterbox_model, "set_attn_implementation"):
+            try: chatterbox_model.set_attn_implementation("eager")
+            except Exception: pass
+
+        # Re-patch AlignmentStreamAnalyzer with known eos_idx
+        try:
+            real_eos_idx = chatterbox_model.t3.hp.stop_speech_token
+            class _DummyWithEos(_DummyAlignmentAnalyzer):
+                def __init__(self_inner, *iargs, **ikwargs):
+                    super().__init__(*iargs, **ikwargs)
+                    self_inner.eos_idx = real_eos_idx
+            import sys as _sys3
+            for _mp in ("chatterbox.models.t3.inference.alignment_stream_analyzer",
+                        "chatterbox.models.t3.t3", "chatterbox.mtl_tts"):
+                _m = _sys3.modules.get(_mp)
+                if _m is not None and hasattr(_m, "AlignmentStreamAnalyzer"):
+                    setattr(_m, "AlignmentStreamAnalyzer", _DummyWithEos)
+                    logger.info(f"[PATCH] Re-patched AlignmentStreamAnalyzer (eos_idx={real_eos_idx}) em {_mp}")
+        except Exception as _ep:
+            logger.warning(f"[PATCH] Re-patch original com eos_idx falhou: {_ep}")
+
         return True
     except Exception as e:
         logger.error(f"Falha ao carregar Original: {e}", exc_info=True)
         return False
+    finally:
+        with _engine_lock:
+            _is_loading = False
 
 def load_multilingual() -> bool:
     """Carrega especificamente o Chatterbox Multilingual com patch eager isolado."""
     global chatterbox_model, MODEL_LOADED, model_device, loaded_model_type, loaded_model_class_name
-    print("[DEBUG] Solicitado: load_multilingual")
+    global _is_loading, _is_generating
+    
+    if _is_generating:
+        print("IGNORADO: geração já em andamento (multilingual)")
+        return False
+
     if loaded_model_type == "multilingual" and MODEL_LOADED:
+        print("Já carregado, ignorando reload")
         return True
 
-    unload_all_for_switch()
-    model_device = _get_chatterbox_device()
-    _optimize_for_device(model_device)
+    with _engine_lock:
+        if _is_loading:
+            print("IGNORADO: já está carregando (multilingual)")
+            return False
+        _is_loading = True
 
-    from copy import deepcopy
-    from chatterbox.models.t3.llama_configs import LLAMA_CONFIGS
-    original_configs = deepcopy(LLAMA_CONFIGS)
-    
     try:
-        print("[PATCH] Aplicando eager apenas para multilingual")
-        for k in LLAMA_CONFIGS:
-            LLAMA_CONFIGS[k]["attn_implementation"] = "eager"
-        
+        print("[DEBUG] Solicitado: load_multilingual")
+        unload_all_for_switch()
+        model_device = _get_chatterbox_device()
+        _optimize_for_device(model_device)
+
         from chatterbox import ChatterboxMultilingualTTS as _Mtl
-        chatterbox_model = _Mtl.from_pretrained(device=model_device)
+        # FIX 1: Try passing attn_implementation=eager directly to from_pretrained.
+        # Newer versions of the lib may accept it; older ones will raise TypeError.
+        print("[ENGINE] Tentando carregar Multilingual com attn_implementation=eager...")
+        try:
+            chatterbox_model = _Mtl.from_pretrained(device=model_device, attn_implementation="eager")
+            logger.info("[MULTILINGUAL] Carregado com attn_implementation=eager via from_pretrained.")
+        except TypeError:
+            logger.warning("[MULTILINGUAL] from_pretrained nao aceita attn_implementation. Carregando sem o argumento.")
+            chatterbox_model = _Mtl.from_pretrained(device=model_device)
+
+        # FORÇAR EM TODAS AS CAMADAS
+        if hasattr(chatterbox_model, "t3") and hasattr(chatterbox_model.t3, "model"):
+            if hasattr(chatterbox_model.t3.model, "config"):
+                chatterbox_model.t3.model.config.attn_implementation = "eager"
+            
+        # FORÇAR também via método (Transformers moderno)
+        if hasattr(chatterbox_model, "set_attn_implementation"):
+            chatterbox_model.set_attn_implementation("eager")
+
+        # FIX 2: Force output_attentions=False on ALL submodules that have a config.
+        # This catches any attention layer that may still hold a stale flag.
+        if hasattr(chatterbox_model, "t3") and hasattr(chatterbox_model.t3, "model"):
+            for _submod in chatterbox_model.t3.model.modules():
+                if hasattr(_submod, "config"):
+                    try: _submod.config.output_attentions = False
+                    except Exception: pass
+        try: chatterbox_model.t3.model.config.output_attentions = False
+        except Exception: pass
+
+        # FIX 3: Instance-level inference wrapper on chatterbox_model.t3.
+        # The real t3.py passes output_attentions=True hardcoded to self.model();
+        # we intercept at the model.__call__ level to strip that kwarg.
+        try:
+            _real_t3_model = chatterbox_model.t3.model
+            _original_call = _real_t3_model.__class__.forward
+
+            def _patched_forward(self_m, *fargs, **fkwargs):
+                fkwargs.pop("output_attentions", None)
+                fkwargs.pop("head_mask", None)
+                return _original_call(self_m, *fargs, **fkwargs)
+
+            import types
+            chatterbox_model.t3.model.forward = types.MethodType(_patched_forward, chatterbox_model.t3.model)
+            logger.info("[MULTILINGUAL] Instance-level forward patch aplicado (output_attentions interceptado).")
+        except Exception as _fp:
+            logger.warning(f"[MULTILINGUAL] Instance forward patch falhou (nao critico): {_fp}")
+
         try: chatterbox_model = chatterbox_model.float()
         except AttributeError: pass
-        
+
         loaded_model_type = "multilingual"
         loaded_model_class_name = "ChatterboxMultilingualTTS"
         MODEL_LOADED = True
         logger.info(f"Chatterbox Multilingual carregado em {model_device}.")
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        
+        # Re-patch the Dummy with the real stop_speech_token so that
+        # the assert in t3.py:288 always passes:
+        #   assert alignment_stream_analyzer.eos_idx == self.hp.stop_speech_token
+        try:
+            real_eos_idx = chatterbox_model.t3.hp.stop_speech_token
+            
+            class _DummyWithEos(_DummyAlignmentAnalyzer):
+                def __init__(self_inner, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self_inner.eos_idx = real_eos_idx  # Override with known correct value
+            
+            import sys as _sys2
+            for _mp in ("chatterbox.models.t3.inference.alignment_stream_analyzer",
+                        "chatterbox.models.t3.t3", "chatterbox.mtl_tts"):
+                _m = _sys2.modules.get(_mp)
+                if _m is not None and hasattr(_m, "AlignmentStreamAnalyzer"):
+                    setattr(_m, "AlignmentStreamAnalyzer", _DummyWithEos)
+                    logger.info(f"[PATCH] Re-patched AlignmentStreamAnalyzer (eos_idx={real_eos_idx}) em {_mp}")
+        except Exception as _ep:
+            logger.warning(f"[PATCH] Re-patch com eos_idx falhou (nao critico): {_ep}")
+        
         return True
     except Exception as e:
         logger.error(f"Falha ao carregar Multilingual: {e}", exc_info=True)
         return False
     finally:
-        print("[PATCH] Restaurando configs originais")
-        LLAMA_CONFIGS.clear()
-        LLAMA_CONFIGS.update(original_configs)
+        with _engine_lock:
+            _is_loading = False
 
 def load_model() -> bool:
     """Funcao legada para compatibilidade - usa a config atual."""
@@ -550,6 +757,21 @@ def warmup_model():
         logger.warning(f"Warmup com ref falhou: {e}")
 
 
+def check_audio_validity(audio):
+    if audio is None:
+        raise RuntimeError("Audio None")
+    import torch
+    import numpy as np
+    if isinstance(audio, torch.Tensor):
+        if audio.numel() < 1000:
+            raise RuntimeError("Audio inválido: muito pequeno (tensor)")
+    elif isinstance(audio, np.ndarray):
+        if audio.size < 1000:
+            raise RuntimeError("Audio inválido: muito pequeno (ndarray)")
+    elif hasattr(audio, "__len__"):
+        if len(audio) < 1000:
+            raise RuntimeError("Audio inválido: muito pequeno (list)")
+
 def synthesize(
     text: str,
     audio_prompt_path: str = None,
@@ -570,6 +792,10 @@ def synthesize(
     PADRAO TTS-STORY: autocast bfloat16 no CUDA para Turbo/Original.
     """
     global chatterbox_model, MODEL_LOADED, loaded_model_type
+    global _is_loading, _is_generating
+
+    if _is_loading:
+        raise RuntimeError("Modelo ainda está carregando")
 
     if not MODEL_LOADED or chatterbox_model is None:
         logger.error("Chatterbox nao carregado.")
@@ -586,11 +812,20 @@ def synthesize(
     else:
         autocast_ctx = contextlib.nullcontext()
 
+    with _engine_lock:
+        _is_generating = True
+
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+
     with _synthesis_lock:
-        print("[ENGINE] Gerando áudio...")
-        start_time = time.time()
         try:
+            print("[ENGINE] Gerando áudio...")
+            start_time = time.time()
             with torch.inference_mode(), autocast_ctx:
+                if is_multilingual:
+                    try: print(f"ATTN: {chatterbox_model.t3.model.config.attn_implementation}")
+                    except: pass
+                
                 if loaded_model_type == "turbo":
                     wav_tensor = chatterbox_model.generate(
                         text=text,
@@ -603,6 +838,8 @@ def synthesize(
                         norm_loudness=norm_loudness,
                     )
                 elif loaded_model_type == "multilingual":
+                    # AlignmentStreamAnalyzer is globally monkey-patched at import time
+                    # (_DummyAlignmentAnalyzer in engine.py) so no per-call workaround needed.
                     wav_tensor = chatterbox_model.generate(
                         text=text,
                         language_id=language,
@@ -638,16 +875,31 @@ def synthesize(
             if hasattr(wav_tensor, "shape"):
                 print(f"[DEBUG] Shape retorno: {wav_tensor.shape}")
 
+            check_audio_validity(wav_tensor)
+            
             wav_tensor = wav_tensor.to(torch.float32)
             return wav_tensor, chatterbox_model.sr
 
         except Exception as e:
-            logger.error(f"Erro Chatterbox synthesize: {e}", exc_info=True)
+            print("ERRO NA GERAÇÃO CHATTERBOX:", e)
+            import traceback
+            traceback.print_exc()
+            logger.error(f"Erro Chatterbox synthesize: {e}")
             return None, None
+        finally:
+            with _engine_lock:
+                _is_generating = False
 
 
 def reload_model() -> bool:
     global chatterbox_model, MODEL_LOADED, model_device, loaded_model_type, loaded_model_class_name
+    global _is_generating
+    
+    with _engine_lock:
+        if _is_generating:
+            print("IGNORADO: modelo em uso (reload_model)")
+            return False
+
     logger.info("Hot-swap Chatterbox...")
     if chatterbox_model is not None:
         del chatterbox_model
@@ -680,17 +932,30 @@ def load_kokoro_engine(
                 "p"=PT-BR, "e"=Spanish, "f"=French
     """
     global kokoro_pipeline, KOKORO_LOADED
+    global _is_loading, _is_generating
 
-    with _kokoro_lock:
-        if KOKORO_LOADED: return True
+    if _is_generating:
+        print("IGNORADO: geração já em andamento (kokoro)")
+        return False
 
-        if not KOKORO_AVAILABLE:
-            logger.error(
-                "Kokoro nao instalado.\n"
-                "Execute: pip install kokoro>=0.9.4\n"
-                "E instale espeak-ng: https://github.com/espeak-ng/espeak-ng/releases"
-            )
+    if KOKORO_LOADED: return True
+
+    with _engine_lock:
+        if _is_loading:
             return False
+        _is_loading = True
+
+    try:
+        with _kokoro_lock:
+            if KOKORO_LOADED: return True
+
+            if not KOKORO_AVAILABLE:
+                logger.error(
+                    "Kokoro nao instalado.\n"
+                    "Execute: pip install kokoro>=0.9.4\n"
+                    "E instale espeak-ng: https://github.com/espeak-ng/espeak-ng/releases"
+                )
+                return False
 
         resolved = "cuda" if (device == "auto" and _test_cuda_functionality()) else (device if device != "auto" else "cpu")
 
@@ -703,6 +968,7 @@ def load_kokoro_engine(
             KOKORO_LOADED   = True
             print(f"[ENGINE] [Kokoro] Carregado com sucesso em {resolved} | Tempo: {time.time() - t0_kload:.2f}s")
             logger.info(f"Kokoro carregado com sucesso em {resolved}.")
+            if torch.cuda.is_available(): torch.cuda.synchronize()
             return True
         except Exception as e:
             err = str(e).lower()
@@ -718,6 +984,9 @@ def load_kokoro_engine(
             kokoro_pipeline = None
             KOKORO_LOADED   = False
             return False
+    finally:
+        with _engine_lock:
+            _is_loading = False
 
 
 
@@ -737,10 +1006,19 @@ def synthesize_kokoro(
     Vozes PT-BR: pf_dora, pm_alex, pm_santa
     """
     global kokoro_pipeline, KOKORO_LOADED
+    global _is_loading, _is_generating
+
+    if _is_loading:
+        raise RuntimeError("Modelo Kokoro ainda está carregando")
 
     if not KOKORO_LOADED or kokoro_pipeline is None:
         logger.error("Kokoro nao carregado. Chame load_kokoro_engine() primeiro.")
         return None, None
+
+    with _engine_lock:
+        _is_generating = True
+
+    if torch.cuda.is_available(): torch.cuda.synchronize()
 
     with _synthesis_lock:
         try:
@@ -763,13 +1041,19 @@ def synthesize_kokoro(
                 audio_parts = [a.detach().cpu().numpy() for a in audio_parts]
 
             final = np.concatenate(audio_parts) if len(audio_parts) > 1 else audio_parts[0]
+            check_audio_validity(final)
             print(f"[ENGINE] [Kokoro] Sintese concluida com sucesso | Samples: {len(final)} | Tempo: {time.time() - t0_ksynth:.2f}s")
             return final.astype(np.float32), KOKORO_SAMPLE_RATE
 
         except Exception as e:
-            print(f"[ERROR] [ENGINE] [Kokoro] Erro critico na sintese: {e}")
+            print("ERRO NA GERAÇÃO KOKORO:", e)
+            import traceback
+            traceback.print_exc()
             logger.error(f"Erro na sintese Kokoro: {e}", exc_info=True)
             return None, None
+        finally:
+            with _engine_lock:
+                _is_generating = False
 
 
 def unload_kokoro_engine():
@@ -790,12 +1074,25 @@ def unload_kokoro_engine():
 
 def load_qwen_model(device: str = "auto") -> bool:
     global qwen_model, QWEN_LOADED, qwen_device
+    global _is_loading, _is_generating
 
-    with _qwen_lock:
-        if QWEN_LOADED: return True
-        if not QWEN3_AVAILABLE:
-            logger.error("qwen_tts nao instalado. Execute: pip install --upgrade qwen-tts")
+    if _is_generating:
+        print("IGNORADO: geração já em andamento (qwen)")
+        return False
+
+    if QWEN_LOADED: return True
+
+    with _engine_lock:
+        if _is_loading:
             return False
+        _is_loading = True
+
+    try:
+        with _qwen_lock:
+            if QWEN_LOADED: return True
+            if not QWEN3_AVAILABLE:
+                logger.error("qwen_tts nao instalado. Execute: pip install --upgrade qwen-tts")
+                return False
 
         if device == "auto":
             if _test_cuda_functionality():   resolved = "cuda"
@@ -825,6 +1122,7 @@ def load_qwen_model(device: str = "auto") -> bool:
                 attn_implementation=attn,
             )
             QWEN_LOADED = True
+            if torch.cuda.is_available(): torch.cuda.synchronize()
             _warmup_qwen()
             return True
         except Exception as e:
@@ -832,6 +1130,9 @@ def load_qwen_model(device: str = "auto") -> bool:
             qwen_model  = None
             QWEN_LOADED = False
             return False
+    finally:
+        with _engine_lock:
+            _is_loading = False
 
 
 def _warmup_qwen():
@@ -867,6 +1168,10 @@ def synthesize_qwen(
       - retorna numpy float32
     """
     global qwen_model, QWEN_LOADED
+    global _is_loading, _is_generating
+
+    if _is_loading:
+        raise RuntimeError("Modelo Qwen ainda está carregando")
 
     if not QWEN_LOADED or qwen_model is None:
         logger.error("Qwen nao carregado. Chame load_qwen_model() primeiro.")
@@ -875,6 +1180,11 @@ def synthesize_qwen(
     speaker_final = _QWEN_SPEAKER_MAP.get(
         speaker.strip().lower().replace(" ", "_"), "Ryan"
     )
+
+    with _engine_lock:
+        _is_generating = True
+
+    if torch.cuda.is_available(): torch.cuda.synchronize()
 
     with _synthesis_lock:
         try:
@@ -898,11 +1208,18 @@ def synthesize_qwen(
                 if isinstance(wav, torch.Tensor)
                 else np.array(wav, dtype=np.float32)
             )
+            check_audio_validity(wav_np)
             return wav_np, int(sr)
 
         except Exception as e:
+            print("ERRO NA GERAÇÃO QWEN:", e)
+            import traceback
+            traceback.print_exc()
             logger.error(f"Erro na sintese Qwen: {e}", exc_info=True)
             return None, None
+        finally:
+            with _engine_lock:
+                _is_generating = False
 
 
 def unload_qwen_model():
@@ -923,11 +1240,24 @@ def unload_qwen_model():
 
 def _start_indextts_worker() -> bool:
     global _indextts_proc
+    global _is_loading, _is_generating
+
+    if _is_generating:
+        print("IGNORADO: geração já em andamento (indextts)")
+        return False
+
     if _indextts_proc and _indextts_proc.poll() is None:
         return True  # ja rodando
 
+    with _engine_lock:
+        if _is_loading:
+            return False
+        _is_loading = True
+
     if not INDEX_TTS_AVAILABLE:
         logger.error("IndexTTS nao configurado. Execute setup.bat.")
+        with _engine_lock:
+            _is_loading = False
         return False
 
     # Garantir que o uv esta no PATH de forma robusta
@@ -940,6 +1270,8 @@ def _start_indextts_worker() -> bool:
 
     if not _check_uv_installed():
         logger.error(f"uv nao instalado ou nao encontrado em {uv_path}. Instale via: powershell -c 'irm https://astral.sh/uv/install.ps1 | iex'")
+        with _engine_lock:
+            _is_loading = False
         return False
 
     try:
@@ -1005,6 +1337,9 @@ def _start_indextts_worker() -> bool:
     except Exception as e:
         logger.error(f"Falha ao iniciar IndexTTS: {e}", exc_info=True)
         return False
+    finally:
+        with _engine_lock:
+            _is_loading = False
 
 
 def _stop_indextts_worker():
@@ -1031,11 +1366,18 @@ def synthesize_indextts(
     O worker e iniciado sob demanda e mantido vivo durante o batch.
     """
     global _indextts_proc
+    global _is_loading, _is_generating
+
+    if _is_loading:
+        raise RuntimeError("Worker IndexTTS ainda está inicializando")
 
     with _indextts_proc_lock:
         if not _indextts_proc or _indextts_proc.poll() is not None:
             if not _start_indextts_worker():
                 return None, None
+
+    with _engine_lock:
+        _is_generating = True
 
     own_tmp = False
     if not output_path:
@@ -1071,6 +1413,7 @@ def synthesize_indextts(
                         audio_np, sr = sf.read(output_path, dtype="float32")
                         if audio_np.ndim == 2:
                             audio_np = audio_np.mean(axis=1)
+                        check_audio_validity(audio_np)
                         return audio_np, int(sr)
                     elif resp.get("status") == "error":
                         logger.error(f"IndexTTS erro: {resp.get('message')}")
@@ -1085,6 +1428,8 @@ def synthesize_indextts(
         logger.error(f"Erro na comunicacao com IndexTTS: {e}", exc_info=True)
         return None, None
     finally:
+        with _engine_lock:
+            _is_generating = False
         if own_tmp and Path(output_path).exists():
             try: Path(output_path).unlink()
             except: pass
@@ -1109,6 +1454,12 @@ def unload_all_for_switch():
     global qwen_model, QWEN_LOADED
     global kokoro_pipeline, KOKORO_LOADED
     global INDEX_TTS_LOADED
+    global _is_generating
+
+    with _engine_lock:
+        if _is_generating:
+            print("IGNORADO: modelo em uso")
+            return
 
     if chatterbox_model is not None:
         logger.info("Descarregando Chatterbox...")
@@ -1136,10 +1487,12 @@ def unload_all_for_switch():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         try:
             vram_free = torch.cuda.mem_get_info()[0] / 1e9
             logger.info(f"VRAM livre apos descarga: {vram_free:.2f} GB")
         except: pass
+    gc.collect()  # Second pass to clean any lingering refs freed after CUDA sync
     if torch.backends.mps.is_available():
         try: torch.mps.empty_cache()
         except: pass
@@ -1149,40 +1502,57 @@ def unload_all_for_switch():
 # ENGINE SWITCHER
 # =============================================================================
 
+_switch_lock = threading.Lock()
+
 def switch_to_engine(engine: str) -> bool:
     """
     Muda para o engine especificado, descarregando o anterior primeiro.
     Engines: original | turbo | multilingual | kokoro | qwen | indextts
     """
-    eng = engine.lower().replace("-", "_").replace(" ", "_")
-    print(f"[DEBUG] Engine solicitado: {eng}")
-    logger.info(f"switch_to_engine: {eng}")
+    if _switch_lock.locked():
+        print("[ENGINE] Troca bloqueada (transicao ja em andamento)")
+        return False
 
-    if eng == "turbo":
-        return load_turbo()
-    
-    if eng == "original":
-        return load_original()
-    
-    if eng == "multilingual":
-        return load_multilingual()
+    # FIX 3: Block switch if generation is active
+    with _engine_lock:
+        if _is_generating:
+            logger.error("[ENGINE] switch_to_engine bloqueado: geracao ativa. Aguarde o fim da geracao antes de trocar.")
+            return False
 
-    unload_all_for_switch()
-    torch.cuda.empty_cache()
+    with _switch_lock:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            
+        eng = engine.lower().replace("-", "_").replace(" ", "_")
+        print(f"[DEBUG] Engine solicitado: {eng}")
+        logger.info(f"switch_to_engine: {eng}")
 
-    if eng == "kokoro":
-        return load_kokoro_engine()
+        if eng == "turbo":
+            return load_turbo()
+        
+        if eng == "original":
+            return load_original()
+        
+        if eng == "multilingual":
+            return load_multilingual()
 
-    if eng in ("qwen", "qwen3"):
-        return load_qwen_model()
+        unload_all_for_switch()
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available(): torch.cuda.synchronize()
 
-    if eng == "indextts":
-        global INDEX_TTS_LOADED
-        INDEX_TTS_LOADED = _start_indextts_worker()
-        return INDEX_TTS_LOADED
+        if eng == "kokoro":
+            return load_kokoro_engine()
 
-    logger.error(f"Engine desconhecido: '{engine}'.")
-    return False
+        if eng in ("qwen", "qwen3"):
+            return load_qwen_model()
+
+        if eng == "indextts":
+            global INDEX_TTS_LOADED
+            INDEX_TTS_LOADED = _start_indextts_worker()
+            return INDEX_TTS_LOADED
+
+        logger.error(f"Engine desconhecido: '{engine}'.")
+        return False
 
 
 def get_active_engine() -> str:

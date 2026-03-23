@@ -2633,12 +2633,20 @@ class MainWindow(QMainWindow):
         self.model_status_label.setText("TTS: carregando…")
         self.model_status_label.setStyleSheet("color:#f0b040;font-size:11px;")
         
+        if hasattr(self, "audio_tab") and hasattr(self.audio_tab, "btn_generate"):
+            self.audio_tab.btn_generate.setEnabled(False)
+            self.audio_tab.btn_generate.setText("Carregando modelo...")
+        
         self._loader_thread = ModelLoaderThread(engine_name, model_type)
         self._loader_thread.setStackSize(16 * 1024 * 1024)
         self._loader_thread.finished_loading.connect(self._on_model_preloaded)
         self._loader_thread.start()
 
     def _on_model_preloaded(self, success, info):
+        if hasattr(self, "audio_tab") and hasattr(self.audio_tab, "btn_generate"):
+            self.audio_tab.btn_generate.setEnabled(True)
+            self.audio_tab.btn_generate.setText("🎙️ Gerar Áudio")
+            
         if success:
             self.model_status_label.setText(f"TTS: {info} Pronto ✅")
             self.model_status_label.setStyleSheet("color:#6ddd6d;font-size:11px;font-weight:bold;")

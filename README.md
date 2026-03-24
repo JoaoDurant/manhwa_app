@@ -1,75 +1,86 @@
-# 🎬 Manhwa Video Creator
+# 🎬 Manhwa Video Creator (V3)
 
-O **Manhwa Video Creator** é uma ferramenta profissional de automação para criação de vídeos estilo "Manhwa Recap" ou "Narrativa Visual". Ele combina tecnologias de ponta em **TTS (Text-to-Speech)**, **NLP (Processamento de Linguagem Natural)** e **Composição de Vídeo** para transformar roteiros simples em vídeos dinâmicos com narração humana e efeitos visuais automáticos.
+O **Manhwa Video Creator** é uma ferramenta profissional de automação para a criação de vídeos estilo "Manhwa Recap", "Narrativa Visual" e "Audiobooks". Ele combina tecnologias de ponta em **Generative AI (Gemini)**, **TTS (Text-to-Speech)**, **NLP** e **Composição de Vídeo** para transformar roteiros simples em produções de alta qualidade.
+
+---
+
+## 📐 Fluxograma de Processamento
+
+Abaixo, o fluxo lógico desde o roteiro bruto até o vídeo final:
+
+```mermaid
+graph TD
+    A[📄 Roteiro .txt] --> B{✨ Pré-Proc. Gemini?}
+    B -- Sim --> C[🌐 Revisão & Tradução]
+    C --> D[📝 Scripts Limpos/Multilíngues]
+    B -- Não --> D
+    
+    D --> E[🎙️ Engine TTS]
+    E --> F[🔊 Áudio Gerado]
+    
+    F --> G{✅ Whisper Verify?}
+    G -- Erro > Thr --> E
+    G -- OK --> H[🎵 Mixagem BGM]
+    
+    H --> I[🎬 Compositor de Vídeo]
+    J[🖼️ Imagens] --> I
+    I --> K[🎞️ Ken Burns & Transições]
+    K --> L[🎥 Vídeo Final .mp4]
+```
 
 ---
 
 ## ✨ Funcionalidades Principais
 
-*   **🎙️ Motores de Voz Avançados:**
-    *   **Chatterbox (V2):** Vozes expressivas com suporte a clonagem (Zero-shot) e modelos Turbo/Multilingual.
-    *   **Kokoro (Local):** Motor de voz ultra-rápido e leve com alta fidelidade.
-*   **🧩 Inteligência de Texto (SpaCy):** Processamento automático para adicionar pausas naturais e melhorar a fluência da narração.
-*   **🖼️ Efeito Ken Burns Automático:** Aplica zooms e movimentos de câmera (Pan) suaves para dar vida a imagens estáticas.
-*   **✅ Verificação de Qualidade (Whisper):** Transcreve o áudio gerado em tempo real e compara com o texto original, refazendo a narração automaticamente se houver erros de pronúncia.
-*   **🚀 Otimização Blackwell (RTX 5070 Ti/40 Series):** Totalmente otimizado para GPUs NVIDIA modernas usando `bfloat16`, `TF32` e limpeza estratégica de VRAM para sessões longas.
-*   **🛠️ Pipeline Tudo-em-Um:** Gera o áudio, aplica trilha sonora de fundo e renderiza o vídeo final usando aceleração de hardware (NVENC).
+### 1. 📂 Nova Aba de Configurações (🔧)
+Agora centralizamos todo o controle do aplicativo em um só lugar:
+*   **🔑 Gemini API:** Suporte completo para as famílias **Gemini 3.1**, **Gemini 3.0**, **Gemini 2.5** e as versões experimentais 2.0.
+*   **🧠 Nível de Raciocínio (Thinking Level):** Controle granular para os modelos da série 3 (Minimal, Low, Medium, High).
+*   **📝 Prompts Customizáveis:** Altere o comportamento da revisão e tradução editando os "System Prompts" diretamente na interface.
+*   **🎨 Aparência Dinâmica:** Escolha temas, aplique imagens de fundo personalizadas e ajuste a transparência da UI.
+*   **🗑️ Cache Management:** Limpe o cache de processamento do Gemini com um clique.
+
+### 2. 🌐 Pré-processamento Inteligente (Gemini AI)
+Transforme roteiros brutos em narrativas fluidas usando raciocínio de última geração:
+*   **Revisão Automática:** Remove onomatopeias (BOOM!), limpa símbolos e quebra frases longas.
+*   **Tradução Multilíngue:** Gere versões em diversos idiomas mantendo a coesão narrativa.
+*   **Suporte Multimodal:** Preparado para processamento de imagens e documentos com controle de resolução de mídia.
+*   **Chunking Estratégico:** Processa parágrafos em blocos com sobreposição (overlap) para manter a continuidade.
+
+
+### 3. 🎙️ Motores de Voz de Alta Fidelidade
+*   **Chatterbox (V2):** Clone qualquer voz em segundos (Zero-shot) ou use modelos Turbo/Multilingual.
+*   **Kokoro (Local):** Qualidade de estúdio com velocidade impressionante, rodando localmente.
+
+### 4. ✅ Verificação de Qualidade (Whisper)
+Interface de segurança que transcreve o áudio gerado e compara com o roteiro. Se o modelo "alucinar" ou errar uma palavra difícil, ele refaz a narração instantaneamente.
+
+### 5. 🎞️ Efeito Ken Burns Automático
+Transforma imagens estáticas em cinema através de algoritmos de Zoom e Pan baseados em análise de composição.
 
 ---
 
-## 🚀 Como Instalar
+## 🚀 Instalação e Uso
 
-### 1. Pré-requisitos
-*   **Python 3.10 ou superior.**
-*   **FFmpeg** instalado no seu sistema e adicionado ao seu PATH.
-*   **NVIDIA GPU** com pelo menos 8GB de VRAM (Recomendado para melhor performance).
+### Requisitos
+*   **Python 3.10+** e **FFmpeg**.
+*   **NVIDIA GPU** (8GB+ VRAM) para rodar o TTS local em performance máxima.
 
-### 2. Instalação Automática (Windows)
-Basta baixar o projeto e clicar duas vezes no arquivo:
-```bash
-start.bat
-```
-Este script irá criar um ambiente virtual, instalar todas as dependências (incluindo PyTorch com suporte a CUDA) e baixar os modelos de linguagem necessários.
-
-### 3. Instalação Manual
-Se preferir fazer manualmente:
-```bash
-# Clone o repositório
-git clone https://github.com/seu-usuario/manhwa-video-creator.git
-cd manhwa-video-creator
-
-# Crie e ative um ambiente virtual
-python -m venv venv
-venv\Scripts\activate
-
-# Instale as dependências
-pip install -r requirements.txt
-
-# Baixe o modelo do SpaCy (Português)
-python -m spacy download pt_core_news_lg
-```
+### Início Rápido
+1. Execute `start.bat` para configurar o ambiente automático.
+2. Na aba **🔧 Configurações**, insira sua **Gemini API Key** se desejar usar a revisão inteligente.
+3. Na aba **📝 Áudio**, carregue seu `.txt` e use o painel Gemini para limpar o texto.
+4. Escolha sua voz na aba **⚙️ TTS**.
+5. Adicione imagens na aba **🖼️ Imagens** e gere o vídeo final!
 
 ---
 
-## 🛠️ Como Usar
-
-1.  **Aba Áudio:** Adicione seus arquivos `.txt` (separe parágrafos com uma linha em branco).
-2.  **Aba TTS:** Escolha o motor (Chatterbox ou Kokoro) e a voz desejada. O modelo será carregado automaticamente no fundo.
-3.  **Aba Imagens:** Adicione as imagens que ilustram cada parágrafo.
-4.  **Aba Vídeo:** Configure os efeitos (Zoom, Pan, Transições) e clique em **🎬 Gerar Vídeo**.
+## 📄 Tech Stack
+*   **Backend:** PyTorch, FFmpeg, SpaCy, Whisper, Google GenAI.
+*   **Frontend:** PySide6 (Qt) com suporte a temas modernos.
+*   **Aceleração:** Blackwell Optimized (RTX 40/50 Series), BF16/TF32.
 
 ---
 
-## 💻 Tech Stack
+*Desenvolvido para criadores de conteúdo que buscam velocidade e qualidade profissional.*
 
-*   **Interface:** PySide6 (Qt para Python)
-*   **TTS:** Chatterbox-V2, Kokoro-TTS
-*   **Vídeo:** FFmpeg (via Subprocess & FFmpeg-python), Pillow (Composição Ken Burns)
-*   **Deep Learning:** PyTorch (CUDA 12.4)
-*   **STT (Verification):** OpenAI Whisper
-*   **NLP:** SpaCy
-
----
-
-## 📄 Créditos
-Desenvolvido para criadores de conteúdo que buscam velocidade e qualidade profissional na produção de vídeos de manhwas, webtoons e audiobooks.

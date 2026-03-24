@@ -1,16 +1,16 @@
 {
   "theme": "🌑 Dark (Padrão)",
-  "bg_overlay_alpha": 180,
+  "bg_overlay_alpha": 174,
   "audio_tab": {
     "project": "testeeee",
     "output_root": "output"
   },
   "tts_tab": {
     "tts_engine": "chatterbox",
-    "model_type": "original",
+    "model_type": "turbo",
     "temperature": 0.85,
     "speed": 1.0,
-    "exaggeration": 0.7000000000000001,
+    "exaggeration": 0.7,
     "cfg_weight": 0.5,
     "seed": 3000,
     "output_format": "wav",
@@ -52,6 +52,28 @@
       "sound_design": {
         "auto_ducking": true
       }
+    }
+  },
+  "settings_tab": {
+    "gemini": {
+      "api_key": "AIzaSyAEMxlP_AmP7XEy6Kw1Fnuw9lQ0Q68wxfM",
+      "model_name": "gemini-3.1-flash-lite-preview",
+      "delay": 4,
+      "languages": [],
+      "chunk_size": 9,
+      "overlap": 0,
+      "thinking_level": "minimal",
+      "media_resolution": "media_resolution_high",
+      "revision_prompt": "Você é um editor profissional especializado em roteiros de manhwa e webtoon narrados em áudio.\n\nSua tarefa: revisar APENAS os parágrafos do BLOCO ATUAL.\n\nREGRAS OBRIGATÓRIAS:\n1. Mantenha o sentido e a narrativa original — não reescreva, apenas corrija e melhore fluidez\n2. Cada parágrafo deve terminar de forma que o próximo continue naturalmente (coesão narrativa)\n3. Remova ou substitua: símbolos especiais (*, #, →, —), reticências excessivas (... ... ...), onomatopeias escritas (BOOM!, POW!), parênteses com indicações de cena\n4. Escreva por extenso: números isolados vire palavras (\"3\" → \"três\"), siglas ambíguas explique (\"km\" → \"quilômetros\")\n5. Frases muito longas (mais de 40 palavras): quebre em duas frases naturais\n6. Não adicione frases novas — apenas refine o que existe\n7. Mantenha o mesmo número de parágrafos que recebeu\n\nCONTEXTO (não edite, apenas leia para entender a continuidade):\n[ANTES]: {context_before}\n[DEPOIS]: {context_after}\n\nBLOCO ATUAL para revisar:\n{current_block_formatted}\n\nResponda SOMENTE com JSON válido, sem markdown, sem explicações:\n{{\"paragrafos\": [\"texto revisado 1\", \"texto revisado 2\", ...]}}\n\nO array deve ter exatamente {n} elementos, na mesma ordem dos parágrafos recebidos.",
+      "translation_prompt": "Você é um tradutor profissional especializado em manhwa e webtoon para narração em áudio.\n\nIdioma de destino: {language_name}\nIdioma de origem: português brasileiro\n\nREGRAS OBRIGATÓRIAS:\n1. Traduza com naturalidade no idioma alvo — não traduza literalmente palavra por palavra\n2. Mantenha o tom narrativo, a emoção e o ritmo do texto original\n3. Nomes próprios de personagens: mantenha como estão (não traduza nomes)\n4. A tradução deve soar como narração de áudio, não como texto escrito\n5. Cada parágrafo deve fluir para o próximo (mesma coesão do original)\n6. Mantenha o mesmo número de parágrafos\n\nCONTEXTO em português (não traduza, só leia para entender a continuidade):\n[ANTES]: {context_before}\n[DEPOIS]: {context_after}\n\nBLOCO ATUAL em português para traduzir:\n{current_block_formatted}\n\nResponda SOMENTE com JSON válido, sem markdown, sem explicações:\n{{\"paragrafos\": [\"texto traduzido 1\", \"texto traduzido 2\", ...]}}\n\nO array deve ter exatamente {n} elementos, na mesma ordem dos parágrafos recebidos."
+    },
+    "appearance": {
+      "theme": "🌑 Dark (Padrão)",
+      "bg_overlay_alpha": 174
+    },
+    "paths": {
+      "default_output": "output",
+      "default_voices": "voices"
     }
   }
 }

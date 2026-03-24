@@ -50,7 +50,104 @@ from manhwa_app.video_pipeline import VideoPipeline, EFFECTS
 # Isso evita re-importações dentro de QThreads que causavam 'No module named chatterbox'.
 from manhwa_app.audio_pipeline import _engine, _ENGINE_AVAILABLE, _config_manager
 
+# Import protegido — o painel Gemini fica desativado se a lib não estiver instalada
+try:
+    from google import genai as _genai_check  # noqa: F401
+    from gemini_processor import GeminiProcessor
+    _GEMINI_AVAILABLE = True
+except ImportError:
+    GeminiProcessor = None
+    _GEMINI_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Worker thread do Gemini (padrão QThread do projeto)
+# ---------------------------------------------------------------------------
+import threading as _threading
+
+
+class GeminiWorker(QThread):
+    """Runs Gemini tasks (process content or list models) in a background thread."""
+
+    progress = Signal(int, int, str)
+    finished = Signal(object)          # Can be dict for process or list for model listing
+    error = Signal(str)
+
+    def __init__(self, *args, **kwargs):
+        """
+        Flexible init:
+        Task Process: (txt_path, api_key, languages, delay_seconds, ...)
+        Task List: (api_key, task="list_models")
+        """
+        super().__init__()
+        # Se o segundo argumento for "list_models", é a tarefa de listagem
+        if len(args) >= 2 and args[1] == "list_models":
+            self.task = "list_models"
+            self.api_key = args[0]
+        else:
+            self.task = "process"
+            # Mapear argumentos posicionais se fornecidos, senão usar kwargs
+            if len(args) >= 4:
+                self.txt_path = args[0]
+                self.api_key = args[1]
+                self.languages = args[2]
+                self.delay_seconds = args[3]
+            else:
+                self.txt_path = kwargs.get("txt_path")
+                self.api_key = kwargs.get("api_key")
+                self.languages = kwargs.get("languages")
+                self.delay_seconds = kwargs.get("delay_seconds")
+            
+            self.model_name = kwargs.get("model_name", "gemini-1.5-flash")
+            self.revision_prompt = kwargs.get("revision_prompt")
+            self.translation_prompt = kwargs.get("translation_prompt")
+            self.chunk_size = kwargs.get("chunk_size", 12)
+            self.overlap = kwargs.get("overlap", 2)
+            self.thinking_level = kwargs.get("thinking_level", "high")
+            self.media_resolution = kwargs.get("media_resolution", "media_resolution_high")
+            self._stop_event = _threading.Event()
+
+    def cancel(self):
+        if hasattr(self, "_stop_event"):
+            self._stop_event.set()
+
+    def run(self):
+        try:
+            from google import genai as _genai
+            client = _genai.Client(api_key=self.api_key)
+
+            if self.task == "list_models":
+                models = []
+                for m in client.models.list():
+                    models.append(m.name)
+                self.finished.emit(models)
+                return
+
+            if GeminiProcessor is None:
+                self.error.emit("GeminiProcessor não disponível.")
+                return
+
+            processor = GeminiProcessor(model_name=self.model_name)
+            result = processor.process(
+                txt_path=self.txt_path,
+                api_key=self.api_key,
+                languages=self.languages,
+                delay_seconds=self.delay_seconds,
+                revision_prompt=self.revision_prompt,
+                translation_prompt=self.translation_prompt,
+                chunk_size=self.chunk_size,
+                overlap=self.overlap,
+                thinking_level=self.thinking_level,
+                media_resolution=self.media_resolution,
+                progress_callback=lambda a, t, m: self.progress.emit(a, t, m),
+                stop_event=self._stop_event,
+            )
+            self.finished.emit(result)
+        except Exception as exc:
+            logger.error(f"GeminiWorker erro ({self.task}): {exc}", exc_info=True)
+            self.error.emit(str(exc))
+
 
 # ---------------------------------------------------------------------------
 # Thread para carregamento de modelos em background
@@ -768,7 +865,15 @@ class AudioTab(QWidget):
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
         lv.setSpacing(10)
+
+        # ----------------------------------------------------------------
+        # Painel Gemini — Revisar e Traduzir (pré-processamento opcional)
+        # ----------------------------------------------------------------
+        self._gemini_worker: Optional[GeminiWorker] = None
+        self._setup_gemini_panel(lv)
+
         proj_group = QGroupBox("Projeto & Saída")
+
         pg = QGridLayout(proj_group)
         pg.addWidget(QLabel("Nome do Projeto:"), 0, 0)
         self.project_edit = QLineEdit("meu_projeto")
@@ -927,6 +1032,13 @@ class AudioTab(QWidget):
         ov.addLayout(player_row)
         rv.addWidget(out_group)
         root.addWidget(right)
+
+        # Conexões Gemini (dependem de files_list e _gemini_run_btn ser criado antes)
+        if hasattr(self, "files_list") and hasattr(self, "_gemini_run_btn"):
+            self.files_list.model().rowsInserted.connect(self._update_gemini_btn_state)
+            self.files_list.model().rowsRemoved.connect(self._update_gemini_btn_state)
+            self._update_gemini_btn_state()
+
 
     def _browse_out(self):
         d = QFileDialog.getExistingDirectory(self, "Selecionar diretório de saída")
@@ -1545,6 +1657,213 @@ class AudioTab(QWidget):
     def reset_defaults(self):
         self.project_edit.setText("")
         self.output_root_edit.setText("output")
+
+    # ------------------------------------------------------------------
+    # Painel Gemini — Revisar e Traduzir (pré-processamento opcional)
+    # ------------------------------------------------------------------
+
+    def _setup_gemini_panel(self, parent_layout: QVBoxLayout):
+        """Build the collapsible Gemini pre-processing panel."""
+        self._gemini_collapsed = True
+
+        # Outer container widget (shown/hidden together)
+        self._gemini_container = QWidget()
+        cv = QVBoxLayout(self._gemini_container)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(6)
+
+        # Header row: toggle button
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        self._gemini_toggle_btn = QPushButton("▶  🌐 Revisar e Traduzir com Gemini")
+        self._gemini_toggle_btn.setCheckable(True)
+        self._gemini_toggle_btn.setChecked(False)
+        self._gemini_toggle_btn.setStyleSheet(
+            "text-align:left; padding:6px 10px; font-weight:600;"
+        )
+        self._gemini_toggle_btn.clicked.connect(self._toggle_gemini_panel)
+        header_row.addWidget(self._gemini_toggle_btn)
+        cv.addLayout(header_row)
+
+        # Collapsible body
+        self._gemini_body = QWidget()
+        bv = QVBoxLayout(self._gemini_body)
+        bv.setContentsMargins(8, 4, 8, 8)
+        bv.setSpacing(8)
+
+        if not _GEMINI_AVAILABLE:
+            warn_lbl = QLabel(
+                "⚠ Biblioteca google-genai não instalada.\n"
+                "  pip install google-genai"
+            )
+            warn_lbl.setStyleSheet("color:#f0c040; font-size:11px;")
+            bv.addWidget(warn_lbl)
+            self._gemini_body.setVisible(False)
+            cv.addWidget(self._gemini_body)
+            parent_layout.addWidget(self._gemini_container)
+            self._gemini_toggle_btn.setEnabled(False)
+            return
+
+        # Model selection (synced with SettingsTab)
+        mod_row = QHBoxLayout()
+        mod_row.setContentsMargins(0, 0, 0, 0)
+        mod_row.addWidget(QLabel("Modelo:"))
+        self._gemini_model_combo = QComboBox()
+        # Copiar itens do SettingsTab (se disponível) ou popular
+        self._gemini_model_combo.setMinimumHeight(30)
+        self._gemini_model_combo.currentIndexChanged.connect(self._update_gemini_btn_state)
+        bv.addLayout(mod_row)
+        mod_row.addWidget(self._gemini_model_combo, 1)
+
+        # Syncing logic will be added via MainWindow later or here if possible
+        # But AudioTab doesn't have easy access to settings_tab until runtime
+        
+        info_lbl = QLabel(
+            "💡 Outras configurações na aba <b>🔧 Configurações</b>."
+        )
+        info_lbl.setStyleSheet("color:#6dbdff; font-size:11px;")
+        info_lbl.setWordWrap(True)
+        bv.addWidget(info_lbl)
+
+
+        # Action buttons
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 4, 0, 0)
+        self._gemini_run_btn = QPushButton("▶  Processar Roteiro")
+        self._gemini_run_btn.setObjectName("primary")
+        self._gemini_run_btn.setEnabled(False)
+        self._gemini_run_btn.clicked.connect(self._on_gemini_start)
+        self._gemini_cancel_btn = QPushButton("⏹  Cancelar")
+        self._gemini_cancel_btn.setObjectName("danger")
+        self._gemini_cancel_btn.setEnabled(False)
+        self._gemini_cancel_btn.clicked.connect(self._on_gemini_cancel)
+        btn_row.addWidget(self._gemini_run_btn, 1)
+        btn_row.addWidget(self._gemini_cancel_btn)
+        bv.addLayout(btn_row)
+
+        # Progress bar (hidden until running)
+        self._gemini_progress = QProgressBar()
+        self._gemini_progress.setRange(0, 100)
+        self._gemini_progress.setValue(0)
+        self._gemini_progress.setVisible(False)
+        bv.addWidget(self._gemini_progress)
+
+        # Status label
+        self._gemini_status_lbl = QLabel("")
+        self._gemini_status_lbl.setStyleSheet("font-size:11px;")
+        self._gemini_status_lbl.setWordWrap(True)
+        bv.addWidget(self._gemini_status_lbl)
+
+        self._gemini_body.setVisible(False)
+        cv.addWidget(self._gemini_body)
+        parent_layout.addWidget(self._gemini_container)
+
+
+
+
+    def _toggle_gemini_panel(self, checked: bool):
+        self._gemini_body.setVisible(checked)
+        arrow = "▼" if checked else "▶"
+        self._gemini_toggle_btn.setText(f"{arrow}  🌐 Revisar e Traduzir com Gemini")
+
+    def _update_gemini_btn_state(self):
+        if not _GEMINI_AVAILABLE:
+            return
+        has_files = self.files_list.count() > 0
+        has_model = bool(getattr(self, "_gemini_model_combo", None) and 
+                         self._gemini_model_combo.currentText())
+        self._gemini_run_btn.setEnabled(has_files and has_model)
+
+
+    def _on_gemini_start(self):
+        """Launch GeminiWorker for the currently selected (or first) .txt file."""
+        if not _GEMINI_AVAILABLE or GeminiProcessor is None:
+            return
+
+        # Resolve which file to process
+        selected = self.files_list.selectedItems()
+        if selected:
+            row = self.files_list.row(selected[0])
+        else:
+            row = 0
+        if row >= len(self._files):
+            return
+        txt_path = self._files[row]
+
+        settings = self.window().settings_tab
+        api_key = settings.get_api_key()
+        if not api_key:
+            self._gemini_status_lbl.setText("❌ Insira sua API Key na aba <b>Configurações</b> antes de continuar.")
+            self.window().tabs.setCurrentWidget(settings)
+            return
+
+        languages = settings.get_languages()
+        delay = settings.get_delay()
+        
+        # Use local combo if it has data, otherwise fallback to settings
+        model_name = self._gemini_model_combo.currentData() or settings.get_model_name()
+        
+        revision_prompt = settings.get_revision_prompt()
+
+        translation_prompt = settings.get_translation_prompt()
+        chunk_size = settings.get_chunk_size()
+        overlap = settings.get_overlap()
+        thinking_level = settings.get_thinking_level()
+        media_resolution = settings.get_media_resolution()
+        
+        self._gemini_worker = GeminiWorker(
+            txt_path=txt_path,
+            api_key=api_key,
+            languages=languages,
+            delay_seconds=delay,
+            model_name=model_name,
+            revision_prompt=revision_prompt,
+            translation_prompt=translation_prompt,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            thinking_level=thinking_level,
+            media_resolution=media_resolution
+        )
+        self._gemini_worker.progress.connect(self._on_gemini_progress)
+        self._gemini_worker.finished.connect(self._on_gemini_done)
+        self._gemini_worker.error.connect(self._on_gemini_error)
+
+        self._gemini_run_btn.setEnabled(False)
+        self._gemini_cancel_btn.setEnabled(True)
+        self._gemini_progress.setValue(0)
+        self._gemini_progress.setVisible(True)
+        self._gemini_status_lbl.setText("⏳ Iniciando…")
+        self._gemini_worker.start()
+
+    def _on_gemini_progress(self, current: int, total: int, message: str):
+        if total > 0:
+            pct = int(current * 100 / total)
+            self._gemini_progress.setValue(pct)
+        self._gemini_status_lbl.setText(message)
+
+    def _on_gemini_done(self, result: dict):
+        self._gemini_run_btn.setEnabled(True)
+        self._gemini_cancel_btn.setEnabled(False)
+        self._gemini_progress.setValue(100)
+        if result:
+            paths = "\n".join(f"  ✅ {Path(p).name}" for p in result.values())
+            self._gemini_status_lbl.setText(f"Concluído!\n{paths}")
+        else:
+            self._gemini_status_lbl.setText("⚠ Processamento concluído sem saída.")
+        self._gemini_worker = None
+
+    def _on_gemini_error(self, message: str):
+        self._gemini_run_btn.setEnabled(True)
+        self._gemini_cancel_btn.setEnabled(False)
+        self._gemini_progress.setVisible(False)
+        self._gemini_status_lbl.setText(f"❌ {message}")
+        self._gemini_worker = None
+
+    def _on_gemini_cancel(self):
+        if self._gemini_worker and self._gemini_worker.isRunning():
+            self._gemini_worker.cancel()
+            self._gemini_status_lbl.setText("⏹ Cancelamento solicitado…")
+            self._gemini_cancel_btn.setEnabled(False)
 
 # ---------------------------------------------------------------------------
 # Aba 2 — Imagens
@@ -2597,6 +2916,692 @@ class VideoTab(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Aba de Configurações
+# ---------------------------------------------------------------------------
+
+_DEFAULT_REVISION_PROMPT = """Você é um editor profissional especializado em roteiros de manhwa e webtoon narrados em áudio.
+
+Sua tarefa: revisar APENAS os parágrafos do BLOCO ATUAL.
+
+REGRAS OBRIGATÓRIAS:
+1. Mantenha o sentido e a narrativa original — não reescreva, apenas corrija e melhore fluidez
+2. Cada parágrafo deve terminar de forma que o próximo continue naturalmente (coesão narrativa)
+3. Remova ou substitua: símbolos especiais (*, #, →, —), reticências excessivas (... ... ...), onomatopeias escritas (BOOM!, POW!), parênteses com indicações de cena
+4. Escreva por extenso: números isolados vire palavras ("3" → "três"), siglas ambíguas explique ("km" → "quilômetros")
+5. Frases muito longas (mais de 40 palavras): quebre em duas frases naturais
+6. Não adicione frases novas — apenas refine o que existe
+7. Mantenha o mesmo número de parágrafos que recebeu
+
+CONTEXTO (não edite, apenas leia para entender a continuidade):
+[ANTES]: {context_before}
+[DEPOIS]: {context_after}
+
+BLOCO ATUAL para revisar:
+{current_block_formatted}
+
+Responda SOMENTE com JSON válido, sem markdown, sem explicações:
+{{"paragrafos": ["texto revisado 1", "texto revisado 2", ...]}}
+
+O array deve ter exatamente {n} elementos, na mesma ordem dos parágrafos recebidos."""
+
+_DEFAULT_TRANSLATION_PROMPT = """Você é um tradutor profissional especializado em manhwa e webtoon para narração em áudio.
+
+Idioma de destino: {language_name}
+Idioma de origem: português brasileiro
+
+REGRAS OBRIGATÓRIAS:
+1. Traduza com naturalidade no idioma alvo — não traduza literalmente palavra por palavra
+2. Mantenha o tom narrativo, a emoção e o ritmo do texto original
+3. Nomes próprios de personagens: mantenha como estão (não traduza nomes)
+4. A tradução deve soar como narração de áudio, não como texto escrito
+5. Cada parágrafo deve fluir para o próximo (mesma coesão do original)
+6. Mantenha o mesmo número de parágrafos
+
+CONTEXTO em português (não traduza, só leia para entender a continuidade):
+[ANTES]: {context_before}
+[DEPOIS]: {context_after}
+
+BLOCO ATUAL em português para traduzir:
+{current_block_formatted}
+
+Responda SOMENTE com JSON válido, sem markdown, sem explicações:
+{{"paragrafos": ["texto traduzido 1", "texto traduzido 2", ...]}}
+
+O array deve ter exatamente {n} elementos, na mesma ordem dos parágrafos recebidos."""
+
+
+class SettingsTab(QWidget):
+    """Aba de configurações gerais: Gemini, aparência, paths e sessão."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Wrap everything in a scroll area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        vl = QVBoxLayout(inner)
+        vl.setContentsMargins(24, 20, 24, 24)
+        vl.setSpacing(18)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+
+        # ── 1. Gemini API ─────────────────────────────────────────────
+        gem_box = QGroupBox("🔑  Gemini API")
+        gg = QGridLayout(gem_box)
+        gg.setSpacing(10)
+
+        gg.addWidget(QLabel("Modelo:"), 0, 0)
+        self.model_combo = QComboBox()
+        # Modelos Solicitados
+        self.model_combo.addItem("Gemini 2.5 Flash (🔥 Recomendado)", "gemini-2.5-flash")
+        self.model_combo.addItem("Gemini 3 Flash", "gemini-3-flash-preview")
+        self.model_combo.addItem("Gemini 3.1 Flash", "gemini-3.1-flash-lite-preview")
+
+        self.model_combo.setEditable(False)
+        self.model_combo.setMinimumHeight(40)
+        gg.addWidget(self.model_combo, 0, 1, 1, 3) # Ocupar mais espaço
+
+
+
+        self.btn_fetch_models = QPushButton("🔄 Atualizar Lista")
+        self.btn_fetch_models.setToolTip("Busca modelos disponíveis para sua chave API no Google")
+        self.btn_fetch_models.clicked.connect(self._fetch_models)
+        gg.addWidget(self.btn_fetch_models, 0, 3)
+
+
+        gg.addWidget(QLabel("API Key:"), 1, 0)
+        self.api_key_edit = QLineEdit()
+        self.api_key_edit.setPlaceholderText("Cole sua Gemini API Key aqui (começa com AIza...)...")
+        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        gg.addWidget(self.api_key_edit, 1, 1, 1, 2)
+
+        self._btn_eye = QPushButton("👁")
+        self._btn_eye.setFixedWidth(34)
+        self._btn_eye.setCheckable(True)
+        self._btn_eye.setToolTip("Mostrar/ocultar chave")
+        self._btn_eye.toggled.connect(
+            lambda on: self.api_key_edit.setEchoMode(
+                QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password)
+        )
+        gg.addWidget(self._btn_eye, 1, 3)
+
+        self.btn_test = QPushButton("🔗  Testar Conexão")
+        self.btn_test.setObjectName("primary")
+        self.btn_test.clicked.connect(self._test_connection)
+        gg.addWidget(self.btn_test, 2, 1)
+
+        self.test_result_lbl = QLabel("")
+        self.test_result_lbl.setWordWrap(True)
+        gg.addWidget(self.test_result_lbl, 2, 2, 1, 2)
+        vl.addWidget(gem_box)
+
+        # ── 2. Comportamento Gemini ───────────────────────────────────
+        behav_box = QGroupBox("⚙  Comportamento Gemini")
+        bg = QGridLayout(behav_box)
+        bg.setSpacing(10)
+
+        bg.addWidget(QLabel("Delay entre chamadas:"), 0, 0)
+        self.delay_slider = QSlider(Qt.Orientation.Horizontal)
+        self.delay_slider.setRange(2, 30)
+        self.delay_slider.setValue(4)
+        self.delay_lbl = QLabel("4 s")
+        self.delay_slider.valueChanged.connect(lambda v: self.delay_lbl.setText(f"{v} s"))
+        bg.addWidget(self.delay_slider, 0, 1)
+        bg.addWidget(self.delay_lbl, 0, 2)
+
+        bg.addWidget(QLabel("Idiomas padrão:"), 1, 0)
+        lang_w = QWidget()
+        lh = QHBoxLayout(lang_w)
+        lh.setContentsMargins(0, 0, 0, 0)
+        self.chk_en = QCheckBox("Inglês (en)")
+        self.chk_es = QCheckBox("Espanhol (es)")
+        self.chk_fr = QCheckBox("Francês (fr)")
+        self.chk_de = QCheckBox("Alemão (de)")
+        self.chk_ja = QCheckBox("Japonês (ja)")
+        self.chk_ko = QCheckBox("Coreano (ko)")
+        for chk in [self.chk_en, self.chk_es, self.chk_fr, self.chk_de, self.chk_ja, self.chk_ko]:
+            lh.addWidget(chk)
+        lh.addStretch()
+        bg.addWidget(lang_w, 1, 1, 1, 2)
+
+        bg.addWidget(QLabel("Tamanho de chunk:"), 2, 0)
+        self.chunk_spin = QSpinBox()
+        self.chunk_spin.setRange(4, 40)
+        self.chunk_spin.setValue(12)
+        self.chunk_spin.setToolTip("Parágrafos por chamada à API (padrão: 12)")
+        bg.addWidget(self.chunk_spin, 2, 1)
+
+        bg.addWidget(QLabel("Overlap (contexto):"), 3, 0)
+        self.overlap_spin = QSpinBox()
+        self.overlap_spin.setRange(0, 6)
+        self.overlap_spin.setValue(2)
+        self.overlap_spin.setToolTip("Parágrafos de contexto antes/depois de cada chunk (padrão: 2)")
+        bg.addWidget(self.overlap_spin, 3, 1)
+
+        # Thinking Level (Gemini 3+)
+        bg.addWidget(QLabel("Nível de Raciocínio (Gemini 3):"), 4, 0)
+        self.thinking_combo = QComboBox()
+        self.thinking_combo.addItem("high (Padrão, Máximo Raciocínio)", "high")
+        self.thinking_combo.addItem("medium (Equilibrado)", "medium")
+        self.thinking_combo.addItem("low (Menor Latência)", "low")
+        self.thinking_combo.addItem("minimal (Quase sem pensamento)", "minimal")
+        self.thinking_combo.setToolTip("Controla a profundidade do raciocínio interno do modelo.")
+        bg.addWidget(self.thinking_combo, 4, 1, 1, 2)
+
+        # Media Resolution (Gemini 3+ Vision)
+        bg.addWidget(QLabel("Resolução de Mídia (Visão):"), 5, 0)
+        self.media_res_combo = QComboBox()
+        self.media_res_combo.addItem("media_resolution_high (Recomendado Imagens)", "media_resolution_high")
+        self.media_res_combo.addItem("media_resolution_medium (Recomendado PDFs)", "media_resolution_medium")
+        self.media_res_combo.addItem("media_resolution_low (Recomendado Vídeo)", "media_resolution_low")
+        self.media_res_combo.addItem("media_resolution_ultra_high (Detalhes Extremos)", "media_resolution_ultra_high")
+        self.media_res_combo.setToolTip("Determina o detalhamento no processamento de imagens/vídeos.")
+        bg.addWidget(self.media_res_combo, 5, 1, 1, 2)
+
+        vl.addWidget(behav_box)
+
+        # ── 3. Prompt de Revisão ──────────────────────────────────────
+        rev_box = QGroupBox("📝  Prompt de Revisão  (variáveis: {context_before} {context_after} {current_block_formatted} {n})")
+        rv = QVBoxLayout(rev_box)
+        self.revision_prompt_edit = QTextEdit()
+        self.revision_prompt_edit.setPlainText(_DEFAULT_REVISION_PROMPT)
+        self.revision_prompt_edit.setMinimumHeight(200)
+        self.revision_prompt_edit.setFont(QFont("Consolas", 10))
+        rv.addWidget(self.revision_prompt_edit)
+        btn_reset_rev = QPushButton("↺  Restaurar Prompt Padrão")
+        btn_reset_rev.clicked.connect(
+            lambda: self.revision_prompt_edit.setPlainText(_DEFAULT_REVISION_PROMPT))
+        rv.addWidget(btn_reset_rev)
+        vl.addWidget(rev_box)
+
+        # ── 4. Prompt de Tradução ─────────────────────────────────────
+        tr_box = QGroupBox("🌐  Prompt de Tradução  (variáveis: {language_name} {context_before} {context_after} {current_block_formatted} {n})")
+        tv = QVBoxLayout(tr_box)
+        self.translation_prompt_edit = QTextEdit()
+        self.translation_prompt_edit.setPlainText(_DEFAULT_TRANSLATION_PROMPT)
+        self.translation_prompt_edit.setMinimumHeight(200)
+        self.translation_prompt_edit.setFont(QFont("Consolas", 10))
+        tv.addWidget(self.translation_prompt_edit)
+        btn_reset_tr = QPushButton("↺  Restaurar Prompt Padrão")
+        btn_reset_tr.clicked.connect(
+            lambda: self.translation_prompt_edit.setPlainText(_DEFAULT_TRANSLATION_PROMPT))
+        tv.addWidget(btn_reset_tr)
+        vl.addWidget(tr_box)
+
+        # ── 5. Cache Gemini ───────────────────────────────────────────
+        cache_box = QGroupBox("🗑  Cache Gemini")
+        ch = QHBoxLayout(cache_box)
+        self.cache_size_lbl = QLabel("Calculando...")
+        ch.addWidget(self.cache_size_lbl, 1)
+        btn_refresh_cache = QPushButton("🔄 Atualizar")
+        btn_refresh_cache.clicked.connect(self._refresh_cache_info)
+        ch.addWidget(btn_refresh_cache)
+        btn_clear_cache = QPushButton("🗑  Limpar Cache")
+        btn_clear_cache.setObjectName("danger")
+        btn_clear_cache.clicked.connect(self._clear_cache)
+        ch.addWidget(btn_clear_cache)
+        vl.addWidget(cache_box)
+        self._refresh_cache_info()
+
+        # ── 6. Aparência ──────────────────────────────────────────────
+        appear_box = QGroupBox("🎨  Aparência")
+        ag = QGridLayout(appear_box)
+        ag.setSpacing(10)
+
+        ag.addWidget(QLabel("Tema:"), 0, 0)
+        self.theme_combo = QComboBox()
+        for name in THEMES:
+            self.theme_combo.addItem(name)
+        self.theme_combo.setMinimumHeight(32)
+        self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
+        ag.addWidget(self.theme_combo, 0, 1, 1, 3)
+
+        ag.addWidget(QLabel("Imagem de Fundo:"), 1, 0)
+        self.bg_path_edit = QLineEdit()
+        self.bg_path_edit.setPlaceholderText("(nenhuma)")
+        self.bg_path_edit.setReadOnly(True)
+        ag.addWidget(self.bg_path_edit, 1, 1)
+        btn_bg = QPushButton("📁 Selecionar")
+        btn_bg.clicked.connect(self._browse_bg)
+        ag.addWidget(btn_bg, 1, 2)
+        btn_clear_bg = QPushButton("✖")
+        btn_clear_bg.setObjectName("danger")
+        btn_clear_bg.setFixedWidth(32)
+        btn_clear_bg.clicked.connect(self._clear_bg)
+        ag.addWidget(btn_clear_bg, 1, 3)
+
+        ag.addWidget(QLabel("Opacidade do Fundo:"), 2, 0)
+        self.overlay_slider = QSlider(Qt.Orientation.Horizontal)
+        self.overlay_slider.setRange(0, 240)
+        self.overlay_slider.setValue(180)
+        self.overlay_lbl = QLabel("180")
+        self.overlay_slider.valueChanged.connect(
+            lambda v: (self.overlay_lbl.setText(str(v)), self._sync_bg_to_main()))
+        ag.addWidget(self.overlay_slider, 2, 1)
+        ag.addWidget(self.overlay_lbl, 2, 2)
+        vl.addWidget(appear_box)
+
+        # ── 7. Paths Padrão ───────────────────────────────────────────
+        paths_box = QGroupBox("📁  Paths Padrão")
+        pg = QGridLayout(paths_box)
+        pg.setSpacing(10)
+
+        pg.addWidget(QLabel("Pasta de Saída Padrão:"), 0, 0)
+        self.default_output_edit = QLineEdit("output")
+        pg.addWidget(self.default_output_edit, 0, 1)
+        btn_out = QPushButton("📁")
+        btn_out.setFixedWidth(34)
+        btn_out.clicked.connect(lambda: self._browse_dir(self.default_output_edit))
+        pg.addWidget(btn_out, 0, 2)
+
+        pg.addWidget(QLabel("Pasta de Vozes Padrão:"), 1, 0)
+        self.default_voices_edit = QLineEdit("voices")
+        pg.addWidget(self.default_voices_edit, 1, 1)
+        btn_voi = QPushButton("📁")
+        btn_voi.setFixedWidth(34)
+        btn_voi.clicked.connect(lambda: self._browse_dir(self.default_voices_edit))
+        pg.addWidget(btn_voi, 1, 2)
+        vl.addWidget(paths_box)
+
+        # ── 8. Sessão ─────────────────────────────────────────────────
+        sess_box = QGroupBox("💾  Sessão")
+        sh = QHBoxLayout(sess_box)
+        btn_export = QPushButton("📤  Exportar Configurações")
+        btn_export.clicked.connect(self._export_session)
+        sh.addWidget(btn_export)
+        btn_import = QPushButton("📥  Importar Configurações")
+        btn_import.clicked.connect(self._import_session)
+        sh.addWidget(btn_import)
+        sh.addStretch()
+        vl.addWidget(sess_box)
+
+        vl.addStretch()
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    def get_api_key(self) -> str:
+        return self.api_key_edit.text().strip()
+
+    def get_model_name(self) -> str:
+        return self.model_combo.currentData() or self.model_combo.currentText().strip()
+
+    def get_delay(self) -> float:
+        return float(self.delay_slider.value())
+
+    def get_languages(self) -> list:
+        langs = []
+        mapping = [
+            (self.chk_en, "en"), (self.chk_es, "es"), (self.chk_fr, "fr"),
+            (self.chk_de, "de"), (self.chk_ja, "ja"), (self.chk_ko, "ko"),
+        ]
+        for chk, code in mapping:
+            if chk.isChecked():
+                langs.append(code)
+        return langs
+
+    def get_revision_prompt(self) -> str:
+        return self.revision_prompt_edit.toPlainText()
+
+    def get_translation_prompt(self) -> str:
+        return self.translation_prompt_edit.toPlainText()
+
+    def get_chunk_size(self) -> int:
+        return self.chunk_spin.value()
+
+    def get_overlap(self) -> int:
+        return self.overlap_spin.value()
+
+    def get_thinking_level(self) -> str:
+        return self.thinking_combo.currentData()
+
+    def get_media_resolution(self) -> str:
+        return self.media_res_combo.currentData()
+
+
+    # ------------------------------------------------------------------
+    # Session persistence
+    # ------------------------------------------------------------------
+
+    def get_session(self) -> dict:
+        return {
+            "gemini": {
+                "api_key": self.get_api_key(),
+                "model_name": self.get_model_name(),
+                "delay": self.delay_slider.value(),
+                "languages": self.get_languages(),
+                "chunk_size": self.chunk_spin.value(),
+                "overlap": self.overlap_spin.value(),
+                "thinking_level": self.get_thinking_level(),
+                "media_resolution": self.get_media_resolution(),
+                "revision_prompt": self.get_revision_prompt(),
+                "translation_prompt": self.get_translation_prompt(),
+
+            },
+            "appearance": {
+                "theme": self.theme_combo.currentText(),
+                "bg_overlay_alpha": self.overlay_slider.value(),
+            },
+            "paths": {
+                "default_output": self.default_output_edit.text().strip(),
+                "default_voices": self.default_voices_edit.text().strip(),
+            }
+        }
+
+    def load_session(self, data: dict):
+        gem = data.get("gemini", {})
+        if "api_key" in gem:
+            self.api_key_edit.setText(gem["api_key"])
+        if "model_name" in gem:
+            idx = self.model_combo.findData(gem["model_name"])
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+            else:
+                self.model_combo.setCurrentText(gem["model_name"])
+        if "delay" in gem:
+            self.delay_slider.setValue(int(gem["delay"]))
+        if "chunk_size" in gem:
+            self.chunk_spin.setValue(int(gem["chunk_size"]))
+        if "overlap" in gem:
+            self.overlap_spin.setValue(int(gem["overlap"]))
+        if "thinking_level" in gem:
+            idx = self.thinking_combo.findData(gem["thinking_level"])
+            if idx >= 0: self.thinking_combo.setCurrentIndex(idx)
+        if "media_resolution" in gem:
+            idx = self.media_res_combo.findData(gem["media_resolution"])
+            if idx >= 0: self.media_res_combo.setCurrentIndex(idx)
+        if "revision_prompt" in gem:
+            self.revision_prompt_edit.setPlainText(gem["revision_prompt"])
+        if "translation_prompt" in gem:
+            self.translation_prompt_edit.setPlainText(gem["translation_prompt"])
+
+        if "languages" in gem:
+            mapping = {"en": self.chk_en, "es": self.chk_es, "fr": self.chk_fr,
+                       "de": self.chk_de, "ja": self.chk_ja, "ko": self.chk_ko}
+            for code, chk in mapping.items():
+
+                chk.setChecked(code in gem["languages"])
+        if "chunk_size" in gem:
+            self.chunk_spin.setValue(int(gem["chunk_size"]))
+        if "overlap" in gem:
+            self.overlap_spin.setValue(int(gem["overlap"]))
+        if "revision_prompt" in gem:
+            self.revision_prompt_edit.setPlainText(gem["revision_prompt"])
+        if "translation_prompt" in gem:
+            self.translation_prompt_edit.setPlainText(gem["translation_prompt"])
+
+        app_ = data.get("appearance", {})
+        if "theme" in app_:
+            self.theme_combo.setCurrentText(app_["theme"])
+        if "bg_overlay_alpha" in app_:
+            self.overlay_slider.setValue(int(app_["bg_overlay_alpha"]))
+
+        paths_ = data.get("paths", {})
+        if "default_output" in paths_:
+            self.default_output_edit.setText(paths_["default_output"])
+        if "default_voices" in paths_:
+            self.default_voices_edit.setText(paths_["default_voices"])
+
+    def reset_defaults(self):
+        self.api_key_edit.clear()
+        self.model_combo.setCurrentIndex(0)
+        self.delay_slider.setValue(4)
+        for chk in [self.chk_en, self.chk_es, self.chk_fr, self.chk_de, self.chk_ja, self.chk_ko]:
+            chk.setChecked(False)
+        self.chunk_spin.setValue(12)
+        self.overlap_spin.setValue(2)
+        self.thinking_combo.setCurrentIndex(0)
+        self.media_res_combo.setCurrentIndex(0)
+        self.revision_prompt_edit.setPlainText(_DEFAULT_REVISION_PROMPT)
+
+        self.translation_prompt_edit.setPlainText(_DEFAULT_TRANSLATION_PROMPT)
+        self.theme_combo.setCurrentText("🌑 Dark (Padrão)")
+        self.overlay_slider.setValue(180)
+        self.default_output_edit.setText("output")
+        self.default_voices_edit.setText("voices")
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def _test_connection(self):
+        key = self.get_api_key()
+        model = self.get_model_name()
+        if not key:
+            self.test_result_lbl.setText("❌ Insira uma API Key antes de testar.")
+            self.test_result_lbl.setStyleSheet("color:#e05555;")
+            return
+        if not _GEMINI_AVAILABLE:
+            self.test_result_lbl.setText("❌ google-genai não instalado: pip install google-genai")
+            self.test_result_lbl.setStyleSheet("color:#e05555;")
+            return
+        self.btn_test.setEnabled(False)
+        self.test_result_lbl.setText("⏳ Testando conexão...")
+        self.test_result_lbl.setStyleSheet("color:#f0c040;")
+
+        class _TestWorker(QThread):
+            done = Signal(bool, str)
+            def __init__(self, k, m, t, r):
+                super().__init__()
+                self._k = k
+                self._m = m
+                self._t = t
+                self._r = r
+            def run(self):
+                try:
+                    from google import genai as _genai
+                    from google.genai import types as _types
+                    client = _genai.Client(api_key=self._k)
+                    
+                    config = None
+                    if self._t and "gemini-3" in self._m:
+                        config = _types.GenerateContentConfig(
+                            thinking_config=_types.ThinkingConfig(thinking_level=self._t)
+                        )
+                    
+                    client.models.generate_content(model=self._m, contents="ok", config=config)
+                    self.done.emit(True, f"✅ Conectado ao modelo {self._m} com sucesso!")
+
+                except Exception as e:
+                    self.done.emit(False, f"❌ {e}")
+
+        think = self.get_thinking_level()
+        res = self.get_media_resolution()
+        self._test_worker = _TestWorker(key, model, think, res)
+
+        self._test_worker.done.connect(self._on_test_done)
+        self._test_worker.start()
+
+    def _fetch_models(self):
+        key = self.api_key_edit.text().strip()
+        if not key:
+            QMessageBox.warning(self, "Sem Chave", "Insira uma API Key para buscar os modelos.")
+            return
+        
+        self.btn_fetch_models.setEnabled(False)
+        self.btn_fetch_models.setText("Buscando...")
+        self.test_result_lbl.setText("⏳ Buscando lista de modelos...")
+
+        self._fetch_worker = GeminiWorker(key, "list_models")
+        self._fetch_worker.finished.connect(self._on_fetch_done)
+        self._fetch_worker.error.connect(self._on_fetch_error)
+        self._fetch_worker.start()
+
+    def _on_fetch_done(self, data):
+        self.btn_fetch_models.setEnabled(True)
+        self.btn_fetch_models.setText("🔄 Atualizar Lista")
+        
+        if not isinstance(data, list):
+             self.test_result_lbl.setText("❌ Resposta inesperada ao buscar modelos.")
+             return
+
+        
+        current_model = self.get_model_name()
+        self.model_combo.clear()
+        
+        # Priorizar modelos úteis
+        important = ["flash", "pro", "thinking"]
+        
+        for m_id in data:
+            name = m_id.replace("models/", "")
+            desc = name
+            if "flash" in name: desc += " (Equilibrado)"
+            if "pro" in name: desc += " (Avançado)"
+            if "lite" in name: desc += " (Poupador)"
+            
+            self.model_combo.addItem(desc, name)
+            
+        # Tentar restaurar o modelo que estava selecionado
+        idx = self.model_combo.findData(current_model)
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+        else:
+            self.model_combo.setCurrentText(current_model)
+            
+        self.test_result_lbl.setText(f"✅ total de {len(data)} modelos carregados.")
+        
+        # Notificar MainWindow para atualizar o combo da aba Áudio
+        main_win = self.window()
+        if hasattr(main_win, "audio_tab") and hasattr(main_win.audio_tab, "_gemini_model_combo"):
+             main_win.audio_tab._gemini_model_combo.clear()
+             for i in range(self.model_combo.count()):
+                 main_win.audio_tab._gemini_model_combo.addItem(
+                     self.model_combo.itemText(i),
+                     self.model_combo.itemData(i)
+                 )
+             main_win.audio_tab._gemini_model_combo.setCurrentIndex(self.model_combo.currentIndex())
+
+    def _on_fetch_error(self, msg: str):
+        self.btn_fetch_models.setEnabled(True)
+        self.btn_fetch_models.setText("🔄 Atualizar Lista")
+        self.test_result_lbl.setText(f"❌ Erro ao buscar modelos: {msg}")
+
+    def _on_test_done(self, success: bool, msg: str):
+
+
+        self.btn_test.setEnabled(True)
+        if not success:
+            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                msg = "❌ Quota Excedida (429): Você atingiu o limite de requisições do Gemini (Tier Gratuito). Aguarde 1 minuto ou aumente o 'Delay' e tente novamente."
+            self.test_result_lbl.setStyleSheet("color:#e05555;")
+        else:
+            self.test_result_lbl.setStyleSheet("color:#6ddd6d;")
+        
+        self.test_result_lbl.setText(msg)
+
+
+    def _refresh_cache_info(self):
+        cache_dir = Path("gemini_cache")
+        if cache_dir.exists():
+            files = list(cache_dir.glob("*.json"))
+            total = sum(f.stat().st_size for f in files)
+            kb = total / 1024
+            self.cache_size_lbl.setText(
+                f"{len(files)} arquivo(s) de cache — {kb:.1f} KB"
+            )
+        else:
+            self.cache_size_lbl.setText("Pasta gemini_cache não encontrada.")
+
+    def _clear_cache(self):
+        cache_dir = Path("gemini_cache")
+        if not cache_dir.exists():
+            QMessageBox.information(self, "Cache", "Nenhum cache encontrado.")
+            return
+        ans = QMessageBox.question(
+            self, "Limpar Cache",
+            "Tem certeza? Todo o progresso de revisão/tradução em cache será perdido.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            import shutil
+            shutil.rmtree(str(cache_dir), ignore_errors=True)
+            cache_dir.mkdir(exist_ok=True)
+            self._refresh_cache_info()
+            QMessageBox.information(self, "Cache Limpo", "Cache Gemini removido com sucesso.")
+
+    def _on_theme_changed(self, name: str):
+        # Sync with MainWindow if available
+        mw = self.window()
+        if hasattr(mw, "theme_combo"):
+            mw.theme_combo.setCurrentText(name)
+
+    def _browse_bg(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Selecionar imagem de fundo", "",
+            "Imagens (*.png *.jpg *.jpeg *.webp *.bmp)"
+        )
+        if path:
+            self.bg_path_edit.setText(path)
+            # Apply to MainWindow
+            mw = self.window()
+            if hasattr(mw, "_browse_background"):
+                from PySide6.QtGui import QPixmap
+                px = QPixmap(path)
+                if not px.isNull():
+                    mw._bg_pixmap = px
+                    mw.btn_clear_bg.setVisible(True)
+                    mw.overlay_lbl.setVisible(True)
+                    mw.overlay_slider.setVisible(True)
+                    mw._apply_header_style()
+                    mw.update()
+
+    def _clear_bg(self):
+        self.bg_path_edit.clear()
+        mw = self.window()
+        if hasattr(mw, "_clear_background"):
+            mw._clear_background()
+
+    def _sync_bg_to_main(self):
+        mw = self.window()
+        if hasattr(mw, "overlay_slider"):
+            mw.overlay_slider.setValue(self.overlay_slider.value())
+            mw._bg_overlay_alpha = self.overlay_slider.value()
+            mw.update()
+
+    def _browse_dir(self, edit: QLineEdit):
+        path = QFileDialog.getExistingDirectory(self, "Selecionar pasta", edit.text())
+        if path:
+            edit.setText(path)
+
+    def _export_session(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar Configurações", "manhwa_config.json", "JSON (*.json)"
+        )
+        if path:
+            mw = self.window()
+            data = mw.get_session() if hasattr(mw, "get_session") else self.get_session()
+            Path(path).write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            QMessageBox.information(self, "Exportado", f"Configurações salvas em:\n{path}")
+
+    def _import_session(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Importar Configurações", "", "JSON (*.json)"
+        )
+        if path:
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+                mw = self.window()
+                if hasattr(mw, "_restore_session"):
+                    mw._session = data
+                    mw._restore_session()
+                else:
+                    self.load_session(data.get("settings_tab", data))
+                QMessageBox.information(self, "Importado", "Configurações carregadas com sucesso.")
+            except Exception as e:
+                QMessageBox.critical(self, "Erro", f"Falha ao importar: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Janela Principal
 # ---------------------------------------------------------------------------
 
@@ -2778,17 +3783,43 @@ class MainWindow(QMainWindow):
 
         # ── Tabs ─────────────────────────────────────────────────────
         self.tabs = QTabWidget()
-        self.audio_tab   = AudioTab()
-        self.tts_tab     = TtsConfigTab()
-        self.images_tab  = ImagesTab()
-        self.video_tab   = VideoTab()
-        self.tabs.addTab(self.audio_tab,  "📝 Áudio")
-        self.tabs.addTab(self.tts_tab,    "⚙️ TTS")
-        self.tabs.addTab(self.images_tab, "🖼 Imagens")
-        self.tabs.addTab(self.video_tab,  "🎬 Vídeo")
+        self.audio_tab     = AudioTab()
+        self.tts_tab       = TtsConfigTab()
+        self.images_tab    = ImagesTab()
+        self.video_tab     = VideoTab()
+        self.settings_tab  = SettingsTab()
+        self.tabs.addTab(self.audio_tab,    "📝 Áudio")
+        self.tabs.addTab(self.tts_tab,      "⚙️ TTS")
+        self.tabs.addTab(self.images_tab,   "🖼 Imagens")
+        self.tabs.addTab(self.video_tab,    "🎬 Vídeo")
+        self.tabs.addTab(self.settings_tab, "🔧 Configurações")
         # Ensure QTabWidget is transparent at its base, so bg image falls through
         self.tabs.setStyleSheet("QTabWidget { background: transparent; }")
         layout.addWidget(self.tabs)
+
+        # ── Sincronização Gemini ─────────────────────────────────────
+        # Sincronizar Combos do Gemini entre Áudio e Configurações
+        if hasattr(self.audio_tab, "_gemini_model_combo"):
+            for i in range(self.settings_tab.model_combo.count()):
+                self.audio_tab._gemini_model_combo.addItem(
+                    self.settings_tab.model_combo.itemText(i),
+                    self.settings_tab.model_combo.itemData(i)
+                )
+            self.audio_tab._gemini_model_combo.setCurrentIndex(self.settings_tab.model_combo.currentIndex())
+
+            def sync_to_audio(idx):
+                self.audio_tab._gemini_model_combo.blockSignals(True)
+                self.audio_tab._gemini_model_combo.setCurrentIndex(idx)
+                self.audio_tab._gemini_model_combo.blockSignals(False)
+
+            def sync_to_settings(idx):
+                self.settings_tab.model_combo.blockSignals(True)
+                self.settings_tab.model_combo.setCurrentIndex(idx)
+                self.settings_tab.model_combo.blockSignals(False)
+
+            self.settings_tab.model_combo.currentIndexChanged.connect(sync_to_audio)
+            self.audio_tab._gemini_model_combo.currentIndexChanged.connect(sync_to_settings)
+
 
         # ── Status bar ───────────────────────────────────────────────
         self.status_bar = QStatusBar()
@@ -2974,6 +4005,8 @@ class MainWindow(QMainWindow):
                     self.tts_tab.load_session(self._session["tts_tab"])
                 if "video_tab" in self._session:
                     self.video_tab.load_session(self._session["video_tab"])
+                if "settings_tab" in self._session:
+                    self.settings_tab.load_session(self._session["settings_tab"])
 
     def get_session(self) -> dict:
         return {
@@ -2982,6 +4015,7 @@ class MainWindow(QMainWindow):
             "audio_tab": self.audio_tab.get_session(),
             "tts_tab": self.tts_tab.get_session(),
             "video_tab": self.video_tab.get_session(),
+            "settings_tab": self.settings_tab.get_session(),
         }
 
     def _reset_to_defaults(self):
@@ -2990,6 +4024,7 @@ class MainWindow(QMainWindow):
             self.audio_tab.reset_defaults()
             self.tts_tab.reset_defaults()
             self.video_tab.reset_defaults()
+            self.settings_tab.reset_defaults()
             self.theme_combo.setCurrentText("\U0001f311 Dark (Padr\u00e3o)")
             self._clear_background()
             QMessageBox.information(self, "Resetado", "Configurações restauradas com sucesso.")

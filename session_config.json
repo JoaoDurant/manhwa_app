@@ -6,11 +6,11 @@
     "output_root": "output"
   },
   "tts_tab": {
-    "tts_engine": "indextts",
-    "model_type": "turbo",
-    "temperature": 0.9,
+    "tts_engine": "chatterbox",
+    "model_type": "original",
+    "temperature": 0.85,
     "speed": 1.0,
-    "exaggeration": 0.65,
+    "exaggeration": 0.7000000000000001,
     "cfg_weight": 0.5,
     "seed": 3000,
     "output_format": "wav",

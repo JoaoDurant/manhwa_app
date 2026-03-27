@@ -1251,6 +1251,9 @@ class LanguageConfigTab(QWidget):
         """Called in MAIN thread via QueuedConnection when pipeline finishes.
         Thread teardown is handled by Qt signals — we only update the UI here.
         """
+        # Salva preview_dir ANTES de zerar referências para usar abaixo
+        preview_dir = getattr(self, "_preview_dir", None)
+
         # Clear references (thread/pipeline self-delete via finished→deleteLater signals)
         self._preview_thread = None
         self._preview_pipeline = None
@@ -1265,22 +1268,43 @@ class LanguageConfigTab(QWidget):
         btn_widget.setEnabled(True)
         btn_widget.setText("📢 Testar")
 
-        if success:
-            audios_dir = Path(self._preview_dir) / "preview" / "audios"
-            files = sorted(audios_dir.glob("*.wav"))
-            if files:
-                # [BUG 3 FIX] Reprodução automática após geração
-                logger.info("[FIX] Reprodução automática iniciada após geração")
+        if success and preview_dir:
+            import os
+            audios_dir = Path(preview_dir) / "preview" / "audios"
+
+            # [PLAYER FIX] Preferir o arquivo silence.wav (processado) ao tmp.wav (bruto)
+            # sorted() coloca 'silence' antes de 'tmp' (s < t), então files[-1] era ERRADO.
+            silence_files = sorted(audios_dir.glob("*silence.wav"))
+            tmp_files     = sorted(audios_dir.glob("*_tmp.wav"))
+            all_files     = sorted(audios_dir.glob("*.wav"))
+
+            if silence_files:
+                audio_path = str(silence_files[-1])
+            elif tmp_files:
+                audio_path = str(tmp_files[-1])
+            elif all_files:
+                audio_path = str(all_files[-1])
+            else:
+                audio_path = None
+
+            if audio_path and os.path.exists(audio_path):
+                logger.info(f"[PLAYER] Reproduzindo: {audio_path}")
                 from PySide6.QtMultimedia import QSoundEffect
                 from PySide6.QtCore import QUrl
+                # Mantém referência ao dir para evitar que GC limpe o tmpdir durante reprodução
+                self._current_preview_dir = preview_dir
                 # Sempre recria o effect para evitar estado sujo
                 self._preview_effect = QSoundEffect()
                 self._preview_effect.setVolume(1.0)
-                audio_path = str(files[-1])
-                self._preview_effect.setSource(QUrl.fromLocalFile(audio_path))
+                url = QUrl.fromLocalFile(os.path.abspath(audio_path))
+                self._preview_effect.setSource(url)
                 self._preview_effect.play()
-        else:
+                logger.info("[FIX] Reprodução automática iniciada após geração")
+            else:
+                logger.warning(f"[PLAYER] Nenhum arquivo .wav encontrado em: {audios_dir}")
+        elif not success:
             QMessageBox.warning(self, "Erro", f"Falha no preview:\n{msg}")
+
 
 
 # ---------------------------------------------------------------------------

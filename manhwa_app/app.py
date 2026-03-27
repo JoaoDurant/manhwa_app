@@ -1176,19 +1176,20 @@ class LanguageConfigTab(QWidget):
     def _test_card_voice(self, eng, voice, lang, txt, btn_widget, speed, temperature, model_type="turbo"):
         if not txt.strip(): return
         
-        # [THREAD SAFETY] Cleanup any previous thread and pipeline safely BEFORE creating new ones
-        if hasattr(self, "_preview_thread") and self._preview_thread and self._preview_thread.isRunning():
-            # AVOID WAITING ON SELF
-            import PySide6.QtCore as QtCore
-            if QtCore.QThread.currentThread() == self._preview_thread:
-                print("[WARNING] Tentativa de wait() no próprio thread. Abortando cleanup direto.")
-            else:
+        # [BUG 1 FIX] Encerra a thread anterior com segurança antes de criar uma nova
+        if hasattr(self, "_preview_thread") and self._preview_thread is not None:
+            if self._preview_thread.isRunning():
+                logger.info("[FIX] PreviewThread encerrada antes de nova geração")
                 if hasattr(self, "_preview_pipeline") and self._preview_pipeline:
                     self._preview_pipeline.cancel()
+                self._preview_thread.requestInterruption()
                 self._preview_thread.quit()
-                if not self._preview_thread.wait(2000):
+                if not self._preview_thread.wait(5000):
+                    logger.warning("[FIX] PreviewThread não encerrou em 5s, forçando terminate()")
                     self._preview_thread.terminate()
-                    self._preview_thread.wait()
+                    self._preview_thread.wait(1000)
+            self._preview_thread = None
+            self._preview_pipeline = None
 
         from manhwa_app.audio_pipeline import AudioPipeline
         import tempfile
@@ -1268,15 +1269,19 @@ class LanguageConfigTab(QWidget):
             audios_dir = Path(self._preview_dir) / "preview" / "audios"
             files = sorted(audios_dir.glob("*.wav"))
             if files:
+                # [BUG 3 FIX] Reprodução automática após geração
+                logger.info("[FIX] Reprodução automática iniciada após geração")
                 from PySide6.QtMultimedia import QSoundEffect
                 from PySide6.QtCore import QUrl
-                if not hasattr(self, "_preview_effect"):
-                    self._preview_effect = QSoundEffect()
-                    self._preview_effect.setVolume(1.0)
-                self._preview_effect.setSource(QUrl.fromLocalFile(str(files[-1])))
+                # Sempre recria o effect para evitar estado sujo
+                self._preview_effect = QSoundEffect()
+                self._preview_effect.setVolume(1.0)
+                audio_path = str(files[-1])
+                self._preview_effect.setSource(QUrl.fromLocalFile(audio_path))
                 self._preview_effect.play()
         else:
             QMessageBox.warning(self, "Erro", f"Falha no preview:\n{msg}")
+
 
 # ---------------------------------------------------------------------------
 # Aba 1 — Geração de Áudio
@@ -4879,6 +4884,21 @@ class MainWindow(QMainWindow):
         
         # Inicia primeiro preload (a checagem interna bloqueia duplicatas)
         self.trigger_model_preload()
+
+    def closeEvent(self, event):
+        """[BUG 1 FIX] Encerra threads de preview antes de fechar."""
+        # Encerra a PreviewThread da aba Express se estiver rodando
+        if hasattr(self, "language_config_tab"):
+            tab = self.language_config_tab
+            if hasattr(tab, "_preview_thread") and tab._preview_thread is not None:
+                if tab._preview_thread.isRunning():
+                    logger.info("[FIX] closeEvent: encerrando PreviewThread antes de sair")
+                    if hasattr(tab, "_preview_pipeline") and tab._preview_pipeline:
+                        tab._preview_pipeline.cancel()
+                    tab._preview_thread.requestInterruption()
+                    tab._preview_thread.quit()
+                    tab._preview_thread.wait(5000)
+        super().closeEvent(event)
 
     def trigger_model_preload(self):
         """Dispara o carregamento do modelo em background."""

@@ -607,7 +607,7 @@ class AudioPipeline(QObject):
             engine_str = p_cfg.get("engine", self.tts_engine)
             p_speed = p_cfg.get("speed", self.speed)
             p_temp = p_cfg.get("temperature", self.temperature)
-            if self._cancelled:
+            if self._cancelled or self.thread().isInterruptionRequested():
                 break
 
             wav_final = audios_dir / f"audio_{idx}.wav"
@@ -687,23 +687,42 @@ class AudioPipeline(QObject):
                     print(f"[DEBUG] AudioPipeline: engine_str='{engine_str}', model_type='{self.model_type}'")
                     print(f"[DEBUG] Engine State: active='{active_eng}', loaded_type='{current_model}'")
 
-                    needs_switch = (active_eng != engine_str)
-                    if not needs_switch and engine_str == "chatterbox":
-                        if current_model != self.model_type:
-                            print(f"[DEBUG] Submodelo mudou: {current_model} -> {self.model_type}")
-                            needs_switch = True
-                    
+                    # [BUG 2 FIX] _needs_engine_switch: mapeia nomes de engine para sistemas
+                    # 'kokoro' é um sistema separado de 'chatterbox' (turbo/original/multilingual).
+                    # A comparação antiga (active_eng vs engine_str) misturava namespaces.
+                    KOKORO_ENGINES = {'kokoro'}
+                    CHATTERBOX_SUBTYPES = {'turbo', 'original', 'multilingual'}
+
+                    def _needs_engine_switch(active, requested, loaded_subtype, requested_model_type):
+                        active_is_kokoro = active in KOKORO_ENGINES
+                        req_is_kokoro = requested in KOKORO_ENGINES
+                        # Sistemas diferentes → sempre trocar
+                        if active_is_kokoro != req_is_kokoro:
+                            return True
+                        # Chatterbox: checar submodelo
+                        if not req_is_kokoro:
+                            if loaded_subtype != requested_model_type:
+                                return True
+                        return False
+
+                    needs_switch = _needs_engine_switch(
+                        active_eng, engine_str, current_model,
+                        self.model_type if self.model_type else "turbo"
+                    )
+
                     if needs_switch:
                         target = engine_str
                         if engine_str == "chatterbox":
                             target = self.model_type if self.model_type else "turbo"
-                        
+
+                        logger.info(f"[FIX] Switch de engine solicitado: {active_eng} → {target}")
                         self.log_message.emit(f"🔄 Trocando motor TTS para: {target.upper()}...")
                         print(f"[DEBUG] Solicitando switch_to_engine('{target}', model_type='{self.model_type}')")
                         if hasattr(_engine, "switch_to_engine"):
                             _engine.switch_to_engine(target, model_type=self.model_type)
                     else:
-                        print(f"[DEBUG] Switch não necessário para {engine_str}")
+                        print(f"[DEBUG] Switch não necessário: {active_eng}/{current_model} já é o engine correto")
+
 
                     success = _utils.generate_paragraph_audio(
                         text=tts_text_input,

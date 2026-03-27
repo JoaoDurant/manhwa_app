@@ -1642,21 +1642,31 @@ def resolve_voice_path(voice_val: Any) -> Optional[str]:
     """
     Safely resolves a voice path, converting UI labels (like 'Sem clonagem') 
     to None and ensuring the result is a valid string path or None.
+    Allows string IDs for engines like Kokoro (e.g. 'af_heart') and Qwen.
     """
     if not voice_val:
         return None
         
     s_val = str(voice_val).strip()
+    print(f"[RESOLVE-DEBUG] voice_val={repr(voice_val)} | s_val={repr(s_val)}", flush=True)
     
     # Check for labels that mean "no cloning" or "default model voice"
     # Labels like "Sem clonagem (Voz do Modelo)" or "None" or "0" should be None
-    if not s_val or "Sem clonagem" in s_val or s_val.lower() == "none" or s_val == "0" or s_val == "":
+    if not s_val or "Sem clonagem" in s_val or s_val.lower() == "none" or s_val == "0":
          return None
          
     # If it's a valid existing file, return the absolute path
     if os.path.isfile(s_val):
         return str(Path(s_val).resolve())
         
+    # If it's a 2-letter Kokoro prefix (af_, am_, bf_, bm_, jf_, jm_, zf_, zm_, ef_, em_, ff_, hf_, hm_, if_, im_, pf_, pm_)
+    # or a known Qwen short name (no slashes), allow it to pass through
+    if len(s_val) >= 4 and s_val[2] == "_" and s_val[:2] in ("af", "am", "bf", "bm", "jf", "jm", "zf", "zm", "ef", "em", "ff", "hf", "hm", "if", "im", "pf", "pm"):
+        return s_val
+        
+    if "/" not in s_val and "\\" not in s_val and not s_val.endswith(".pt") and not s_val.endswith(".wav"):
+        return s_val
+
     # [LOG] Optional: log if we received a string that is not a file but not a 'no-cloning' label
     # logger.debug(f"resolve_voice_path: '{s_val}' is not a valid file path, returning None.")
     return None

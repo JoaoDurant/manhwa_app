@@ -229,6 +229,8 @@ class AudioPipeline(QObject):
     log_message    = Signal(str)                  # linha de status
     paragraph_done = Signal(int, str, str)        # (índice 1-based, wav_path, texto)
     finished       = Signal(bool, str)            # (sucesso, mensagem)
+    # [BUG FIX] Sinal para a thread principal sinalizando necessidade de troca de engine
+    engine_switch_needed = Signal(str, str) # (engine_str, model_type)
 
     def __init__(
         self,
@@ -298,6 +300,9 @@ class AudioPipeline(QObject):
         self.qwen_ref_text         = qwen_ref_text
         self._cancelled            = False
         
+        # [BUG FIX] Event lock for engine switching
+        self._switch_event = threading.Event()
+        self._switch_event.set() # Inicialmente liberado
         # Otimização CPU: usar todas as threads disponíveis para processamento paralelo (FX, SpaCy)
         if hasattr(torch, 'set_num_threads'):
             torch.set_num_threads(os.cpu_count() or 4)
@@ -345,6 +350,11 @@ class AudioPipeline(QObject):
     # ------------------------------------------------------------------
     # Ponto de entrada principal (chamado por QThread.started ou diretamente)
     # ------------------------------------------------------------------
+
+    def confirm_switch_done(self):
+        """[BUG FIX] Main thread chama isso para liberar a geração do pipeline."""
+        if hasattr(self, "_switch_event"):
+            self._switch_event.set()
 
     def run(self):
         start_time = time.time()
@@ -676,7 +686,8 @@ class AudioPipeline(QObject):
                     
                     import time
                     t0_gen = time.time()
-                    print(f"[PIPELINE] Iniciando geração de áudio (Parágrafo {idx}) | Texto len: {len(tts_text_input)} chars | Engine: {engine_str}")
+                    logger.info(f"[PIPELINE] Iniciando geração de áudio (Parágrafo {idx}) | Texto len: {len(tts_text_input)} chars | Engine: {engine_str}")
+                    logger.info(f"[PIPELINE-DEBUG] Final voice for Kokoro='{voice_path}', engine='{engine_str}'")
                     
                     # --- NOVO DISPATCHER UNIFICADO (engine.py + utils.py) ---
                     # Substitui os blocos If/Else fragmentados por um ponto único de entrada
@@ -715,11 +726,22 @@ class AudioPipeline(QObject):
                         if engine_str == "chatterbox":
                             target = self.model_type if self.model_type else "turbo"
 
-                        logger.info(f"[FIX] Switch de engine solicitado: {active_eng} → {target}")
-                        self.log_message.emit(f"🔄 Trocando motor TTS para: {target.upper()}...")
-                        print(f"[DEBUG] Solicitando switch_to_engine('{target}', model_type='{self.model_type}')")
-                        if hasattr(_engine, "switch_to_engine"):
-                            _engine.switch_to_engine(target, model_type=self.model_type)
+                        logger.info(f"[PIPELINE] Pausando geração para troca de engine: {active_eng} → {target}")
+                        self.log_message.emit(f"🔄 Solicitando motor TTS: {target.upper()}...")
+                        
+                        # Bloqueia a execução desta thread e sinaliza a thread principal
+                        self._switch_event.clear()
+                        self.engine_switch_needed.emit(engine_str, self.model_type)
+                        
+                        # Aguarda a main thread baixar/carregar e setar self._switch_event.set()
+                        swapped = self._switch_event.wait(timeout=120)
+                        if not swapped:
+                            raise Exception("Tempo esgotado aguardando troca de engine.")
+                        
+                        # Re-valida para garantir que a memória foi preenchida
+                        import engine as eng_local
+                        active_eng = getattr(eng_local, "get_active_engine")() if hasattr(eng_local, "get_active_engine") else "none"
+                        logger.info(f"[PIPELINE] Troca de engine confirmada: {active_eng}")
                     else:
                         print(f"[DEBUG] Switch não necessário: {active_eng}/{current_model} já é o engine correto")
 
@@ -729,6 +751,7 @@ class AudioPipeline(QObject):
                         output_path=str(wav_tmp),
                         engine_name=engine_str,
                         audio_prompt_path=voice_path,
+                        kokoro_voice=voice_path,  # [FIX] Kokoro expects 'kokoro_voice' in kwargs
                         qwen_speaker=self.qwen_speaker if hasattr(self, 'qwen_speaker') else "Ryan",
                         qwen_language="Auto",
                         indextts_speed=p_speed,

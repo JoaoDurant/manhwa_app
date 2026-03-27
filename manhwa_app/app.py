@@ -841,12 +841,21 @@ class TtsConfigTab(QWidget):
 
 
 class LanguageConfigTab(QWidget):
+    # [BUG FIX] Sinal emitido quando a aba Express precisa trocar de engine ANTES de gerar
+    engine_switch_requested = Signal(str, str)  # engine_str, model_type
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.mapping = {}
         self._cards = []
         self._preview_thread = None
         self._preview_pipeline = None
+        # QMediaPlayer must be created on the main thread — initialize here.
+        from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+        self._preview_audio_output = QAudioOutput(self)
+        self._preview_audio_output.setVolume(1.0)
+        self._preview_player = QMediaPlayer(self)
+        self._preview_player.setAudioOutput(self._preview_audio_output)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -994,9 +1003,38 @@ class LanguageConfigTab(QWidget):
                 if base.exists():
                     for p in base.rglob("*.wav"): combo.addItem(p.stem, str(p))
             elif eng == "kokoro":
-                base = Path(__file__).parent.parent / "Kokoro-TTS-Local-master" / "voices"
-                if base.exists():
-                    for p in base.glob("*.pt"): combo.addItem(p.stem, str(p))
+                KOKORO_BUILTIN = [
+                    ("af_heart","[EN-US] Heart (F)"),("af_alloy","[EN-US] Alloy (F)"),
+                    ("af_aoede","[EN-US] Aoede (F)"),("af_bella","[EN-US] Bella (F)"),
+                    ("af_jessica","[EN-US] Jessica (F)"),("af_kore","[EN-US] Kore (F)"),
+                    ("af_nicole","[EN-US] Nicole (F)"),("af_nova","[EN-US] Nova (F)"),
+                    ("af_river","[EN-US] River (F)"),("af_sarah","[EN-US] Sarah (F)"),
+                    ("af_sky","[EN-US] Sky (F)"),
+                    ("am_adam","[EN-US] Adam (M)"),("am_echo","[EN-US] Echo (M)"),
+                    ("am_eric","[EN-US] Eric (M)"),("am_fenrir","[EN-US] Fenrir (M)"),
+                    ("am_liam","[EN-US] Liam (M)"),("am_michael","[EN-US] Michael (M)"),
+                    ("am_onyx","[EN-US] Onyx (M)"),("am_orion","[EN-US] Orion (M)"),
+                    ("am_puck","[EN-US] Puck (M)"),("am_santa","[EN-US] Santa (M)"),
+                    ("bf_alice","[EN-GB] Alice (F)"),("bf_emma","[EN-GB] Emma (F)"),
+                    ("bf_isabella","[EN-GB] Isabella (F)"),("bf_lily","[EN-GB] Lily (F)"),
+                    ("bm_daniel","[EN-GB] Daniel (M)"),("bm_fable","[EN-GB] Fable (M)"),
+                    ("bm_george","[EN-GB] George (M)"),("bm_lewis","[EN-GB] Lewis (M)"),
+                    ("jf_alpha","[JA-JP] Alpha (F)"),("jf_gongitsune","[JA-JP] Gongitsune (F)"),
+                    ("jf_nezuko","[JA-JP] Nezuko (F)"),("jf_tebukuro","[JA-JP] Tebukuro (F)"),
+                    ("jm_kumo","[JA-JP] Kumo (M)"),
+                    ("zf_xiaobei","[ZH-CN] Xiaobei (F)"),("zf_xiaoni","[ZH-CN] Xiaoni (F)"),
+                    ("zf_xiaoxiao","[ZH-CN] Xiaoxiao (F)"),("zf_xiaoyi","[ZH-CN] Xiaoyi (F)"),
+                    ("zm_yunjian","[ZH-CN] Yunjian (M)"),("zm_yunxi","[ZH-CN] Yunxi (M)"),
+                    ("zm_yunxia","[ZH-CN] Yunxia (M)"),("zm_yunyang","[ZH-CN] Yunyang (M)"),
+                    ("ef_dora","[ES-ES] Dora (F)"),("em_alex","[ES-ES] Alex (M)"),
+                    ("em_santa","[ES-ES] Santa (M)"),("ff_siwis","[FR-FR] Siwis (F)"),
+                    ("hf_alpha","[HI-IN] Alpha (F)"),("hm_omega","[HI-IN] Omega (M)"),
+                    ("if_sara","[IT-IT] Sara (F)"),("im_nicola","[IT-IT] Nicola (M)"),
+                    ("pf_dora","[PT-BR] Dora (F)"),("pm_alex","[PT-BR] Alex (M)"),
+                    ("pm_santa","[PT-BR] Santa (M)"),
+                ]
+                for voice_id, label in KOKORO_BUILTIN:
+                    combo.addItem(f"🎤 {label}", voice_id)
             elif eng == "qwen":
                 combo.addItems(["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"])
                 qdir = Path(__file__).parent / "qwen_voices"
@@ -1010,11 +1048,14 @@ class LanguageConfigTab(QWidget):
             idx = combo.findData(current_v)
             if idx >= 0: combo.setCurrentIndex(idx)
             else:
-                idx = combo.findText(current_v)
-                if idx >= 0: combo.setCurrentIndex(idx)
+                # Tenta pelo stem caso current_v seja um caminho completo (sessão antiga .pt)
+                stem = Path(current_v).stem if current_v else ""
+                idx = combo.findData(stem)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
                 elif current_v:
-                    combo.addItem(current_v, current_v)
-                    combo.setCurrentIndex(combo.count()-1)
+                    idx = combo.findText(current_v)
+                    if idx >= 0: combo.setCurrentIndex(idx)
 
         update_voices(engine, voice_combo, voice)
         engine_combo.currentTextChanged.connect(lambda txt, c=voice_combo: update_voices(txt, c, ""))
@@ -1175,10 +1216,54 @@ class LanguageConfigTab(QWidget):
 
     def _test_card_voice(self, eng, voice, lang, txt, btn_widget, speed, temperature, model_type="turbo"):
         if not txt.strip(): return
+        logger.info(f"[EXPRESS-DEBUG] _test_card_voice received voice='{voice}' for eng='{eng}'")
+        
+        # [RACE CONDITION FIX] Verificar se precisa trocar de engine ANTES de instanciar a PreviewThread
+        def _check_needs_switch(engine_str: str, requested_model_type: str) -> bool:
+            import engine as eng_mod
+            active = getattr(eng_mod, "get_active_engine")() if hasattr(eng_mod, "get_active_engine") else "none"
+            current_subtype = getattr(eng_mod, "loaded_model_type", "none")
+            
+            KOKORO_ENGINES = {'kokoro'}
+            current_is_kokoro = active in KOKORO_ENGINES
+            requested_is_kokoro = engine_str in KOKORO_ENGINES
+            
+            if current_is_kokoro != requested_is_kokoro: return True
+            if not requested_is_kokoro and current_subtype != requested_model_type: return True
+            return False
+
+        needs_switch = _check_needs_switch(eng, model_type)
+        if needs_switch:
+            logger.info(f"[EXPRESS] Engine precisa ser trocado para {eng}/{model_type}. Aguardando troca...")
+            # Salvar estado para retomar a geração após o ModelLoaderThread terminar
+            self._pending_preview = {
+                "eng": eng,
+                "voice": voice,
+                "lang": lang,
+                "txt": txt,
+                "btn_widget": btn_widget,
+                "speed": speed,
+                "temperature": temperature,
+                "model_type": model_type
+            }
+            # Avisa a MainWindow para carregar esse motor
+            self.engine_switch_requested.emit(eng, model_type)
+            return
+
+        # Engine já correto, prossegue para geração
+        self._launch_preview_pipeline(eng, voice, lang, txt, btn_widget, speed, temperature, model_type)
+
+    def _launch_preview_pipeline(self, eng, voice, lang, txt, btn_widget, speed, temperature, model_type):
+        """Inicia a PreviewThread apenas quando o engine já está devidamente carregado."""
         
         # [BUG 1 FIX] Encerra a thread anterior com segurança antes de criar uma nova
         if hasattr(self, "_preview_thread") and self._preview_thread is not None:
-            if self._preview_thread.isRunning():
+            try:
+                is_running = self._preview_thread.isRunning()
+            except RuntimeError:
+                is_running = False
+                
+            if is_running:
                 logger.info("[FIX] PreviewThread encerrada antes de nova geração")
                 if hasattr(self, "_preview_pipeline") and self._preview_pipeline:
                     self._preview_pipeline.cancel()
@@ -1291,14 +1376,8 @@ class LanguageConfigTab(QWidget):
                 # Mantém referência ao dir para evitar que GC limpe o tmpdir durante reprodução
                 self._current_preview_dir = preview_dir
                 
-                # Para arquivos dinâmicos no Windows, QSoundEffect falha e faz cache agressivo de paths antigos.
-                # Solução: Usar QMediaPlayer, sempre recriado.
-                self._preview_audio_output = QAudioOutput()
-                self._preview_audio_output.setVolume(1.0)
-                
-                self._preview_player = QMediaPlayer()
-                self._preview_player.setAudioOutput(self._preview_audio_output)
-                
+                # QMediaPlayer is pre-created in __init__ on the main thread — reuse it here.
+                # (Creating QObjects with a parent in a background thread is not allowed in Qt)
                 url = QUrl.fromLocalFile(os.path.abspath(audio_path))
                 self._preview_player.setSource(url)
                 self._preview_player.play()
@@ -1317,6 +1396,8 @@ class LanguageConfigTab(QWidget):
 class AudioTab(QWidget):
     audio_generated = Signal(list)
     run_all_audio_done = Signal(int, str, list)
+    # [BUG FIX] Pass-through sinal para MainWindow iniciar o preload durante a geração do AudioPipeline
+    engine_switch_requested = Signal(str, str) # engine_str, model_type
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1663,16 +1744,18 @@ class AudioTab(QWidget):
             audios_dir = Path(self._preview_dir) / "preview" / "audios"
             audio_files = list(audios_dir.glob("*.wav"))
             if audio_files:
-                from PySide6.QtMultimedia import QSoundEffect
+                from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
                 from PySide6.QtCore import QUrl
                 
-                if not hasattr(self, "_preview_effect"):
-                    self._preview_effect = QSoundEffect()
-                    self._preview_effect.setVolume(1.0)
+                if not hasattr(self, "_preview_audio_output"):
+                    self._preview_audio_output = QAudioOutput(self)
+                    self._preview_audio_output.setVolume(1.0)
+                    self._preview_player = QMediaPlayer(self)
+                    self._preview_player.setAudioOutput(self._preview_audio_output)
                 
                 audio_file = audio_files[0]
-                self._preview_effect.setSource(QUrl.fromLocalFile(str(audio_file)))
-                self._preview_effect.play()
+                self._preview_player.setSource(QUrl.fromLocalFile(str(audio_file)))
+                self._preview_player.play()
         else:
             QMessageBox.warning(self, "Erro no Preview", f"Falha ao gerar o preview:\n{msg}")
 
@@ -1706,28 +1789,81 @@ class AudioTab(QWidget):
                     self.preset_voice_combo.addItem(f"👤 {format_name_chatterbox(path)} (Clonada)", str(path))
                     
         elif engine == "kokoro":
+            # ── Vozes built-in do hexgrad/Kokoro-82M ──────────────────────────
+            KOKORO_BUILTIN = [
+                # American English (Female)
+                ("af_heart",   "[EN-US] Heart (F)"),
+                ("af_alloy",   "[EN-US] Alloy (F)"),
+                ("af_aoede",   "[EN-US] Aoede (F)"),
+                ("af_bella",   "[EN-US] Bella (F)"),
+                ("af_jessica", "[EN-US] Jessica (F)"),
+                ("af_kore",    "[EN-US] Kore (F)"),
+                ("af_nicole",  "[EN-US] Nicole (F)"),
+                ("af_nova",    "[EN-US] Nova (F)"),
+                ("af_river",   "[EN-US] River (F)"),
+                ("af_sarah",   "[EN-US] Sarah (F)"),
+                ("af_sky",     "[EN-US] Sky (F)"),
+                # American English (Male)
+                ("am_adam",    "[EN-US] Adam (M)"),
+                ("am_echo",    "[EN-US] Echo (M)"),
+                ("am_eric",    "[EN-US] Eric (M)"),
+                ("am_fenrir",  "[EN-US] Fenrir (M)"),
+                ("am_liam",    "[EN-US] Liam (M)"),
+                ("am_michael", "[EN-US] Michael (M)"),
+                ("am_onyx",    "[EN-US] Onyx (M)"),
+                ("am_orion",   "[EN-US] Orion (M)"),
+                ("am_puck",    "[EN-US] Puck (M)"),
+                ("am_santa",   "[EN-US] Santa (M)"),
+                # British English (Female)
+                ("bf_alice",   "[EN-GB] Alice (F)"),
+                ("bf_emma",    "[EN-GB] Emma (F)"),
+                ("bf_isabella","[EN-GB] Isabella (F)"),
+                ("bf_lily",    "[EN-GB] Lily (F)"),
+                # British English (Male)
+                ("bm_daniel",  "[EN-GB] Daniel (M)"),
+                ("bm_fable",   "[EN-GB] Fable (M)"),
+                ("bm_george",  "[EN-GB] George (M)"),
+                ("bm_lewis",   "[EN-GB] Lewis (M)"),
+                # Japanese (Female / Male)
+                ("jf_alpha",   "[JA-JP] Alpha (F)"),
+                ("jf_gongitsune","[JA-JP] Gongitsune (F)"),
+                ("jf_nezuko",  "[JA-JP] Nezuko (F)"),
+                ("jf_tebukuro","[JA-JP] Tebukuro (F)"),
+                ("jm_kumo",    "[JA-JP] Kumo (M)"),
+                # Chinese (Female / Male)
+                ("zf_xiaobei", "[ZH-CN] Xiaobei (F)"),
+                ("zf_xiaoni",  "[ZH-CN] Xiaoni (F)"),
+                ("zf_xiaoxiao","[ZH-CN] Xiaoxiao (F)"),
+                ("zf_xiaoyi",  "[ZH-CN] Xiaoyi (F)"),
+                ("zm_yunjian", "[ZH-CN] Yunjian (M)"),
+                ("zm_yunxi",   "[ZH-CN] Yunxi (M)"),
+                ("zm_yunxia",  "[ZH-CN] Yunxia (M)"),
+                ("zm_yunyang", "[ZH-CN] Yunyang (M)"),
+                # Spanish
+                ("ef_dora",    "[ES-ES] Dora (F)"),
+                ("em_alex",    "[ES-ES] Alex (M)"),
+                ("em_santa",   "[ES-ES] Santa (M)"),
+                # French
+                ("ff_siwis",   "[FR-FR] Siwis (F)"),
+                # Hindi
+                ("hf_alpha",   "[HI-IN] Alpha (F)"),
+                ("hm_omega",   "[HI-IN] Omega (M)"),
+                # Italian
+                ("if_sara",    "[IT-IT] Sara (F)"),
+                ("im_nicola",  "[IT-IT] Nicola (M)"),
+                # Portuguese (BR)
+                ("pf_dora",    "[PT-BR] Dora (F)"),
+                ("pm_alex",    "[PT-BR] Alex (M)"),
+                ("pm_santa",   "[PT-BR] Santa (M)"),
+            ]
+            for voice_id, label in KOKORO_BUILTIN:
+                self.preset_voice_combo.addItem(f"🎤 {label}", voice_id)
+
+            # ── Vozes .pt customizadas (pasta local) ──────────────────────────
             base_dir = Path(__file__).parent.parent / "Kokoro-TTS-Local-master" / "voices"
             if base_dir.exists():
-                def get_kokoro_lang_str(voice_name):
-                    prefix = voice_name[:2]
-                    mapping = {
-                        'af': '[EN-US]', 'am': '[EN-US]',
-                        'bf': '[EN-GB]', 'bm': '[EN-GB]',
-                        'jf': '[JA-JP]', 'jm': '[JA-JP]',
-                        'zf': '[ZH-CN]', 'zm': '[ZH-CN]',
-                        'ef': '[ES-ES]', 'em': '[ES-ES]',
-                        'ff': '[FR-FR]', 'fm': '[FR-FR]',
-                        'hf': '[HI-IN]', 'hm': '[HI-IN]',
-                        'if': '[IT-IT]', 'im': '[IT-IT]',
-                        'pf': '[PT-BR]', 'pm': '[PT-BR]',
-                    }
-                    return mapping.get(prefix, '[EN-US]')
-
-                voices = list(base_dir.glob("*.pt"))
-                for path in sorted(voices, key=natural_sort_key):
-                    name = path.stem
-                    lang = get_kokoro_lang_str(name)
-                    self.preset_voice_combo.addItem(f"✨ {lang} {name}", str(path))
+                for path in sorted(base_dir.glob("*.pt"), key=natural_sort_key):
+                    self.preset_voice_combo.addItem(f"💾 {path.stem} (Custom)", str(path))
                     
         elif engine == "qwen":
             self.preset_voice_combo.addItem("Vivian (Female, Chinese, Lively)", "Vivian")
@@ -2023,6 +2159,8 @@ class AudioTab(QWidget):
         self._pipeline.progress.connect(self._on_progress)
         self._pipeline.paragraph_done.connect(self._on_pdone)
         self._pipeline.finished.connect(self._on_done)
+        # Passa o sinal do pipeline (thread) pra cima para a MainWindow (UI)
+        self._pipeline.engine_switch_needed.connect(self.engine_switch_requested.emit)
         self._worker_thread.start()
 
     @Slot(str)
@@ -4367,8 +4505,43 @@ class LanguageConfigCard(QFrame):
             if vdir2.exists():
                 for p in vdir2.glob("*.wav"): self.voice_combo.addItem(p.stem, str(p))
         elif eng == "kokoro":
-            v_list = ["af_heart", "af_bella", "af_nicole", "af_aoi", "af_sarah", "am_adam", "am_michael", "bf_isabella", "bf_emma", "bm_george", "bm_lewis"]
-            for v in v_list: self.voice_combo.addItem(v, v)
+            KOKORO_BUILTIN = [
+                ("af_heart","[EN-US] Heart (F)"),("af_alloy","[EN-US] Alloy (F)"),
+                ("af_aoede","[EN-US] Aoede (F)"),("af_bella","[EN-US] Bella (F)"),
+                ("af_jessica","[EN-US] Jessica (F)"),("af_kore","[EN-US] Kore (F)"),
+                ("af_nicole","[EN-US] Nicole (F)"),("af_nova","[EN-US] Nova (F)"),
+                ("af_river","[EN-US] River (F)"),("af_sarah","[EN-US] Sarah (F)"),
+                ("af_sky","[EN-US] Sky (F)"),
+                ("am_adam","[EN-US] Adam (M)"),("am_echo","[EN-US] Echo (M)"),
+                ("am_eric","[EN-US] Eric (M)"),("am_fenrir","[EN-US] Fenrir (M)"),
+                ("am_liam","[EN-US] Liam (M)"),("am_michael","[EN-US] Michael (M)"),
+                ("am_onyx","[EN-US] Onyx (M)"),("am_orion","[EN-US] Orion (M)"),
+                ("am_puck","[EN-US] Puck (M)"),("am_santa","[EN-US] Santa (M)"),
+                ("bf_alice","[EN-GB] Alice (F)"),("bf_emma","[EN-GB] Emma (F)"),
+                ("bf_isabella","[EN-GB] Isabella (F)"),("bf_lily","[EN-GB] Lily (F)"),
+                ("bm_daniel","[EN-GB] Daniel (M)"),("bm_fable","[EN-GB] Fable (M)"),
+                ("bm_george","[EN-GB] George (M)"),("bm_lewis","[EN-GB] Lewis (M)"),
+                ("jf_alpha","[JA-JP] Alpha (F)"),("jf_gongitsune","[JA-JP] Gongitsune (F)"),
+                ("jf_nezuko","[JA-JP] Nezuko (F)"),("jf_tebukuro","[JA-JP] Tebukuro (F)"),
+                ("jm_kumo","[JA-JP] Kumo (M)"),
+                ("zf_xiaobei","[ZH-CN] Xiaobei (F)"),("zf_xiaoni","[ZH-CN] Xiaoni (F)"),
+                ("zf_xiaoxiao","[ZH-CN] Xiaoxiao (F)"),("zf_xiaoyi","[ZH-CN] Xiaoyi (F)"),
+                ("zm_yunjian","[ZH-CN] Yunjian (M)"),("zm_yunxi","[ZH-CN] Yunxi (M)"),
+                ("zm_yunxia","[ZH-CN] Yunxia (M)"),("zm_yunyang","[ZH-CN] Yunyang (M)"),
+                ("ef_dora","[ES-ES] Dora (F)"),("em_alex","[ES-ES] Alex (M)"),
+                ("em_santa","[ES-ES] Santa (M)"),("ff_siwis","[FR-FR] Siwis (F)"),
+                ("hf_alpha","[HI-IN] Alpha (F)"),("hm_omega","[HI-IN] Omega (M)"),
+                ("if_sara","[IT-IT] Sara (F)"),("im_nicola","[IT-IT] Nicola (M)"),
+                ("pf_dora","[PT-BR] Dora (F)"),("pm_alex","[PT-BR] Alex (M)"),
+                ("pm_santa","[PT-BR] Santa (M)"),
+            ]
+            for voice_id, label in KOKORO_BUILTIN:
+                self.voice_combo.addItem(f"🎤 {label}", voice_id)
+            # Custom .pt files
+            base = Path(__file__).parent.parent / "Kokoro-TTS-Local-master" / "voices"
+            if base.exists():
+                for p in sorted(base.glob("*.pt")):
+                    self.voice_combo.addItem(f"💾 {p.stem} (Custom)", str(p))
         elif eng == "qwen":
             self.voice_combo.addItems(["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"])
             qdir = Path(__file__).parent / "qwen_voices"
@@ -4927,13 +5100,12 @@ class MainWindow(QMainWindow):
                     tab._preview_thread.wait(5000)
         super().closeEvent(event)
 
-    def trigger_model_preload(self):
-        """Dispara o carregamento do modelo em background."""
-        if not hasattr(self, "tts_tab"): return
-        
-        cfg = self.tts_tab.get_session()
-        engine_name = cfg.get("tts_engine", "chatterbox")
-        model_type = cfg.get("model_type", "turbo")
+    def trigger_model_preload(self, explicit_engine=None, explicit_model_type=None):
+        """Dispara o carregamento do modelo em background.
+        Se explicit_* forem fornecidos, ignora as configs da tts_tab (útil para a aba Express)."""
+        cfg = self.tts_tab.get_session() if hasattr(self, "tts_tab") else {}
+        engine_name = explicit_engine if explicit_engine else cfg.get("tts_engine", "chatterbox")
+        model_type = explicit_model_type if explicit_model_type else cfg.get("model_type", "turbo")
 
         if hasattr(self, "_loader_thread") and self._loader_thread and self._loader_thread.isRunning():
             return # Já carregando
@@ -4961,6 +5133,35 @@ class MainWindow(QMainWindow):
         else:
             self.model_status_label.setText(f"TTS: Erro ❌ ({info[:15]}...)")
             self.model_status_label.setStyleSheet("color:#e05555;font-size:11px;")
+
+        # [EXPRESS FIX] Retomar a PreviewThread pendente na aba Express se existir
+        if hasattr(self, "language_config_tab") and hasattr(self.language_config_tab, "_pending_preview"):
+            p = self.language_config_tab._pending_preview
+            if p:
+                self.language_config_tab._pending_preview = None
+                if success:
+                    logger.info(f"[EXPRESS] Engine {p['eng']}/{p['model_type']} carregado via main thread. Iniciando geração...")
+                    self.language_config_tab._launch_preview_pipeline(**p)
+                else:
+                    logger.error("[EXPRESS] Geração abortada pois o carregamento do engine falhou.")
+                    if p.get("btn_widget"):
+                        p["btn_widget"].setEnabled(True)
+                        p["btn_widget"].setText("📢 Testar")
+
+        # [AUDIO PIPELINE FIX] Liberar a QThread se estivermos rodando um batch de múltiplos idiomas
+        if hasattr(self, "audio_tab") and hasattr(self.audio_tab, "_pipeline") and self.audio_tab._pipeline is not None:
+             self.audio_tab._pipeline.confirm_switch_done()
+
+    def _handle_express_engine_switch(self, engine_str: str, model_type: str):
+        """Slot para lidar com pedidos de troca de engine vindos da aba Express."""
+        logger.info(f"[EXPRESS] Pedido de carregamento em background: {engine_str} ({model_type})")
+        self.trigger_model_preload(explicit_engine=engine_str, explicit_model_type=model_type)
+
+    @Slot(str, str)
+    def _handle_audio_tab_engine_switch(self, engine_str: str, model_type: str):
+        """[BUG FIX] Disparado durante QThread da AudioPipeline quando múltiplos idiomas exigem troca."""
+        logger.info(f"[MAIN_WINDOW] AudioPipeline solicitou troca de engine para {engine_str}/{model_type}")
+        self.trigger_model_preload(explicit_engine=engine_str, explicit_model_type=model_type)
 
     # ------------------------------------------------------------------
     # Background image rendering
@@ -5143,6 +5344,11 @@ class MainWindow(QMainWindow):
         self.images_tab.images_changed.connect(self.video_tab.update_image_paths)
         self.images_tab.images_changed.connect(self._on_images_changed)
         self.audio_tab.project_edit.textChanged.connect(self._on_project_name_changed)
+        
+        # Conexões para troca de modelos em background
+        self.language_config_tab.engine_switch_requested.connect(self._handle_express_engine_switch)
+        if hasattr(self.audio_tab, "engine_switch_requested"):
+            self.audio_tab.engine_switch_requested.connect(self._handle_audio_tab_engine_switch)
 
         # Apply header style for current theme
         self._apply_header_style()

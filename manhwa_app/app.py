@@ -1251,12 +1251,8 @@ class LanguageConfigTab(QWidget):
         """Called in MAIN thread via QueuedConnection when pipeline finishes.
         Thread teardown is handled by Qt signals — we only update the UI here.
         """
-        # Salva preview_dir ANTES de zerar referências para usar abaixo
+        # Salva preview_dir ANTES de usar abaixo
         preview_dir = getattr(self, "_preview_dir", None)
-
-        # Clear references (thread/pipeline self-delete via finished→deleteLater signals)
-        self._preview_thread = None
-        self._preview_pipeline = None
 
         try:
             import torch, gc
@@ -1289,17 +1285,24 @@ class LanguageConfigTab(QWidget):
 
             if audio_path and os.path.exists(audio_path):
                 logger.info(f"[PLAYER] Reproduzindo: {audio_path}")
-                from PySide6.QtMultimedia import QSoundEffect
+                from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
                 from PySide6.QtCore import QUrl
+                
                 # Mantém referência ao dir para evitar que GC limpe o tmpdir durante reprodução
                 self._current_preview_dir = preview_dir
-                # Sempre recria o effect para evitar estado sujo
-                self._preview_effect = QSoundEffect()
-                self._preview_effect.setVolume(1.0)
+                
+                # Para arquivos dinâmicos no Windows, QSoundEffect falha e faz cache agressivo de paths antigos.
+                # Solução: Usar QMediaPlayer, sempre recriado.
+                self._preview_audio_output = QAudioOutput()
+                self._preview_audio_output.setVolume(1.0)
+                
+                self._preview_player = QMediaPlayer()
+                self._preview_player.setAudioOutput(self._preview_audio_output)
+                
                 url = QUrl.fromLocalFile(os.path.abspath(audio_path))
-                self._preview_effect.setSource(url)
-                self._preview_effect.play()
-                logger.info("[FIX] Reprodução automática iniciada após geração")
+                self._preview_player.setSource(url)
+                self._preview_player.play()
+                logger.info("[FIX] Reprodução automática iniciada (QMediaPlayer)")
             else:
                 logger.warning(f"[PLAYER] Nenhum arquivo .wav encontrado em: {audios_dir}")
         elif not success:

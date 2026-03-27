@@ -112,7 +112,8 @@
     "project_name": "projeto_expresso_1",
     "source_lang": "pt",
     "selected_langs": [
-      "pt"
+      "pt",
+      "en"
     ],
     "overrides": {
       "pt": {

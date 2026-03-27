@@ -40,15 +40,16 @@ from PySide6.QtWidgets import (
     QMainWindow, QMessageBox, QPushButton, QProgressBar,
     QScrollArea, QSizePolicy, QStatusBar, QTabWidget, QTextEdit,
     QVBoxLayout, QWidget, QSlider, QComboBox, QDoubleSpinBox, QSpinBox,
-    QCheckBox, QInputDialog,
+    QCheckBox, QInputDialog, QDialog, QTableWidget, QHeaderView,
+    QDialogButtonBox, QTableWidgetItem,
 )
 
-from manhwa_app.audio_pipeline import AudioPipeline, split_into_paragraphs
-from manhwa_app.video_pipeline import VideoPipeline, EFFECTS
+from manhwa_app.audio_pipeline import split_into_paragraphs
+from manhwa_app.video_pipeline import EFFECTS
 
-# Reutilizar a referência a engine já importada pelo audio_pipeline no thread principal.
-# Isso evita re-importações dentro de QThreads que causavam 'No module named chatterbox'.
-from manhwa_app.audio_pipeline import _engine, _ENGINE_AVAILABLE, _config_manager
+# Using config natively instead of heavy audio pipeline
+from config import config_manager as _config_manager
+from utils import resolve_voice_path
 
 # Import protegido — o painel Gemini fica desativado se a lib não estiver instalada
 try:
@@ -60,6 +61,14 @@ except ImportError:
     _GEMINI_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+def _append_log(widget: QTextEdit, message: str):
+    """Helper to append timestamped logs to a QTextEdit."""
+    from datetime import datetime
+    time_str = datetime.now().strftime("%H:%M:%S")
+    widget.append(f"[{time_str}] {message}")
+    widget.verticalScrollBar().setValue(widget.verticalScrollBar().maximum())
+
 
 # ---------------------------------------------------------------------------
 # Worker thread do Gemini (padrão QThread do projeto)
@@ -162,6 +171,7 @@ class ModelLoaderThread(QThread):
 
     def run(self):
         try:
+            from manhwa_app.audio_pipeline import _engine, _ENGINE_AVAILABLE
             if not _ENGINE_AVAILABLE or _engine is None:
                 self.finished_loading.emit(False, "Engine não disponível")
                 return
@@ -829,6 +839,445 @@ class TtsConfigTab(QWidget):
         self.fx_loudnorm_chk.setChecked(True)
 
 
+
+class LanguageConfigTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.mapping = {}
+        self._cards = []
+        self._preview_thread = None
+        self._preview_pipeline = None
+        self._setup_ui()
+
+    def _setup_ui(self):
+        root_vbox = QVBoxLayout(self)
+
+        lbl_info = QLabel(
+            "Configure a Engine, Voz, Velocidade e Temperatura para traduções de cada idioma.\n"
+            "Arquivos convertidos com o modelo (terminados com '_' + idioma. Ex: roteiro_es.txt)\n"
+            "usarão as opções mapeadas aqui automaticamente no painel principal."
+        )
+        lbl_info.setWordWrap(True)
+        lbl_info.setStyleSheet("color:#a0a0a0; font-size:12px; margin-bottom:10px;")
+        root_vbox.addWidget(lbl_info)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        
+        self.scroll_widget = QWidget()
+        self.cards_layout = QVBoxLayout(self.scroll_widget)
+        self.cards_layout.setSpacing(15)
+        self.cards_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.scroll.setWidget(self.scroll_widget)
+        
+        root_vbox.addWidget(self.scroll)
+
+    def _setup_ui(self):
+        root_vbox = QVBoxLayout(self)
+
+        lbl_info = QLabel(
+            "Configure opções extremas do TTS para traduções de cada idioma.\n"
+            "Arquivos convertidos usarão estes cards como base (ex: roteiro_es.txt)."
+        )
+        lbl_info.setWordWrap(True)
+        lbl_info.setStyleSheet("color:#a0a0a0; font-size:12px; margin-bottom:10px;")
+        root_vbox.addWidget(lbl_info)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        
+        self.scroll_widget = QWidget()
+        self.cards_layout = QVBoxLayout(self.scroll_widget)
+        self.cards_layout.setSpacing(15)
+        self.cards_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.scroll.setWidget(self.scroll_widget)
+        
+        root_vbox.addWidget(self.scroll)
+
+        btn_row = QHBoxLayout()
+        self.btn_add = QPushButton("➕ Adicionar Idioma")
+        self.btn_add.setObjectName("primary")
+        self.btn_add.clicked.connect(lambda: self._add_card())
+        btn_row.addWidget(self.btn_add)
+        
+        self.btn_save = QPushButton("💾 Salvar Configurações Manualmente")
+        self.btn_save.setObjectName("primary")
+        self.btn_save.clicked.connect(lambda: _save_session(self.window().get_session()) if hasattr(self.window(), "get_session") else QMessageBox.information(self,"Salvo","A janela principal fará o save."))
+        btn_row.addWidget(self.btn_save)
+
+        btn_row.addStretch()
+        root_vbox.addLayout(btn_row)
+
+    def _add_card(self, lang="pt", engine="chatterbox", voice="", config=None):
+        from PySide6.QtWidgets import QFrame, QGroupBox, QInputDialog
+        import copy
+
+        if config is None: config = {}
+        
+        speed = config.get("speed", 1.0)
+        temp = config.get("temperature", 0.65)
+        exag = config.get("exaggeration", 0.5)
+        cfg_w = config.get("cfg_weight", 0.5)
+        seed = config.get("seed", 3000)
+        min_p = config.get("min_p", 0.05)
+        top_p = config.get("top_p", 1.0)
+        top_k = config.get("top_k", 1000)
+        rep_p = config.get("repetition_penalty", 1.2)
+        fx_hp = config.get("fx_highpass", True)
+        fx_comp = config.get("fx_compressor", True)
+        fx_de = config.get("fx_deesser", True)
+        fx_rev = config.get("fx_reverb", False)
+        fx_sil = config.get("fx_silence", True)
+        fx_loud = config.get("fx_loudnorm", True)
+
+        card = QFrame()
+        card.setStyleSheet("QFrame { background:#222225; border-radius:8px; border:1px solid #3a3a40; }")
+        cv = QVBoxLayout(card)
+        cv.setContentsMargins(15, 15, 15, 15)
+        cv.setSpacing(10)
+
+        # L1: Idioma, Engine, Rm
+        r1 = QHBoxLayout()
+        r1.addWidget(QLabel("Idioma (Sufixo):"))
+        lang_combo = QComboBox()
+        lang_combo.addItems(["en", "pt", "es", "fr", "ja", "ko", "zh", "Outro..."])
+        r1.addWidget(lang_combo)
+
+        def handle_lang_combo(t):
+            if t == "Outro...":
+                text, ok = QInputDialog.getText(self, "Novo Sufixo", "Digite o sufixo (ex: it, ru):")
+                if ok and text.strip():
+                    lang_combo.insertItem(lang_combo.count()-1, text.strip())
+                    lang_combo.setCurrentIndex(lang_combo.count()-2)
+                else:
+                    lang_combo.setCurrentIndex(0)
+        lang_combo.currentTextChanged.connect(handle_lang_combo)
+
+        idx = lang_combo.findText(lang)
+        if idx >= 0:
+            lang_combo.setCurrentIndex(idx)
+        elif lang:
+            lang_combo.insertItem(lang_combo.count()-1, lang)
+            lang_combo.setCurrentIndex(lang_combo.count()-2)
+
+        r1.addSpacing(15)
+        r1.addWidget(QLabel("Engine TTS:"))
+        engine_combo = QComboBox()
+        engine_combo.addItems(["chatterbox", "kokoro", "qwen", "indextts"])
+        engine_combo.setCurrentText(engine)
+        r1.addWidget(engine_combo)
+        
+        r1.addStretch()
+        btn_rm = QPushButton("✖ Remover")
+        btn_rm.setObjectName("danger")
+        btn_rm.clicked.connect(lambda: self._remove_card(card))
+        r1.addWidget(btn_rm)
+        cv.addLayout(r1)
+
+        # L2: Voz
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel("Voz:"))
+        voice_combo = QComboBox()
+        r2.addWidget(voice_combo, 1)
+        btn_clone = QPushButton("📁 Clonar (Custom)")
+        btn_clone.clicked.connect(lambda: self._browse_custom_voice(voice_combo))
+        r2.addWidget(btn_clone)
+        cv.addLayout(r2)
+
+        def update_voices(eng, combo, current_v):
+            combo.clear()
+            if eng == "chatterbox":
+                combo.addItem("Sem clonagem (Voz do Modelo)", "")
+                base = Path(__file__).parent.parent / "voices"
+                if base.exists():
+                    for p in base.rglob("*.wav"): combo.addItem(p.stem, str(p))
+            elif eng == "kokoro":
+                base = Path(__file__).parent.parent / "Kokoro-TTS-Local-master" / "voices"
+                if base.exists():
+                    for p in base.glob("*.pt"): combo.addItem(p.stem, str(p))
+            elif eng == "qwen":
+                combo.addItems(["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"])
+                qdir = Path(__file__).parent / "qwen_voices"
+                if qdir.exists():
+                    for p in qdir.glob("*.pt"): combo.addItem(p.stem, str(p))
+            elif eng == "indextts":
+                pdir = Path("presets")
+                if pdir.exists():
+                    for p in pdir.glob("*.wav"): combo.addItem(p.stem, str(p))
+            
+            idx = combo.findData(current_v)
+            if idx >= 0: combo.setCurrentIndex(idx)
+            else:
+                idx = combo.findText(current_v)
+                if idx >= 0: combo.setCurrentIndex(idx)
+                elif current_v:
+                    combo.addItem(current_v, current_v)
+                    combo.setCurrentIndex(combo.count()-1)
+
+        update_voices(engine, voice_combo, voice)
+        engine_combo.currentTextChanged.connect(lambda txt, c=voice_combo: update_voices(txt, c, ""))
+        
+        # L3: Opções Avançadas (Toggle)
+        adv_group = QGroupBox("⚙️ Opções TTS e Efeitos")
+        adv_group.setCheckable(True)
+        adv_group.setChecked(False) # Recolhido por padrão
+        
+        gl = QGridLayout(adv_group)
+        w_spd = QDoubleSpinBox(); w_spd.setRange(0.5,2.0); w_spd.setSingleStep(0.1); w_spd.setValue(speed)
+        w_tmp = QDoubleSpinBox(); w_tmp.setRange(0.1,1.0); w_tmp.setSingleStep(0.05); w_tmp.setValue(temp)
+        w_exa = QDoubleSpinBox(); w_exa.setRange(0.0,1.0); w_exa.setSingleStep(0.05); w_exa.setValue(exag)
+        w_cfg = QDoubleSpinBox(); w_cfg.setRange(0.0,1.0); w_cfg.setSingleStep(0.05); w_cfg.setValue(cfg_w)
+        w_seed= QSpinBox(); w_seed.setRange(0,999999); w_seed.setValue(seed)
+        w_minp= QDoubleSpinBox(); w_minp.setRange(0.0,1.0); w_minp.setSingleStep(0.05); w_minp.setValue(min_p)
+        w_topp= QDoubleSpinBox(); w_topp.setRange(0.0,1.0); w_topp.setSingleStep(0.05); w_topp.setValue(top_p)
+        w_topk= QSpinBox(); w_topk.setRange(1,9999); w_topk.setValue(top_k)
+        w_rep = QDoubleSpinBox(); w_rep.setRange(1.0,2.0); w_rep.setSingleStep(0.1); w_rep.setValue(rep_p)
+        
+        chk_hp = QCheckBox("Ruído"); chk_hp.setChecked(fx_hp)
+        chk_cp = QCheckBox("Compr."); chk_cp.setChecked(fx_comp)
+        chk_de = QCheckBox("Eq."); chk_de.setChecked(fx_de)
+        chk_rv = QCheckBox("Reverb"); chk_rv.setChecked(fx_rev)
+        chk_sl = QCheckBox("Crt.Sil"); chk_sl.setChecked(fx_sil)
+        chk_nm = QCheckBox("Norm."); chk_nm.setChecked(fx_loud)
+        
+        w_spd.setToolTip("Velocidade global. 1.0 é normal.")
+        w_tmp.setToolTip("Temperatura (criatividade/emoção). ~0.65 é bom.")
+        w_exa.setToolTip("Exagero de emoção (Chatterbox).")
+        w_cfg.setToolTip("CFG Weight (fidelidade ao input de voz).")
+        w_seed.setToolTip("Controle de semente (3000 padrão).")
+
+        gl.addWidget(QLabel("Vel:"), 0,0); gl.addWidget(w_spd, 0,1)
+        gl.addWidget(QLabel("Temp:"), 0,2); gl.addWidget(w_tmp, 0,3)
+        gl.addWidget(QLabel("Exag:"), 0,4); gl.addWidget(w_exa, 0,5)
+        gl.addWidget(QLabel("CFG:"), 0,6); gl.addWidget(w_cfg, 0,7)
+        
+        gl.addWidget(QLabel("Seed:"), 1,0); gl.addWidget(w_seed, 1,1)
+        gl.addWidget(QLabel("MinP:"), 1,2); gl.addWidget(w_minp, 1,3)
+        gl.addWidget(QLabel("TopP:"), 1,4); gl.addWidget(w_topp, 1,5)
+        gl.addWidget(QLabel("TopK:"), 1,6); gl.addWidget(w_topk, 1,7)
+        
+        gl.addWidget(QLabel("RepPen:"), 2,0); gl.addWidget(w_rep, 2,1)
+        
+        fx_box = QHBoxLayout()
+        fx_box.addWidget(chk_hp); fx_box.addWidget(chk_cp); fx_box.addWidget(chk_de)
+        fx_box.addWidget(chk_rv); fx_box.addWidget(chk_sl); fx_box.addWidget(chk_nm)
+        gl.addLayout(fx_box, 3, 0, 1, 8)
+        
+        cv.addWidget(adv_group)
+
+        # L4: Test row
+        r4 = QHBoxLayout()
+        r4.addWidget(QLabel("Teste de Voz:"))
+        test_edit = QLineEdit("Um teste da voz configurada para este idioma.")
+        r4.addWidget(test_edit, 1)
+        
+        btn_test = QPushButton("▶ Testar Voz")
+        btn_test.clicked.connect(lambda: self._test_card_voice(
+            engine_combo.currentText(), 
+            resolve_voice_path(voice_combo.currentData() or voice_combo.currentText()), 
+            lang_combo.currentText() or "en", 
+            test_edit.text(), 
+            btn_test,
+            w_spd.value(),
+            w_tmp.value()
+        ))
+        r4.addWidget(btn_test)
+        cv.addLayout(r4)
+
+        self.cards_layout.addWidget(card)
+        self._cards.append((
+            card, lang_combo, engine_combo, voice_combo,
+            w_spd, w_tmp, w_exa, w_cfg, w_seed, w_minp,
+            w_topp, w_topk, w_rep, chk_hp, chk_cp, chk_de, chk_rv, chk_sl, chk_nm
+        ))
+
+    def _browse_custom_voice(self, combo):
+        path, _ = QFileDialog.getOpenFileName(self, "Selecionar Voz para Clonagem", "", "Audio Files (*.wav *.mp3 *.flac *.m4a)")
+        if path:
+            combo.addItem(f"[Custom] {Path(path).stem}", path)
+            combo.setCurrentIndex(combo.count()-1)
+
+    def _remove_card(self, card_widget):
+        for rec in self._cards:
+            if rec[0] == card_widget:
+                self._cards.remove(rec)
+                card_widget.deleteLater()
+                break
+
+    def get_session(self):
+        new_map = {}
+        for cdict in self._cards:
+            l = cdict[1].currentText().strip()
+            if not l: continue
+            new_map[l] = {
+                "engine": cdict[2].currentText(),
+                "voice": resolve_voice_path(cdict[3].currentData() or cdict[3].currentText()),
+                "speed": cdict[4].value(),
+                "temperature": cdict[5].value(),
+                "exaggeration": cdict[6].value(),
+                "cfg_weight": cdict[7].value(),
+                "seed": cdict[8].value(),
+                "min_p": cdict[9].value(),
+                "top_p": cdict[10].value(),
+                "top_k": cdict[11].value(),
+                "repetition_penalty": cdict[12].value(),
+                "fx_highpass": cdict[13].isChecked(),
+                "fx_compressor": cdict[14].isChecked(),
+                "fx_deesser": cdict[15].isChecked(),
+                "fx_reverb": cdict[16].isChecked(),
+                "fx_silence": cdict[17].isChecked(),
+                "fx_loudnorm": cdict[18].isChecked()
+            }
+        return {"language_mapping": new_map}
+
+    def load_session(self, sess: dict):
+        self.mapping = sess.get("language_mapping", {})
+        # clear cards
+        for rec in list(self._cards):
+            self._remove_card(rec[0])
+        # rebuild
+        for lang, dat in self.mapping.items():
+            self._add_card(lang, dat.get("engine", "chatterbox"), dat.get("voice", ""), dat)
+
+    def _test_voice_custom(self, text, engine, voice_path, lang_code, btn_widget=None, speed=None, temperature=None):
+        # Wrapper para facilitar chamadas externas (ex: do Modo Expresso)
+        # Se btn_widget for None, usamos um botão genérico
+        
+        main_win = self.window()
+        if speed is None or temperature is None:
+            s_val = 1.0; t_val = 0.65
+            if hasattr(main_win, "tts_tab"):
+                tts_cfg = main_win.tts_tab.get_session()
+                s_val = tts_cfg.get("speed", 1.0)
+                t_val = tts_cfg.get("temperature", 0.65)
+            if speed is None: speed = s_val
+            if temperature is None: temperature = t_val
+            
+        # Mock de botão se necessário
+        class MockBtn:
+            def setEnabled(self, b): pass
+            def setText(self, t): pass
+        
+        target_btn = btn_widget if btn_widget else MockBtn()
+        # [NEW] Get model_type from source if available (card or tts_tab)
+        model_type = "turbo"
+        if hasattr(btn_widget, "parent") and btn_widget.parent():
+            # Tentar achar o card que contém este botão
+            p = btn_widget.parent()
+            while p and not hasattr(p, "get_config"): p = p.parent()
+            if p: 
+                card_cfg = p.get_config()
+                model_type = card_cfg.get("model_type", "turbo")
+
+        self._test_card_voice(engine, voice_path, lang_code, text, target_btn, speed, temperature, model_type)
+
+    def _test_card_voice(self, eng, voice, lang, txt, btn_widget, speed, temperature, model_type="turbo"):
+        if not txt.strip(): return
+        
+        # [THREAD SAFETY] Cleanup any previous thread and pipeline safely BEFORE creating new ones
+        if hasattr(self, "_preview_thread") and self._preview_thread and self._preview_thread.isRunning():
+            # AVOID WAITING ON SELF
+            import PySide6.QtCore as QtCore
+            if QtCore.QThread.currentThread() == self._preview_thread:
+                print("[WARNING] Tentativa de wait() no próprio thread. Abortando cleanup direto.")
+            else:
+                if hasattr(self, "_preview_pipeline") and self._preview_pipeline:
+                    self._preview_pipeline.cancel()
+                self._preview_thread.quit()
+                if not self._preview_thread.wait(2000):
+                    self._preview_thread.terminate()
+                    self._preview_thread.wait()
+
+        from manhwa_app.audio_pipeline import AudioPipeline
+        import tempfile
+        from PySide6.QtCore import QThread
+        
+        cfg = {}
+        w = self.window()
+        if hasattr(w, "audio_tab"):
+            cfg = w.audio_tab._get_tts_config()
+
+        self._preview_dir = tempfile.mkdtemp()
+        tmp_txt_path = Path(self._preview_dir) / "preview.txt"
+        tmp_txt_path.write_text(txt.strip(), encoding="utf-8")
+
+        btn_widget.setEnabled(False)
+        btn_widget.setText("Gerando...")
+
+        preview_configs = [{"path": str(tmp_txt_path), "voice": voice, "lang": lang, "speed": speed, "temperature": temperature}]
+        
+        self._preview_pipeline = AudioPipeline(
+            file_configs=preview_configs,
+            project_name="preview",
+            output_root=self._preview_dir,
+            tts_engine=eng,
+            model_type=model_type,
+            whisper_model=cfg.get("whisper_model", "base"),
+            similarity_threshold=cfg.get("similarity_threshold", 0.75),
+            max_retries=1,
+            temperature=temperature,
+            speed=speed,
+            output_format="wav",
+            fx_noise_reduction=cfg.get("fx_highpass", False),
+            fx_compressor=cfg.get("fx_compressor", False),
+            fx_eq=cfg.get("fx_deesser", False),
+            fx_reverb=cfg.get("fx_reverb", False),
+            fx_enhancer=cfg.get("fx_silence", False),
+            fx_normalize=cfg.get("fx_loudnorm", False),
+        )
+        
+        self._preview_thread = QThread()
+        self._preview_thread.setObjectName("PreviewThread")
+        self._preview_pipeline.moveToThread(self._preview_thread)
+        self._preview_thread.started.connect(self._preview_pipeline.run)
+
+        # --- Qt canonical thread teardown ---
+        # 1) When pipeline finishes, tell thread's event loop to stop
+        self._preview_pipeline.finished.connect(self._preview_thread.quit)
+        # 2) When thread actually stops, schedule it for deletion
+        self._preview_thread.finished.connect(self._preview_thread.deleteLater)
+        # 3) Notify UI in main thread (QueuedConnection fires after thread.quit is processed)
+        from PySide6.QtCore import Qt
+        self._preview_pipeline.finished.connect(
+            lambda s, m: self._on_preview_done(s, m, btn_widget),
+            Qt.ConnectionType.QueuedConnection
+        )
+        self._preview_thread.start()
+
+    def _on_preview_done(self, success, msg, btn_widget):
+        """Called in MAIN thread via QueuedConnection when pipeline finishes.
+        Thread teardown is handled by Qt signals — we only update the UI here.
+        """
+        # Clear references (thread/pipeline self-delete via finished→deleteLater signals)
+        self._preview_thread = None
+        self._preview_pipeline = None
+
+        try:
+            import torch, gc
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
+        except: pass
+
+        btn_widget.setEnabled(True)
+        btn_widget.setText("📢 Testar")
+
+        if success:
+            audios_dir = Path(self._preview_dir) / "preview" / "audios"
+            files = sorted(audios_dir.glob("*.wav"))
+            if files:
+                from PySide6.QtMultimedia import QSoundEffect
+                from PySide6.QtCore import QUrl
+                if not hasattr(self, "_preview_effect"):
+                    self._preview_effect = QSoundEffect()
+                    self._preview_effect.setVolume(1.0)
+                self._preview_effect.setSource(QUrl.fromLocalFile(str(files[-1])))
+                self._preview_effect.play()
+        else:
+            QMessageBox.warning(self, "Erro", f"Falha no preview:\n{msg}")
+
 # ---------------------------------------------------------------------------
 # Aba 1 — Geração de Áudio
 # ---------------------------------------------------------------------------
@@ -907,23 +1356,30 @@ class AudioTab(QWidget):
         fv.addWidget(self.files_list)
         # Voz e Idioma Global (Preset)
         vox_group = QGroupBox("Preset Rápido (Aplicar a todos)")
-        vg = QHBoxLayout(vox_group)
+        vg = QGridLayout(vox_group)
+        vg.setSpacing(10)
         
-        vg.addWidget(QLabel("Voz:"))
+        vg.addWidget(QLabel("Voz:"), 0, 0)
         self.preset_voice_combo = QComboBox()
         self.preset_voice_combo.addItem("Sem clonagem (Voz do Modelo)", "")
         self._populate_voices()
-        vg.addWidget(self.preset_voice_combo, 1)
+        vg.addWidget(self.preset_voice_combo, 0, 1)
 
         btn_custom = QPushButton("📁 Arquivo...")
         btn_custom.setFixedWidth(90)
         btn_custom.clicked.connect(self._browse_custom_voice)
-        vg.addWidget(btn_custom)
+        vg.addWidget(btn_custom, 0, 2)
         
-        vg.addWidget(QLabel("Idioma:"))
+        vg.addWidget(QLabel("Idioma:"), 1, 0)
         self.preset_lang_combo = QComboBox()
         self.preset_lang_combo.addItems(["en", "pt", "es", "fr", "ja", "ko", "zh"])
-        vg.addWidget(self.preset_lang_combo)
+        vg.addWidget(self.preset_lang_combo, 1, 1)
+        
+        btn_lang_cfg = QPushButton("⚙ Mapear Vozes (Tradução)")
+        btn_lang_cfg.setToolTip("Adicionar regras de vozes e engines diferentes para cada idioma das traduções")
+        btn_lang_cfg.setStyleSheet("background-color: #2b4566; color: #a4cefe; font-weight: bold; border: 1px solid #3c5ea4; padding: 4px;")
+        btn_lang_cfg.clicked.connect(self._open_language_mapping)
+        vg.addWidget(btn_lang_cfg, 1, 2)
         
         lv.addWidget(vox_group)
         self._custom_voice_path = None
@@ -1098,6 +1554,7 @@ class AudioTab(QWidget):
         
         preview_configs = [{"path": str(tmp_txt_path), "voice": voice_val, "lang": lang_val}]
 
+        from manhwa_app.audio_pipeline import AudioPipeline
         self._preview_pipeline = AudioPipeline(
             file_configs=preview_configs,
             project_name="preview",
@@ -1424,6 +1881,13 @@ class AudioTab(QWidget):
         self._current_run_all_project = proj_name
         self._start_pipeline([file_cfg], project_override=proj_name)
 
+    def _open_language_mapping(self):
+        w = self.window()
+        if hasattr(w, "tabs"):
+            lct = getattr(w, "language_config_tab", None)
+            if lct:
+                w.tabs.setCurrentWidget(lct)
+
     def _start_pipeline(self, configs, project_override=None):
         if not configs: return
         # CORRIGIDO: evitar double-start se pipeline já estiver rodando
@@ -1438,8 +1902,55 @@ class AudioTab(QWidget):
         
         voice_val = self.preset_voice_combo.currentData()
         lang_val = self.preset_lang_combo.currentText()
-        new_configs = [{"path": c["path"], "voice": voice_val, "lang": lang_val} for c in configs]
         
+        w = self.window()
+        lct = getattr(w, "language_config_tab", None)
+        mapping = lct.mapping if lct else {}
+
+        base_speed = cfg.get("speed", 1.0)
+        base_temp = cfg.get("temperature", 0.65)
+
+        new_configs = []
+        for c in configs:
+            c_path = c["path"]
+            c_name = Path(c_path).stem
+            c_lang = lang_val
+            c_voice = voice_val
+            c_engine = cfg.get("tts_engine", "chatterbox")
+            
+            c_cfg = {
+                "path": c_path, "voice": c_voice, "lang": c_lang, "engine": c_engine,
+                "speed": base_speed, "temperature": base_temp,
+                "exaggeration": cfg.get("exaggeration", 0.5),
+                "cfg_weight": cfg.get("cfg_weight", 0.5),
+                "seed": cfg.get("seed", 3000),
+                "min_p": cfg.get("min_p", 0.05),
+                "top_p": cfg.get("top_p", 1.0),
+                "top_k": cfg.get("top_k", 1000),
+                "repetition_penalty": cfg.get("repetition_penalty", 1.2),
+                "fx_highpass": cfg.get("fx_highpass", True),
+                "fx_compressor": cfg.get("fx_compressor", True),
+                "fx_deesser": cfg.get("fx_deesser", True),
+                "fx_reverb": cfg.get("fx_reverb", False),
+                "fx_silence": cfg.get("fx_silence", True),
+                "fx_loudnorm": cfg.get("fx_loudnorm", True)
+            }
+            
+            parts = c_name.split("_")
+            if len(parts) > 1 and parts[-1] in mapping:
+                l_code = parts[-1]
+                m = mapping[l_code]
+                c_cfg["lang"] = l_code
+                c_cfg["voice"] = m.get("voice", c_voice)
+                c_cfg["engine"] = m.get("engine", c_engine)
+                for k in ["speed", "temperature", "exaggeration", "cfg_weight", "seed", "min_p", "top_p", "top_k", "repetition_penalty", "fx_highpass", "fx_compressor", "fx_deesser", "fx_reverb", "fx_silence", "fx_loudnorm"]:
+                    if k in m: c_cfg[k] = m[k]
+                
+                print(f"[UI] Trocando configuração dinâmica. {c_name} => Lang:{c_cfg['lang']}, Eng:{c_cfg['engine']}, SP:{c_cfg['speed']}, SEED:{c_cfg['seed']}")
+                
+            new_configs.append(c_cfg)
+        
+        from manhwa_app.audio_pipeline import AudioPipeline
         self._pipeline = AudioPipeline(
             file_configs=new_configs,
             project_name=project_override or (self.project_edit.text().strip() or "projeto"),
@@ -1600,6 +2111,7 @@ class AudioTab(QWidget):
         row_voice = self.preset_voice_combo.currentData()
         row_lang = self.preset_lang_combo.currentText()
         cfg = self._get_tts_config()
+        from manhwa_app.audio_pipeline import AudioPipeline
         pipeline = AudioPipeline(
             file_configs=[{"path": tmp_txt, "voice": row_voice, "lang": row_lang}],
             project_name=project,
@@ -1647,11 +2159,23 @@ class AudioTab(QWidget):
     def load_session(self, data: dict):
         if "project" in data: self.project_edit.setText(data["project"])
         if "output_root" in data: self.output_root_edit.setText(data["output_root"])
+        if "preset_lang" in data:
+            idx = self.preset_lang_combo.findText(data["preset_lang"])
+            if idx >= 0: self.preset_lang_combo.setCurrentIndex(idx)
+        if "preset_voice" in data:
+            idx = self.preset_voice_combo.findData(data["preset_voice"])
+            if idx >= 0:
+                self.preset_voice_combo.setCurrentIndex(idx)
+            else:
+                idx = self.preset_voice_combo.findText(data["preset_voice"])
+                if idx >= 0: self.preset_voice_combo.setCurrentIndex(idx)
 
     def get_session(self) -> dict:
         return {
             "project": self.project_edit.text().strip(),
-            "output_root": self.output_root_edit.text().strip()
+            "output_root": self.output_root_edit.text().strip(),
+            "preset_lang": self.preset_lang_combo.currentText(),
+            "preset_voice": self.preset_voice_combo.currentData() or self.preset_voice_combo.currentText()
         }
 
     def reset_defaults(self):
@@ -1788,7 +2312,7 @@ class AudioTab(QWidget):
             row = 0
         if row >= len(self._files):
             return
-        txt_path = self._files[row]
+        txt_path = self._files[row]["path"]
 
         settings = self.window().settings_tab
         api_key = settings.get_api_key()
@@ -1848,16 +2372,39 @@ class AudioTab(QWidget):
         if result:
             paths = "\n".join(f"  ✅ {Path(p).name}" for p in result.values())
             self._gemini_status_lbl.setText(f"Concluído!\n{paths}")
+            
+            # --- Auto-load mechanism ---
+            selected = self.files_list.selectedItems()
+            row = self.files_list.row(selected[0]) if selected else 0
+            if 0 <= row < len(self._files):
+                # Remove original
+                self._files.pop(row)
+                self.files_list.takeItem(row)
+                
+                # Insert generated files at the same position
+                insert_idx = row
+                for lang_code, new_path in result.items():
+                    self._files.insert(insert_idx, {"path": str(new_path), "voice": None, "lang": None})
+                    self.files_list.insertItem(insert_idx, Path(new_path).name)
+                    insert_idx += 1
+                
+                # Select the first newly added file
+                self.files_list.setCurrentRow(row)
+
         else:
             self._gemini_status_lbl.setText("⚠ Processamento concluído sem saída.")
-        self._gemini_worker = None
+        if self._gemini_worker:
+            self._gemini_worker.deleteLater()
+            self._gemini_worker = None
 
     def _on_gemini_error(self, message: str):
         self._gemini_run_btn.setEnabled(True)
         self._gemini_cancel_btn.setEnabled(False)
         self._gemini_progress.setVisible(False)
         self._gemini_status_lbl.setText(f"❌ {message}")
-        self._gemini_worker = None
+        if self._gemini_worker:
+            self._gemini_worker.deleteLater()
+            self._gemini_worker = None
 
     def _on_gemini_cancel(self):
         if self._gemini_worker and self._gemini_worker.isRunning():
@@ -2699,6 +3246,7 @@ class VideoTab(QWidget):
         bgm_path = self.bgm_path_edit.text().strip()
         bgm_vol = self.bgm_vol_spin.value()
 
+        from manhwa_app.video_pipeline import VideoPipeline
         self._pipeline = VideoPipeline(pairs=pairs, output_path=output_path,
                                        effect_mode=effect_mode,
                                        transition_mode=transition_mode,
@@ -2748,6 +3296,7 @@ class VideoTab(QWidget):
         bgm_path = self.bgm_path_edit.text().strip()
         bgm_vol = self.bgm_vol_spin.value()
 
+        from manhwa_app.video_pipeline import VideoPipeline
         self._pipeline = VideoPipeline(pairs=pairs, output_path=str(out_mp4),
                                        effect_mode=effect_mode,
                                        bg_music_path=bgm_path,
@@ -3017,17 +3566,37 @@ class SettingsTab(QWidget):
 
 
         gg.addWidget(QLabel("API Key:"), 1, 0)
-        self.api_key_edit = QLineEdit()
-        self.api_key_edit.setPlaceholderText("Cole sua Gemini API Key aqui (começa com AIza...)...")
-        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        gg.addWidget(self.api_key_edit, 1, 1, 1, 2)
+        self.api_key_combo = QComboBox()
+        self.api_key_combo.setEditable(True)
+        self.api_key_combo.lineEdit().setPlaceholderText("Cole ou digite sua API Key...")
+        self.api_key_combo.lineEdit().setEchoMode(QLineEdit.EchoMode.Password)
+        
+        kw = QWidget()
+        kh = QHBoxLayout(kw)
+        kh.setContentsMargins(0, 0, 0, 0)
+        kh.setSpacing(5)
+        kh.addWidget(self.api_key_combo, 1)
+
+        self.btn_save_key = QPushButton("💾")
+        self.btn_save_key.setToolTip("Salvar chave atual na lista")
+        self.btn_save_key.setFixedWidth(34)
+        self.btn_save_key.clicked.connect(self._save_api_key)
+        kh.addWidget(self.btn_save_key)
+
+        self.btn_rem_key = QPushButton("🗑")
+        self.btn_rem_key.setToolTip("Remover chave atual da lista")
+        self.btn_rem_key.setFixedWidth(34)
+        self.btn_rem_key.clicked.connect(self._remove_api_key)
+        kh.addWidget(self.btn_rem_key)
+
+        gg.addWidget(kw, 1, 1, 1, 2)
 
         self._btn_eye = QPushButton("👁")
         self._btn_eye.setFixedWidth(34)
         self._btn_eye.setCheckable(True)
         self._btn_eye.setToolTip("Mostrar/ocultar chave")
         self._btn_eye.toggled.connect(
-            lambda on: self.api_key_edit.setEchoMode(
+            lambda on: self.api_key_combo.lineEdit().setEchoMode(
                 QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password)
         )
         gg.addWidget(self._btn_eye, 1, 3)
@@ -3228,8 +3797,22 @@ class SettingsTab(QWidget):
     # Public helpers
     # ------------------------------------------------------------------
 
+    def _save_api_key(self):
+        text = self.api_key_combo.currentText().strip()
+        if text and self.api_key_combo.findText(text) == -1:
+            self.api_key_combo.addItem(text)
+            self.api_key_combo.setCurrentText(text)
+
+    def _remove_api_key(self):
+        idx = self.api_key_combo.currentIndex()
+        if idx >= 0:
+            self.api_key_combo.removeItem(idx)
+
+    def get_all_api_keys(self) -> list:
+        return [self.api_key_combo.itemText(i) for i in range(self.api_key_combo.count())]
+
     def get_api_key(self) -> str:
-        return self.api_key_edit.text().strip()
+        return self.api_key_combo.currentText().strip()
 
     def get_model_name(self) -> str:
         return self.model_combo.currentData() or self.model_combo.currentText().strip()
@@ -3275,6 +3858,7 @@ class SettingsTab(QWidget):
         return {
             "gemini": {
                 "api_key": self.get_api_key(),
+                "api_keys": self.get_all_api_keys(),
                 "model_name": self.get_model_name(),
                 "delay": self.delay_slider.value(),
                 "languages": self.get_languages(),
@@ -3284,7 +3868,7 @@ class SettingsTab(QWidget):
                 "media_resolution": self.get_media_resolution(),
                 "revision_prompt": self.get_revision_prompt(),
                 "translation_prompt": self.get_translation_prompt(),
-
+                "language_mapping": getattr(self, "language_mapping", {})
             },
             "appearance": {
                 "theme": self.theme_combo.currentText(),
@@ -3298,8 +3882,16 @@ class SettingsTab(QWidget):
 
     def load_session(self, data: dict):
         gem = data.get("gemini", {})
+        self.language_mapping = gem.get("language_mapping", {})
+        if "api_keys" in gem:
+            self.api_key_combo.clear()
+            self.api_key_combo.addItems(gem["api_keys"])
         if "api_key" in gem:
-            self.api_key_edit.setText(gem["api_key"])
+            idx = self.api_key_combo.findText(gem["api_key"])
+            if idx >= 0:
+                self.api_key_combo.setCurrentIndex(idx)
+            else:
+                self.api_key_combo.setCurrentText(gem["api_key"])
         if "model_name" in gem:
             idx = self.model_combo.findData(gem["model_name"])
             if idx >= 0:
@@ -3605,6 +4197,670 @@ class SettingsTab(QWidget):
 # Janela Principal
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Utilitários de Teste Localizado
+# ---------------------------------------------------------------------------
+SAMPLE_TEXTS = {
+    "pt": "Olá! Esta é uma amostra da minha voz em português. Espero que a qualidade esteja excelente para o seu vídeo.",
+    "en": "Hello there! This is a sample of my voice in English. I hope the quality is perfect for your project.",
+    "es": "Hola, esta es una muestra de mi voz para su proyecto.",
+    "fr": "Bonjour, ceci est un échantillon de ma voix pour votre projet.",
+    "de": "Hallo, dies ist eine Probe meiner Stimme für Ihr Projekt.",
+    "it": "Ciao! Questo è un campione della mia voce in italiano. Spero que la qualità sia ottima per o teu vídeo.",
+    "ru": "Привет, это образец моего голоса для вашего проекта.",
+    "ja": "こんにちは、これはあなたのプロジェクトのための私の声のサンプルです。",
+    "ko": "안녕하세요, 이것은 당신의 프로젝트를 위한 제 목소리 샘플입니다.",
+    "zh": "你好，这是我为你的项目提供的声音样本。"
+}
+
+class LanguageConfigCard(QFrame):
+    """
+    Card dinâmico para configuração de voz por idioma no Modo Expresso.
+    """
+    def __init__(self, lang_code, lang_name, parent=None):
+        super().__init__(parent)
+        self.lang_code = lang_code
+        self.lang_name = lang_name
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self.setObjectName("configCard")
+        self.setStyleSheet("""
+            QFrame#configCard {
+                background: #1e1e2e;
+                border: 1px solid #3b82f6;
+                border-radius: 10px;
+                padding: 2px;
+            }
+        """)
+        
+        main_v = QVBoxLayout(self)
+        main_v.setContentsMargins(10, 8, 10, 8)
+        main_v.setSpacing(6)
+
+        # Top Row: Info + Engine + Voice + Controls
+        top_row = QHBoxLayout()
+        top_row.setSpacing(10)
+
+        lbl = QLabel(f"<b>{self.lang_name}</b>")
+        lbl.setFixedWidth(90)
+        lbl.setStyleSheet("font-size: 13px; color: #60a5fa;")
+        top_row.addWidget(lbl)
+        
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItems(["chatterbox", "kokoro", "qwen", "indextts"])
+        self.engine_combo.setFixedWidth(100)
+        self.engine_combo.currentTextChanged.connect(self._update_voice_combo)
+        self.engine_combo.currentTextChanged.connect(self._on_engine_changed)
+        top_row.addWidget(self.engine_combo)
+        
+        # Submodelo (Turbo vs Multilingual vs Original)
+        self.submodel_combo = QComboBox()
+        self.submodel_combo.addItems(["turbo", "multilingual", "original"])
+        self.submodel_combo.setFixedWidth(100)
+        top_row.addWidget(self.submodel_combo)
+        
+        self.voice_combo = QComboBox()
+        self.voice_combo.setMinimumWidth(180)
+        top_row.addWidget(self.voice_combo)
+        
+        # Clearer buttons with text
+        self.voice_browse = QPushButton("📁 Voz")
+        self.voice_browse.setFixedWidth(75)
+        self.voice_browse.setToolTip("Carregar arquivo de voz customizado")
+        self.voice_browse.clicked.connect(self._browse_voice)
+        top_row.addWidget(self.voice_browse)
+
+        self.btn_adv = QPushButton("⚙️ Config")
+        self.btn_adv.setCheckable(True)
+        self.btn_adv.setFixedWidth(85)
+        self.btn_adv.setToolTip("Parâmetros Avançados (Speed, Temp, etc)")
+        top_row.addWidget(self.btn_adv)
+        
+        self.btn_test = QPushButton("📢 Testar")
+        self.btn_test.setFixedWidth(85)
+        self.btn_test.setObjectName("primary")
+        self.btn_test.clicked.connect(self._test_voice)
+        top_row.addWidget(self.btn_test)
+        
+        top_row.addStretch()
+        main_v.addLayout(top_row)
+
+        # Advanced Panel
+        self.adv_frame = QFrame()
+        self.adv_frame.setVisible(False)
+        self.btn_adv.toggled.connect(self.adv_frame.setVisible)
+        self.adv_frame.setStyleSheet("background: #161625; border-radius: 6px; border: 1px solid #333344;")
+        
+        avg = QGridLayout(self.adv_frame)
+        avg.setContentsMargins(10, 8, 10, 8)
+        avg.setSpacing(8)
+
+        self.sp_speed = QDoubleSpinBox(); self.sp_speed.setRange(0.5, 2.5); self.sp_speed.setValue(1.0); self.sp_speed.setSingleStep(0.1); self.sp_speed.setFixedWidth(60)
+        self.sp_temp = QDoubleSpinBox(); self.sp_temp.setRange(0.1, 1.0); self.sp_temp.setValue(0.65); self.sp_temp.setSingleStep(0.05); self.sp_temp.setFixedWidth(60)
+        self.sp_exag = QDoubleSpinBox(); self.sp_exag.setRange(0.0, 1.0); self.sp_exag.setValue(0.0); self.sp_exag.setSingleStep(0.1); self.sp_exag.setFixedWidth(60)
+        self.sp_cfg = QDoubleSpinBox(); self.sp_cfg.setRange(0.0, 1.0); self.sp_cfg.setValue(0.5); self.sp_cfg.setSingleStep(0.1); self.sp_cfg.setFixedWidth(60)
+        self.sp_seed = QSpinBox(); self.sp_seed.setRange(-1, 999999); self.sp_seed.setValue(-1); self.sp_seed.setFixedWidth(80)
+
+        def add_param(txt, spin, r, c):
+            lbl = QLabel(txt)
+            lbl.setStyleSheet("font-size: 10px; font-weight: bold; color: #94a3b8;")
+            avg.addWidget(lbl, r, c)
+            avg.addWidget(spin, r, c+1)
+
+        add_param("Veloc:", self.sp_speed, 0, 0)
+        add_param("Temp:", self.sp_temp, 0, 2)
+        add_param("Exag:", self.sp_exag, 0, 4)
+        add_param("CFG:", self.sp_cfg, 1, 0)
+        add_param("Seed:", self.sp_seed, 1, 2)
+
+        main_v.addWidget(self.adv_frame)
+        self._on_engine_changed(self.engine_combo.currentText())
+        self._update_voice_combo()
+
+    def _on_engine_changed(self, eng):
+        self.submodel_combo.setVisible(eng == "chatterbox")
+
+    def _update_voice_combo(self):
+        eng = self.engine_combo.currentText()
+        self.voice_combo.clear()
+        
+        if eng == "chatterbox":
+            self.voice_combo.addItem("Sem clonagem (Voz do Modelo)", "")
+            vdir = Path("voices")
+            if vdir.exists():
+                for p in vdir.glob("*.wav"): self.voice_combo.addItem(p.stem, str(p))
+            # Tambem checar em manhwa_app/voices se existir
+            vdir2 = Path(__file__).parent / "voices"
+            if vdir2.exists():
+                for p in vdir2.glob("*.wav"): self.voice_combo.addItem(p.stem, str(p))
+        elif eng == "kokoro":
+            v_list = ["af_heart", "af_bella", "af_nicole", "af_aoi", "af_sarah", "am_adam", "am_michael", "bf_isabella", "bf_emma", "bm_george", "bm_lewis"]
+            for v in v_list: self.voice_combo.addItem(v, v)
+        elif eng == "qwen":
+            self.voice_combo.addItems(["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"])
+            qdir = Path(__file__).parent / "qwen_voices"
+            if qdir.exists():
+                for p in qdir.glob("*.pt"): self.voice_combo.addItem(p.stem, str(p))
+        elif eng == "indextts":
+            pdir = Path("presets")
+            if pdir.exists():
+                for p in pdir.glob("*.wav"): self.voice_combo.addItem(p.stem, str(p))
+
+    def _browse_voice(self):
+        path, _ = QFileDialog.getOpenFileName(self, f"Voz para {self.lang_name}", "", "Áudio (*.wav *.mp3)")
+        if path:
+            self.voice_combo.addItem(f"[Custom] {Path(path).stem}", path)
+            self.voice_combo.setCurrentIndex(self.voice_combo.count()-1)
+
+    def _test_voice(self):
+        text = SAMPLE_TEXTS.get(self.lang_code, SAMPLE_TEXTS["en"])
+        engine_str = self.engine_combo.currentText()
+        voice_val = resolve_voice_path(self.voice_combo.currentData() or self.voice_combo.currentText())
+        
+        main_win = self.window()
+        if hasattr(main_win, "language_config_tab"):
+            main_win.language_config_tab._test_voice_custom(
+                text=text, 
+                engine=engine_str, 
+                voice_path=voice_val,
+                lang_code=self.lang_code,
+                btn_widget=self.btn_test,
+                speed=self.sp_speed.value(),
+                temperature=self.sp_temp.value()
+            )
+
+    def get_config(self):
+        return {
+            "voice": resolve_voice_path(self.voice_combo.currentData() or self.voice_combo.currentText()),
+            "engine": self.engine_combo.currentText(),
+            "model_type": self.submodel_combo.currentText() if self.engine_combo.currentText() == "chatterbox" else "default",
+            "speed": self.sp_speed.value(),
+            "temperature": self.sp_temp.value(),
+            "exaggeration": self.sp_exag.value(),
+            "cfg_weight": self.sp_cfg.value(),
+            "seed": self.sp_seed.value()
+        }
+
+    def load_config(self, cfg):
+        if not cfg: return
+        if "engine" in cfg:
+            self.engine_combo.setCurrentText(cfg["engine"])
+        if "model_type" in cfg and cfg.get("engine") == "chatterbox":
+            self.submodel_combo.setCurrentText(cfg["model_type"])
+        
+        # Need to ensure voice combo is updated before setting voice
+        self._update_voice_combo()
+        
+        if "voice" in cfg:
+            idx = self.voice_combo.findData(cfg["voice"])
+            if idx >= 0:
+                self.voice_combo.setCurrentIndex(idx)
+            else:
+                self.voice_combo.setCurrentText(cfg["voice"])
+        
+        if "speed" in cfg: self.sp_speed.setValue(cfg["speed"])
+        if "temperature" in cfg: self.sp_temp.setValue(cfg["temperature"])
+        if "exaggeration" in cfg: self.sp_exag.setValue(cfg["exaggeration"])
+        if "cfg_weight" in cfg: self.sp_cfg.setValue(cfg["cfg_weight"])
+        if "seed" in cfg: self.sp_seed.setValue(cfg["seed"])
+
+# ---------------------------------------------------------------------------
+# Aba Express - One Click Pipeline
+# ---------------------------------------------------------------------------
+
+class ExpressTab(QWidget):
+    """
+    Modo Expresso: Um único clique para Processamento Gemini -> TTS -> Vídeo.
+    """
+    log_message = Signal(str)
+    pipeline_finished = Signal(bool, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._files = [] # list of {"path": str}
+        self._images = []
+        self._worker = None
+        self._setup_ui()
+
+    def _setup_ui(self):
+        # Base Layout (Scroll Area)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setObjectName("expressScroll")
+        outer_layout.addWidget(self.scroll)
+
+        self.content = QWidget()
+        self.content.setObjectName("expressContent")
+        self.scroll.setWidget(self.content)
+        
+        layout = QVBoxLayout(self.content)
+        layout.setContentsMargins(30, 25, 30, 25)
+        layout.setSpacing(20)
+
+        # Header Title
+        title_box = QHBoxLayout()
+        title = QLabel("🚀 Modo Expresso")
+        title.setStyleSheet("font-size: 24px; font-weight: 800; color: #60a5fa; letter-spacing: 1px;")
+        title_box.addWidget(title)
+        title_box.addStretch()
+        layout.addLayout(title_box)
+
+        desc = QLabel("Processamento inteligente: Revisão Gemini → TTS Multilíngue → Montagem de Vídeo.")
+        desc.setStyleSheet("color: #94a3b8; font-size: 13px; margin-bottom: 5px;")
+        layout.addWidget(desc)
+
+        # Centralized Config Area
+        cfg_row = QHBoxLayout()
+        cfg_row.setSpacing(15)
+
+        v1 = QVBoxLayout(); v1.addWidget(QLabel("NOME DO PROJETO")); self.proj_edit = QLineEdit("projeto_expresso_1"); self.proj_edit.setMinimumHeight(35); v1.addWidget(self.proj_edit)
+        cfg_row.addLayout(v1, 2)
+
+        v2 = QVBoxLayout(); v2.addWidget(QLabel("IDIOMA ORIGINAL (TXT)")); self.source_lang_combo = QComboBox(); self.source_lang_combo.setMinimumHeight(35)
+        for code, name in [("pt", "Português"), ("en", "Inglês"), ("es", "Espanhol"), ("ja", "Japonês"), ("ko", "Coreano"), ("zh", "Chinês")]:
+            self.source_lang_combo.addItem(f"{name} ({code})", code)
+        v2.addWidget(self.source_lang_combo)
+        cfg_row.addLayout(v2, 1)
+
+        layout.addLayout(cfg_row)
+
+        # File Drop Areas
+        file_row = QHBoxLayout()
+        file_row.setSpacing(20)
+        
+        # Style for drop zone
+        drop_style = """
+            QFrame { 
+                background: qlineargradient(spread:pad, x1:0, y1:0, x2:0, y2:1, stop:0 #1e1e2e, stop:1 #13131e); 
+                border: 2px solid #334155; 
+                border-radius: 12px; 
+            }
+            QFrame:hover { border-color: #3b82f6; background: #1a1a2a; }
+        """
+        
+        self.drop_txt = QFrame()
+        self.drop_txt.setAcceptDrops(True)
+        self.drop_txt.setMinimumHeight(120)
+        self.drop_txt.setStyleSheet(drop_style)
+        dt_v = QVBoxLayout(self.drop_txt)
+        dt_v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.txt_lbl = QLabel("📄\n<b>CLIQUE OU ARRASTE</b>\nRoteiro (.txt)")
+        self.txt_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.txt_lbl.setStyleSheet("color: #cbd5e1; font-size: 13px; border: none; background: transparent;")
+        dt_v.addWidget(self.txt_lbl)
+        file_row.addWidget(self.drop_txt)
+        
+        self.drop_img = QFrame()
+        self.drop_img.setAcceptDrops(True)
+        self.drop_img.setMinimumHeight(120)
+        self.drop_img.setStyleSheet(drop_style.replace("#3b82f6", "#e8789a"))
+        di_v = QVBoxLayout(self.drop_img)
+        di_v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img_lbl = QLabel("🖼️\n<b>CLIQUE OU ARRASTE</b>\nPasta de Imagens")
+        self.img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img_lbl.setStyleSheet("color: #cbd5e1; font-size: 13px; border: none; background: transparent;")
+        di_v.addWidget(self.img_lbl)
+        file_row.addWidget(self.drop_img)
+        
+        layout.addLayout(file_row)
+
+        # Mouse clicks
+        self.drop_txt.mousePressEvent = lambda e: self._pick_txt()
+        self.drop_img.mousePressEvent = lambda e: self._pick_images()
+
+        # Target Languages Selection (Grid)
+        langs_group = QGroupBox("🌍 IDIOMAS DE DESTINO (TRADUÇÃO GEMINI)")
+        self.lang_grid = QGridLayout(langs_group)
+        self.lang_grid.setContentsMargins(15, 15, 15, 15)
+        self.lang_grid.setSpacing(10)
+        
+        self.lang_checkboxes = {}
+        self.target_langs = [
+            ("pt", "Português"), ("en", "Inglês"), ("es", "Espanhol"), 
+            ("fr", "Francês"), ("de", "Alemão"), ("it", "Italiano"),
+            ("ru", "Russo"), ("ja", "Japonês"), ("ko", "Coreano"), ("zh", "Chinês")
+        ]
+        
+        cols = 5
+        for i, (code, name) in enumerate(self.target_langs):
+            chk = QCheckBox(name)
+            chk.setProperty("lang_code", code)
+            chk.setProperty("lang_name", name)
+            if code == "pt":
+                chk.setChecked(True)
+            chk.toggled.connect(self._on_lang_toggled)
+            self.lang_grid.addWidget(chk, i // cols, i % cols)
+            self.lang_checkboxes[code] = chk
+            
+        layout.addWidget(langs_group)
+
+        # Language Config Cards
+        voices_header = QHBoxLayout()
+        v_title = QLabel("🎙️ CONFIGURAÇÕES DE VOZ POR IDIOMA")
+        v_title.setStyleSheet("font-weight: bold; color: #94a3b8; font-size: 11px;")
+        voices_header.addWidget(v_title)
+        voices_header.addStretch()
+        
+        self.chk_use_saved = QCheckBox("Sincronizar Global")
+        self.chk_use_saved.setChecked(True)
+        self.chk_use_saved.setStyleSheet("color: #3b82f6; font-size: 10px; font-weight: bold;")
+        voices_header.addWidget(self.chk_use_saved)
+        layout.addLayout(voices_header)
+
+        self.cards_container = QWidget()
+        self.cards_v = QVBoxLayout(self.cards_container)
+        self.cards_v.setContentsMargins(0, 5, 0, 5)
+        self.cards_v.setSpacing(8)
+        layout.addWidget(self.cards_container)
+
+        self.language_cards = {}
+        self._add_lang_card("pt", "Português")
+
+
+        # Control Buttons
+        self.btn_run = QPushButton("⚡ INICIAR PIPELINE COMPLETO")
+        self.btn_run.setObjectName("primary")
+        self.btn_run.setFixedHeight(55)
+        self.btn_run.setStyleSheet("font-size: 16px; font-weight: 800; border-radius: 12px;")
+        self.btn_run.clicked.connect(self._run_all)
+        layout.addWidget(self.btn_run)
+
+        # Logs & Progress
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(120)
+        self.log_text.setStyleSheet("background:#0a0a0f; border: 1px solid #1e293b; border-radius: 8px; color: #94a3b8; font-family: 'Consolas', monospace;")
+        layout.addWidget(self.log_text)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedHeight(6)
+        layout.addWidget(self.progress_bar)
+
+        # Apply specific stylesheet for scroll area
+        self.setStyleSheet("""
+            QScrollArea#expressScroll { background: transparent; }
+            QWidget#expressContent { background: transparent; }
+            QGroupBox { font-size: 10px; color: #64748b; margin-top: 15px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+        """)
+
+    def _pick_txt(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Selecionar Roteiro", "", "Texto (*.txt)")
+        if path: self._set_txt(path)
+
+    def _pick_images(self):
+        folder = QFileDialog.getExistingDirectory(self, "Selecionar Pasta de Imagens")
+        if folder: self._set_images(folder)
+
+    def _on_lang_toggled(self, checked):
+        chk = self.sender()
+        code = chk.property("lang_code")
+        name = chk.property("lang_name")
+        if checked:
+            self._add_lang_card(code, name)
+        else:
+            self._remove_lang_card(code)
+
+    def _add_lang_card(self, code, name):
+        if code in self.language_cards: return
+        card = LanguageConfigCard(code, name, self)
+        self.cards_v.addWidget(card)
+        self.language_cards[code] = card
+        
+        # Apply pending overrides from session load
+        if hasattr(self, "_pending_overrides") and code in self._pending_overrides:
+            card.load_config(self._pending_overrides[code])
+
+    def _remove_lang_card(self, code):
+        if code not in self.language_cards: return
+        card = self.language_cards.pop(code)
+        card.setParent(None)
+        card.deleteLater()
+
+    def _get_overrides(self):
+        ov = {}
+        for code, card in self.language_cards.items():
+            cfg = card.get_config()
+            if cfg["voice"] or cfg["engine"] != "chatterbox":
+                ov[code] = cfg
+        return ov
+
+    def _set_txt(self, path):
+        self._files = [{"path": path}]
+        self.txt_lbl.setText(f"✅ Roteiro: {Path(path).name}")
+
+    def _set_images(self, folder):
+        from pathlib import Path
+        imgs = sorted([str(p) for p in Path(folder).glob("*") if p.suffix.lower() in [".jpg", ".png", ".webp", ".jpeg"]], key=natural_sort_key)
+        self._images = imgs
+        self.img_lbl.setText(f"✅ {len(imgs)} imagens carregadas")
+
+    def get_session(self):
+        return {
+            "project_name": self.proj_edit.text(),
+            "source_lang": self.source_lang_combo.currentData(),
+            "selected_langs": [code for code, chk in self.lang_checkboxes.items() if chk.isChecked()],
+            "overrides": self._get_overrides(),
+            "use_saved_tts": self.chk_use_saved.isChecked()
+        }
+
+    def load_session(self, data):
+        if not data: return
+        if "project_name" in data: 
+            self.proj_edit.setText(data["project_name"])
+        if "source_lang" in data:
+            idx = self.source_lang_combo.findData(data["source_lang"])
+            if idx >= 0: self.source_lang_combo.setCurrentIndex(idx)
+        
+        if "selected_langs" in data:
+            for code, chk in self.lang_checkboxes.items():
+                if code == "pt": continue 
+                chk.setChecked(code in data["selected_langs"])
+        
+        if "use_saved_tts" in data:
+            self.chk_use_saved.setChecked(data["use_saved_tts"])
+            
+        overrides = data.get("overrides", {})
+        for code, card in self.language_cards.items():
+            if code in overrides:
+                card.load_config(overrides[code])
+        self._pending_overrides = overrides
+
+    def _run_all(self):
+        if not self._files:
+            QMessageBox.warning(self, "Erro", "Selecione um arquivo .txt primeiro.")
+            return
+        if not self._images:
+            QMessageBox.warning(self, "Erro", "Selecione as imagens primeiro.")
+            return
+
+        selected_langs = [code for code, chk in self.lang_checkboxes.items() if chk.isChecked()]
+        if not selected_langs:
+            QMessageBox.warning(self, "Erro", "Selecione ao menos um idioma.")
+            return
+
+        self.btn_run.setEnabled(False)
+        self.log_text.clear()
+        self.progress_bar.setValue(0)
+        
+        main_win = self.window()
+        cfg = main_win.settings_tab.get_session()
+        api_key = main_win.settings_tab.get_api_key()
+        
+        if not api_key:
+            QMessageBox.warning(self, "Erro", "API Key do Gemini não configurada na aba Configurações.")
+            self.btn_run.setEnabled(True)
+            return
+
+        overrides = self._get_overrides()
+
+        self._orchestrator = ExpressOrchestrator(
+            parent=self,
+            txt_path=self._files[0]["path"],
+            image_paths=self._images,
+            project_name=self.proj_edit.text().strip(),
+            api_key=api_key,
+            source_lang=self.source_lang_combo.currentData(),
+            languages=selected_langs,
+            use_saved_tts=self.chk_use_saved.isChecked(),
+            main_cfg=cfg,
+            overrides=overrides
+        )
+        self._orchestrator.log_message.connect(lambda m: _append_log(self.log_text, m))
+        self._orchestrator.progress.connect(self.progress_bar.setValue)
+        self._orchestrator.finished.connect(self._on_done)
+        self._orchestrator.start()
+
+    def _on_done(self, success, msg):
+        self.btn_run.setEnabled(True)
+        if success:
+            QMessageBox.information(self, "Concluído", f"Pipeline concluído com sucesso!\n{msg}")
+        else:
+            QMessageBox.critical(self, "Erro", f"Pipeline falhou:\n{msg}")
+
+class ExpressOrchestrator(QThread):
+    log_message = Signal(str)
+    progress = Signal(int)
+    finished = Signal(bool, str)
+
+    def __init__(self, parent, txt_path, image_paths, project_name, api_key, source_lang, languages, use_saved_tts, main_cfg, overrides=None):
+        super().__init__(parent)
+        self.txt_path = txt_path
+        self.image_paths = image_paths
+        self.project_name = project_name
+        self.api_key = api_key
+        self.source_lang = source_lang
+        self.languages = languages
+        self.use_saved_tts = use_saved_tts
+        self.main_cfg = main_cfg
+        self.overrides = overrides or {}
+
+    def run(self):
+        try:
+            # 1. Gemini Process
+            self.log_message.emit("--- FASE 1: Revisão e Tradução Gemini ---")
+            self.progress.emit(10)
+            
+            # Use original revised (pt) + requested langs
+            target_langs = list(set(self.languages))
+            
+            from gemini_processor import GeminiProcessor
+            proc = GeminiProcessor(model_name=self.main_cfg.get("gemini", {}).get("model_name", "gemini-1.5-flash"))
+            
+            # Map paths
+            lang_paths = proc.process(
+                txt_path=self.txt_path,
+                api_key=self.api_key,
+                languages=target_langs,
+                source_lang=self.source_lang,
+                delay_seconds=float(self.main_cfg.get("gemini", {}).get("delay", 4)),
+                revision_prompt=self.main_cfg.get("gemini", {}).get("revision_prompt"),
+                translation_prompt=self.main_cfg.get("gemini", {}).get("translation_prompt"),
+                chunk_size=int(self.main_cfg.get("gemini", {}).get("chunk_size", 12)),
+                overlap=int(self.main_cfg.get("gemini", {}).get("overlap", 2)),
+                progress_callback=lambda c, t, m: self.log_message.emit(f"Gemini: {m}")
+            )
+            
+            if not lang_paths:
+                self.finished.emit(False, "Gemini não gerou arquivos.")
+                return
+
+            self.progress.emit(40)
+            self.log_message.emit("--- FASE 2: Geração de Áudio e Vídeo por Idioma ---")
+
+            main_win = self.parent().window()
+            mapping = main_win.language_config_tab.mapping if self.use_saved_tts else {}
+            tts_global = main_win.tts_tab.get_session()
+            video_tab = main_win.video_tab
+            
+            from manhwa_app.audio_pipeline import AudioPipeline
+            from manhwa_app.video_pipeline import VideoPipeline
+
+            results_summary = []
+
+            for i, (l_code, l_path) in enumerate(lang_paths.items()):
+                # Filtrar para processar apenas o que o usuário escolheu
+                if l_code not in self.languages:
+                    continue
+                    
+                self.log_message.emit(f"\n[IDIOMA: {l_code.upper()}]")
+                sub_project = f"{self.project_name}_{l_code}"
+                
+                # Config baseada no tts_global + mapeamento + overrides
+                c_cfg = {
+                    "path": l_path, 
+                    "lang": l_code,
+                    "engine": tts_global.get("tts_engine", "chatterbox"),
+                    "voice": tts_global.get("voice", ""),
+                    "speed": tts_global.get("speed", 1.0),
+                    "temperature": tts_global.get("temperature", 0.65),
+                    "exaggeration": tts_global.get("exaggeration", 0.0),
+                    "cfg_weight": tts_global.get("cfg_weight", 0.5),
+                    "seed": tts_global.get("seed", -1)
+                }
+                # Se usar o mapeamento salvo (Aba Idiomas)
+                if self.use_saved_tts and l_code in mapping:
+                    c_cfg.update(mapping[l_code])
+                
+                # Se tiver overrides específicos desta sessão (Express Tab)
+                if l_code in self.overrides:
+                    c_cfg.update(self.overrides[l_code])
+
+                # 2. Audio Pipeline para este idioma
+                audio_pipe = AudioPipeline(
+                    file_configs=[c_cfg],
+                    project_name=sub_project,
+                    output_root="output",
+                    **tts_global
+                )
+                audio_pipe.log_message.connect(self.log_message.emit)
+                audio_pipe.run()
+
+                # 3. Video Pipeline para este idioma
+                audios_dir = Path(f"output/{sub_project}/audios")
+                audio_files = sorted([str(p) for p in audios_dir.glob("*.wav")], key=natural_sort_key)
+                
+                if not audio_files:
+                    self.log_message.emit(f"⚠ Falha ao gerar áudios para {l_code}. Pulando vídeo.")
+                    continue
+
+                output_mp4 = f"output/{sub_project}/{sub_project}_final.mp4"
+                
+                # Montar pares Áudio/Imagem
+                n = min(len(audio_files), len(self.image_paths))
+                pairs = [(audio_files[j], self.image_paths[j]) for j in range(n)]
+
+                self.log_message.emit(f"🎥 Montando vídeo: {output_mp4}")
+                video_pipe = VideoPipeline(
+                    pairs=pairs,
+                    output_path=output_mp4,
+                    effect_mode=video_tab.effect_combo.currentData() or "auto",
+                    transition_mode=video_tab.transition_combo.currentData() or "fade",
+                    transition_time=video_tab.transition_time_spin.value(),
+                    bg_music_path=video_tab.bgm_path_edit.text().strip() or None,
+                    bg_music_volume=video_tab.bgm_vol_spin.value() / 100.0 if hasattr(video_tab, 'bgm_vol_spin') else 0.5
+                )
+                video_pipe.log_message.connect(self.log_message.emit)
+                video_pipe.run()
+                
+                results_summary.append(f"{l_code.upper()}: {output_mp4}")
+                self.progress.emit(40 + int((i + 1) / len(lang_paths) * 60))
+
+            summary_str = "\n".join(results_summary)
+            self.finished.emit(True, f"Processamento concluído para {len(results_summary)} idiomas!\n\nProjetos:\n{summary_str}")
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.log_message.emit(f"❌ ERRO NO ORQUESTRADOR: {str(e)}")
+            self.finished.emit(False, str(e))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3783,12 +5039,18 @@ class MainWindow(QMainWindow):
 
         # ── Tabs ─────────────────────────────────────────────────────
         self.tabs = QTabWidget()
+        self.express_tab   = ExpressTab()
         self.audio_tab     = AudioTab()
+
+        self.language_config_tab = LanguageConfigTab(self)
         self.tts_tab       = TtsConfigTab()
         self.images_tab    = ImagesTab()
         self.video_tab     = VideoTab()
         self.settings_tab  = SettingsTab()
+        self.tabs.addTab(self.express_tab,  "🚀 Express")
         self.tabs.addTab(self.audio_tab,    "📝 Áudio")
+
+        self.tabs.addTab(self.language_config_tab, "🗣️ Traduções Multilíngue")
         self.tabs.addTab(self.tts_tab,      "⚙️ TTS")
         self.tabs.addTab(self.images_tab,   "🖼 Imagens")
         self.tabs.addTab(self.video_tab,    "🎬 Vídeo")
@@ -3926,6 +5188,7 @@ class MainWindow(QMainWindow):
             result = Signal(bool, str, str)
             def run(self_t):
                 try:
+                    from manhwa_app.audio_pipeline import _engine, _ENGINE_AVAILABLE
                     engine = _engine
                     if engine is None or not _ENGINE_AVAILABLE:
                         self_t.result.emit(False, "cpu", "engine não disponível")
@@ -4001,21 +5264,27 @@ class MainWindow(QMainWindow):
                     self._bg_overlay_alpha = self._session["bg_overlay_alpha"]
                 if "audio_tab" in self._session:
                     self.audio_tab.load_session(self._session["audio_tab"])
+                if "language_config_tab" in self._session:
+                    self.language_config_tab.load_session(self._session["language_config_tab"])
                 if "tts_tab" in self._session:
                     self.tts_tab.load_session(self._session["tts_tab"])
                 if "video_tab" in self._session:
                     self.video_tab.load_session(self._session["video_tab"])
                 if "settings_tab" in self._session:
                     self.settings_tab.load_session(self._session["settings_tab"])
+                if "express_tab" in self._session:
+                    self.express_tab.load_session(self._session["express_tab"])
 
     def get_session(self) -> dict:
         return {
             "theme": self.theme_combo.currentText(),
             "bg_overlay_alpha": self.overlay_slider.value(),
             "audio_tab": self.audio_tab.get_session(),
+            "language_config_tab": self.language_config_tab.get_session(),
             "tts_tab": self.tts_tab.get_session(),
             "video_tab": self.video_tab.get_session(),
             "settings_tab": self.settings_tab.get_session(),
+            "express_tab": self.express_tab.get_session(),
         }
 
     def _reset_to_defaults(self):

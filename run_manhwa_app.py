@@ -17,31 +17,39 @@ import sys
 import subprocess
 from pathlib import Path
 
-def restart_with_venv():
-    """Tenta reiniciar o app usando o venv_main se o ambiente global estiver quebrado."""
-    root = Path(__file__).resolve().parent
-    venv_python = root / "venv_main" / "Scripts" / "python.exe"
-    if venv_python.exists() and sys.executable != str(venv_python):
-        print(f"\n[AUTO-FIX] Ambiente global inconsistente. Reiniciando via venv_main...")
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+def get_venv_python():
+    """Retorna o caminho do python.exe no venv_main relativo a este script."""
+    return Path(__file__).resolve().parent / "venv_main" / "Scripts" / "python.exe"
+
+def check_and_restart_venv():
+    """Tenta reiniciar o app usando o venv_main imediatamente se o sys.executable não for ele."""
+    venv_python = get_venv_python()
+    if venv_python.exists() and sys.executable.lower() != str(venv_python).lower():
+        print(f"\n[AUTO-FIX] Ambiente global inconsistente detectado. Reiniciando via venv_main...")
         cmd = [str(venv_python)] + sys.argv
         sys.exit(subprocess.call(cmd))
 
+# Fast-path imediato para pular carga inútil se estivermos no interpretador errado
+check_and_restart_venv()
+
+# Se chegou aqui, já está no venv correto (ou o venv não existe e será avisado).
 # Verificacao de integridade de dependencias criticas
 try:
     import torch
-    # Se torch estiver vazio ou quebrado (erro comum em upgrade falho)
     if not hasattr(torch, "LongTensor"):
-        restart_with_venv()
-except (ImportError, AttributeError):
-    restart_with_venv()
-
-# Se chegou aqui e ainda nao tem torch, avisa o usuario
-try:
-    import torch
+        print("\n" + "="*60)
+        print(" ERRO CRÍTICO: PyTorch corrompido no ambiente.")
+        print(" Ação: Execute o arquivo: SUPER_FIX_RTX5000.bat")
+        print("="*60)
+        import time; time.sleep(5)
+        sys.exit(1)
 except ImportError:
     print("\n" + "="*60)
-    print(" ERRO CRITICO: Ambiente Python corrompido.")
-    print(" Acao: Por favor, execute o arquivo: SUPER_FIX_RTX5000.bat")
+    print(" ERRO CRÍTICO: PyTorch não instalado no ambiente atual.")
+    print(" Ação: Execute o arquivo: SUPER_FIX_RTX5000.bat")
     print("="*60)
     import time; time.sleep(5)
     sys.exit(1)
@@ -81,6 +89,13 @@ except ImportError:
 
 # Change working directory to repo root so relative paths (config.yaml, output/, etc.) work.
 os.chdir(str(ROOT_DIR))
+
+# [AUTO-FIX] Tentar encontrar SoX se estiver no Windows
+try:
+    from utils import find_sox_and_add_to_path
+    find_sox_and_add_to_path()
+except Exception:
+    pass
 
 
 def check_dependencies():

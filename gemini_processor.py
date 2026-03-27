@@ -27,8 +27,11 @@ LANGUAGE_NAMES: dict[str, str] = {
     "fr": "francês",
     "de": "alemão",
     "it": "italiano",
+    "ru": "russo",
     "ja": "japonês",
     "ko": "coreano",
+    "zh": "chinês",
+    "pt": "português brasileiro",
 }
 
 # ---------------------------------------------------------------------------
@@ -63,7 +66,7 @@ O array deve ter exatamente {n} elementos, na mesma ordem dos parágrafos recebi
 _TRANSLATION_SYSTEM = """Você é um tradutor profissional especializado em manhwa e webtoon para narração em áudio.
 
 Idioma de destino: {language_name}
-Idioma de origem: português brasileiro
+Idioma de origem: {source_language_name}
 
 REGRAS OBRIGATÓRIAS:
 1. Traduza com naturalidade no idioma alvo — não traduza literalmente palavra por palavra
@@ -109,6 +112,7 @@ class GeminiProcessor:
         txt_path: str,
         api_key: str,
         languages: list[str],
+        source_lang: str = "pt",
         delay_seconds: float = 4.0,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         stop_event=None,
@@ -167,12 +171,19 @@ class GeminiProcessor:
         # --- 2. Parse do arquivo de entrada ---
         txt_path_obj = Path(txt_path)
         logger.info(f"Lendo arquivo de entrada: {txt_path_obj}")
-        raw_text = txt_path_obj.read_text(encoding="utf-8")
+        raw_text = txt_path_obj.read_text(encoding="utf-8-sig")
         paragraphs: list[tuple[int, str]] = []  # (número, texto)
         for line in raw_text.splitlines():
-            m = re.match(r"^(\d+)\.\s+(.+)$", line.strip())
+            line = line.strip()
+            if not line: continue
+            # Mais flexível: aceita "1. Texto", "1.Texto", "1 Texto", "01. Texto"
+            m = re.match(r"^(\d+)[.\s-]*\s*(.+)$", line)
             if m:
                 paragraphs.append((int(m.group(1)), m.group(2)))
+            else:
+                # Se não tem número, mas a linha não é vazia, tenta atribuir o próximo número
+                last_num = paragraphs[-1][0] if paragraphs else 0
+                paragraphs.append((last_num + 1, line))
 
         if not paragraphs:
             logger.warning("Nenhum parágrafo encontrado no arquivo. Encerrando.")
@@ -184,7 +195,8 @@ class GeminiProcessor:
         # --- 3. Cache ---
         cache_dir = Path("gemini_cache")
         cache_dir.mkdir(exist_ok=True)
-        cache_key = hashlib.md5(txt_path[:200].encode("utf-8")).hexdigest()[:8]
+        # Use content explicitly so edits bypass old cache
+        cache_key = hashlib.md5(raw_text.encode("utf-8")).hexdigest()[:8]
         cache_file = cache_dir / f"{cache_key}_{txt_path_obj.stem}.json"
         cache = self._load_cache(cache_file, txt_path, total_paragraphs, languages)
 
@@ -277,6 +289,10 @@ class GeminiProcessor:
                 context_before, current_block_orig, context_after = (
                     self._split_chunk_context(paragraphs, chunk)
                 )
+                
+                source_name = LANGUAGE_NAMES.get(source_lang, source_lang)
+                target_name = LANGUAGE_NAMES.get(lang, lang)
+
                 # Usar os textos revisados para traduzir
                 current_block_revised = [
                     (num, cache["revised"].get(str(num), text))
@@ -291,7 +307,7 @@ class GeminiProcessor:
 
                 translated = self._call_with_retry(
                     prompt=self._build_translation_prompt(
-                        lang_name, ctx_before_rev, current_block_revised, ctx_after_rev
+                        target_name, source_name, ctx_before_rev, current_block_revised, ctx_after_rev
                     ),
                     expected_count=len(current_block_revised),
                     fallback_texts=[p[1] for p in current_block_revised],
@@ -314,10 +330,12 @@ class GeminiProcessor:
         stem = txt_path_obj.stem
 
         # PT (revisado)
-        pt_path = out_dir / f"{stem}_pt.txt"
+        pt_dir = out_dir / "pt"
+        pt_dir.mkdir(parents=True, exist_ok=True)
+        pt_path = pt_dir / f"{stem}_pt.txt"
         self._write_output(pt_path, revised_paragraphs)
         output_paths["pt"] = str(pt_path)
-        logger.info(f"Arquivo PT salvo: {pt_path}")
+        logger.info(f"Arquivo PT salvo na pasta: {pt_path}")
 
         # Idiomas solicitados
         for lang in languages:
@@ -327,10 +345,12 @@ class GeminiProcessor:
                 (num, cache["translations"][lang].get(str(num), text))
                 for (num, text) in revised_paragraphs
             ]
-            lang_path = out_dir / f"{stem}_{lang}.txt"
+            lang_dir = out_dir / lang
+            lang_dir.mkdir(parents=True, exist_ok=True)
+            lang_path = lang_dir / f"{stem}_{lang}.txt"
             self._write_output(lang_path, lang_paras)
             output_paths[lang] = str(lang_path)
-            logger.info(f"Arquivo {lang.upper()} salvo: {lang_path}")
+            logger.info(f"Arquivo {lang.upper()} salvo na pasta: {lang_path}")
 
         if progress_callback:
             progress_callback(total_steps, total_steps, "Processamento concluído.")
@@ -341,11 +361,10 @@ class GeminiProcessor:
     # ------------------------------------------------------------------
 
     def _build_chunks(
-        self, paragraphs: list[tuple[int, str]]
+        self, paragraphs: list[tuple[int, str]], chunk_size: int = 12
     ) -> list[list[int]]:
         """Divide a lista de parágrafos em blocos de tamanho fixo."""
         nums = [p[0] for p in paragraphs]
-        chunk_size = getattr(self, "_chunk_size", 12) # Default to 12 if not set
         return [nums[i : i + chunk_size] for i in range(0, len(nums), chunk_size)]
 
     def _split_chunk_context(
@@ -394,16 +413,18 @@ class GeminiProcessor:
     def _build_translation_prompt(
         self,
         language_name: str,
+        source_language_name: str,
         context_before: list[str],
         current_block: list[tuple[int, str]],
         context_after: list[str],
-    ) -> str:
+    ):
         ctx_b = "\n".join(context_before) if context_before else "(início do texto)"
         ctx_a = "\n".join(context_after) if context_after else "(fim do texto)"
         blk = self._format_block(current_block)
         n = len(current_block)
         return self._translation_prompt_tmpl.format(
             language_name=language_name,
+            source_language_name=source_language_name,
             context_before=ctx_b,
             context_after=ctx_a,
             current_block_formatted=blk,

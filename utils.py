@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Set, List
 from pydub import AudioSegment
 
+logger = logging.getLogger(__name__)
+
 import numpy as np
 import soundfile as sf
 import torchaudio  # For saving PyTorch tensors and potentially speed adjustment.
@@ -25,17 +27,10 @@ from config import get_predefined_voices_path, get_reference_audio_path, config_
 # Optional import for librosa (for audio resampling, e.g., Opus encoding and time stretching)
 try:
     import librosa
-
     LIBROSA_AVAILABLE = True
-    logger = logging.getLogger(
-        __name__
-    )  # Initialize logger here if librosa is available
-    logger.info(
-        "Librosa library found and will be used for audio resampling and time stretching."
-    )
+    logger.info("Librosa library found and will be used for audio resampling and time stretching.")
 except ImportError:
     LIBROSA_AVAILABLE = False
-    logger = logging.getLogger(__name__)
     logger.warning(
         "Librosa library not found. Advanced audio resampling features (e.g., for Opus encoding) "
         "and pitch-preserving speed adjustment will be limited. Speed adjustment will fall back to basic method if enabled."
@@ -1475,6 +1470,7 @@ def generate_paragraph_audio(
     chatter_t   = kwargs.get("temperature", 0.8)
     chatter_e   = kwargs.get("exaggeration", 0.5)
     chatter_c   = kwargs.get("cfg_weight", 0.5)
+    chatter_s   = kwargs.get("seed", 0)
 
     audio_array = None
     sample_rate = None
@@ -1556,7 +1552,8 @@ def generate_paragraph_audio(
             logger.info(f"[DISPATCHER] Iniciando geracao Chatterbox | Temp: {chatter_t}")
             raw_output = synthesize(
                 text=text, audio_prompt_path=audio_prompt_path,
-                temperature=chatter_t, exaggeration=chatter_e, cfg_weight=chatter_c
+                temperature=chatter_t, exaggeration=chatter_e, cfg_weight=chatter_c,
+                seed=chatter_s
             )
             logger.debug(f"[DISPATCHER] Retorno bruto Chatterbox: {type(raw_output)}")
             audio_array = normalize_audio_output(raw_output)
@@ -1640,6 +1637,56 @@ class PerformanceMonitor:
             self.logger.log(log_level, full_report_str)
         return full_report_str
 
+
+def resolve_voice_path(voice_val: Any) -> Optional[str]:
+    """
+    Safely resolves a voice path, converting UI labels (like 'Sem clonagem') 
+    to None and ensuring the result is a valid string path or None.
+    """
+    if not voice_val:
+        return None
+        
+    s_val = str(voice_val).strip()
+    
+    # Check for labels that mean "no cloning" or "default model voice"
+    # Labels like "Sem clonagem (Voz do Modelo)" or "None" or "0" should be None
+    if not s_val or "Sem clonagem" in s_val or s_val.lower() == "none" or s_val == "0" or s_val == "":
+         return None
+         
+    # If it's a valid existing file, return the absolute path
+    if os.path.isfile(s_val):
+        return str(Path(s_val).resolve())
+        
+    # [LOG] Optional: log if we received a string that is not a file but not a 'no-cloning' label
+    # logger.debug(f"resolve_voice_path: '{s_val}' is not a valid file path, returning None.")
+    return None
+    
+def find_sox_and_add_to_path():
+    """
+    Tries to find SoX installation on Windows and adds it to os.environ['PATH'].
+    Returns True if found and added.
+    """
+    import sys
+    if sys.platform != "win32": return False
+    
+    # Common SoX installation paths on Windows
+    # We check for sox-14-4-2 specifically as it's the most common version
+    possible_paths = [
+        r"C:\Program Files (x86)\sox-14-4-2",
+        r"C:\Program Files\sox-14-4-2",
+        r"C:\Program Files (x86)\sox",
+        r"C:\Program Files\sox",
+        r"D:\sox-14-4-2",
+        r"E:\sox-14-4-2",
+    ]
+    
+    for p in possible_paths:
+        if os.path.exists(os.path.join(p, "sox.exe")):
+            if p not in os.environ["PATH"]:
+                os.environ["PATH"] = p + os.pathsep + os.environ["PATH"]
+                print(f"[AUTO-FIX] SoX encontrado e adicionado ao PATH: {p}")
+                return True
+    return False
 
 # --- End of utils.py ---
 

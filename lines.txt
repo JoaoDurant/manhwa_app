@@ -1,0 +1,38 @@
+46: from manhwa_app.audio_pipeline import AudioPipeline, split_into_paragraphs
+47: from manhwa_app.video_pipeline import VideoPipeline, EFFECTS
+51: from manhwa_app.audio_pipeline import _engine, _ENGINE_AVAILABLE, _config_manager
+155: class ModelLoaderThread(QThread):
+158: def __init__(self, tts_engine: str, model_type: str):
+160: self.tts_engine = tts_engine
+165: if not _ENGINE_AVAILABLE or _engine is None:
+170: target = self.tts_engine
+171: if self.tts_engine == "chatterbox":
+174: logger.info(f"ModelLoaderThread: trocando para {target}")
+176: if _engine.switch_to_engine(target):
+190: if hasattr(_engine, "engine") and _engine.engine and hasattr(_engine.engine, "device"):
+191: if str(_engine.engine.device) == "cpu":
+200: logger.error(f"Erro no ModelLoaderThread: {e}", exc_info=True)
+448: self.engine_combo.currentIndexChanged.connect(self._on_engine_change)
+700: def _on_engine_change(self):
+715: main_win.audio_tab._update_engine_ui(eng)
+726: "tts_engine": self.engine_combo.currentData(),
+766: if "tts_engine" in data:
+767: idx = self.engine_combo.findData(data["tts_engine"])
+1053: engine_mode = cfg.get("tts_engine", "chatterbox")
+1097: print(f"[UI] Início do Preview | Engine: {cfg.get('tts_engine', 'chatterbox')} | Texto: {len(txt)} chars | Lang: {lang_val} | Voice: {voice_val}")
+1101: self._preview_pipeline = AudioPipeline(
+1105: tts_engine=cfg.get("tts_engine", "chatterbox"),
+1139: print("[UI] Criando thread de background para o AudioPipeline...")
+1197: engine = cfg.get("tts_engine", "chatterbox")
+1273: def _update_engine_ui(self, engine_mode: str):
+1443: self._pipeline = AudioPipeline(
+1447: tts_engine=cfg.get("tts_engine", "chatterbox"),
+1465: # AudioPipeline espera: fx_noise_reduction, fx_compressor, fx_reverb, fx_normalize, fx_enhancer
+1466: # Mapeamento: get_session() novo → AudioPipeline param
+1603: pipeline = AudioPipeline(
+2169: self._pipeline: Optional[VideoPipeline] = None
+2702: self._pipeline = VideoPipeline(pairs=pairs, output_path=output_path,
+2751: self._pipeline = VideoPipeline(pairs=pairs, output_path=str(out_mp4),
+3632: engine_name = cfg.get("tts_engine", "chatterbox")
+3645: self._loader_thread = ModelLoaderThread(engine_name, model_type)
+3929: engine = _engine

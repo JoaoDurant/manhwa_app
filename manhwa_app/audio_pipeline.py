@@ -472,12 +472,10 @@ class AudioPipeline(QObject):
             pass
 
         # -------- Lê e separa os parágrafos de todos os .txt --------
-        # all_paragraphs contém: (texto, source_file, voice_path, lang)
-        all_paragraphs: List[Tuple[str, str, Optional[str], str]] = []
+        # all_paragraphs contém: (texto, source_file, paragraph_config)
+        all_paragraphs: List[Tuple[str, str, dict]] = []
         for fcfg in self.file_configs:
             txt_path = fcfg["path"]
-            voice_path = fcfg.get("voice") or None
-            lang = fcfg.get("lang", "en")  # fallback
             
             try:
                 text = Path(txt_path).read_text(encoding="utf-8", errors="replace")
@@ -488,10 +486,10 @@ class AudioPipeline(QObject):
             paragraphs = split_into_paragraphs(text)
             self.log_message.emit(
                 f"✓ {len(paragraphs)} parágrafo(s) em '{Path(txt_path).name}' "
-                f"(Idioma: {lang,}, Voz: {'Padrão' if not voice_path else Path(voice_path).stem})."
+                f"(Idioma: {fcfg.get('lang','en')}, Engine: {fcfg.get('engine','chatterbox')})."
             )
             for p in paragraphs:
-                all_paragraphs.append((p, Path(txt_path).name, voice_path, lang))
+                all_paragraphs.append((p, Path(txt_path).name, fcfg))
 
         if not all_paragraphs:
             self.finished.emit(False, "Nenhum parágrafo encontrado nos arquivos (separe com linhas em branco).")
@@ -507,7 +505,7 @@ class AudioPipeline(QObject):
         # O manager do dispatcher vai carregar sob demanda, mas logamos aqui para claridade
         if self.tts_engine == "chatterbox":
             self.log_message.emit("Verificando/Carregando modelo Chatterbox TTS...")
-            if not engine.load_model():
+            if not engine.load_model(model_type=self.model_type):
                 self.finished.emit(False, "Falha ao carregar modelo Chatterbox. Verifique os logs.")
                 return
             device_str = (engine.model_device or "cpu").upper()
@@ -603,7 +601,12 @@ class AudioPipeline(QObject):
 
         pending_paragraphs = all_paragraphs[start_index:]
 
-        for idx, (paragraph, source_file, voice_path, lang) in enumerate(pending_paragraphs, start=start_index + 1):
+        for idx, (paragraph, source_file, p_cfg) in enumerate(pending_paragraphs, start=start_index + 1):
+            lang = p_cfg.get("lang", "en")
+            voice_path = p_cfg.get("voice")
+            engine_str = p_cfg.get("engine", self.tts_engine)
+            p_speed = p_cfg.get("speed", self.speed)
+            p_temp = p_cfg.get("temperature", self.temperature)
             if self._cancelled:
                 break
 
@@ -673,21 +676,47 @@ class AudioPipeline(QObject):
                     
                     import time
                     t0_gen = time.time()
-                    print(f"[PIPELINE] Iniciando geração de áudio (Parágrafo {idx}) | Texto len: {len(tts_text_input)} chars | Engine: {self.tts_engine}")
+                    print(f"[PIPELINE] Iniciando geração de áudio (Parágrafo {idx}) | Texto len: {len(tts_text_input)} chars | Engine: {engine_str}")
                     
                     # --- NOVO DISPATCHER UNIFICADO (engine.py + utils.py) ---
                     # Substitui os blocos If/Else fragmentados por um ponto único de entrada
+                    
+                    active_eng = getattr(_engine, "get_active_engine")() if hasattr(_engine, "get_active_engine") else "none"
+                    current_model = getattr(_engine, "loaded_model_type", "none")
+                    
+                    print(f"[DEBUG] AudioPipeline: engine_str='{engine_str}', model_type='{self.model_type}'")
+                    print(f"[DEBUG] Engine State: active='{active_eng}', loaded_type='{current_model}'")
+
+                    needs_switch = (active_eng != engine_str)
+                    if not needs_switch and engine_str == "chatterbox":
+                        if current_model != self.model_type:
+                            print(f"[DEBUG] Submodelo mudou: {current_model} -> {self.model_type}")
+                            needs_switch = True
+                    
+                    if needs_switch:
+                        target = engine_str
+                        if engine_str == "chatterbox":
+                            target = self.model_type if self.model_type else "turbo"
+                        
+                        self.log_message.emit(f"🔄 Trocando motor TTS para: {target.upper()}...")
+                        print(f"[DEBUG] Solicitando switch_to_engine('{target}', model_type='{self.model_type}')")
+                        if hasattr(_engine, "switch_to_engine"):
+                            _engine.switch_to_engine(target, model_type=self.model_type)
+                    else:
+                        print(f"[DEBUG] Switch não necessário para {engine_str}")
+
                     success = _utils.generate_paragraph_audio(
                         text=tts_text_input,
                         output_path=str(wav_tmp),
-                        engine_name=self.tts_engine,
+                        engine_name=engine_str,
                         audio_prompt_path=voice_path,
                         qwen_speaker=self.qwen_speaker if hasattr(self, 'qwen_speaker') else "Ryan",
                         qwen_language="Auto",
-                        indextts_speed=getattr(self, 'speed', 1.0),
-                        temperature=self.temperature,
-                        exaggeration=self.exaggeration,
-                        cfg_weight=self.cfg_weight
+                        indextts_speed=p_speed,
+                        temperature=p_temp,
+                        exaggeration=p_cfg.get("exaggeration", self.exaggeration),
+                        cfg_weight=p_cfg.get("cfg_weight", self.cfg_weight),
+                        seed=p_cfg.get("seed", self.seed)
                     )
 
                     if not success:
@@ -736,31 +765,30 @@ class AudioPipeline(QObject):
                         final_path_no_fx = _remove_silence_from_file(str(wav_tmp), silence_out, sample_rate)
 
                         # ---- FX de áudio (opcionais) ----
-                        # CORRIGIDO: inclui todos os 6 flags de FX (antes faltavam fx_noise_reduction,
-                        # fx_highpass, fx_silence, fx_deesser — tornando os FX nunca ativados)
-                        _any_fx = (
-                            self.fx_noise_reduction or self.fx_compressor or
-                            self.fx_eq or self.fx_reverb or
-                            self.fx_enhancer or self.fx_normalize
-                        )
+                        # CORRIGIDO: usa parâmetros de p_cfg se existirem, senão fallback global
+                        f_hp = p_cfg.get("fx_highpass", self.fx_noise_reduction)
+                        f_cp = p_cfg.get("fx_compressor", self.fx_compressor)
+                        f_eq = p_cfg.get("fx_deesser", self.fx_eq)
+                        f_rv = p_cfg.get("fx_reverb", self.fx_reverb)
+                        f_sl = p_cfg.get("fx_silence", self.fx_enhancer)
+                        f_nm = p_cfg.get("fx_loudnorm", self.fx_normalize)
+
+                        _any_fx = f_hp or f_cp or f_eq or f_rv or f_sl or f_nm
                         if _any_fx:
-                            # CORRIGIDO: passa config dict com NOVOS nomes de chave que audio_fx.py espera
-                            # (audio_fx.py lê production.audio.* ou as chaves novas via fallback)
                             fx_config = {
                                 "production": {
                                     "audio": {
-                                        "highpass":       self.fx_noise_reduction,   # mapeado ao antigo fx_noise_reduction
-                                        "compressor":     self.fx_compressor,
-                                        "reverb":         self.fx_reverb,
-                                        "normalize":      self.fx_normalize,
-                                        "remove_silence": self.fx_enhancer,          # reutilizado como "silence removal"
+                                        "highpass":       f_hp,
+                                        "compressor":     f_cp,
+                                        "reverb":         f_rv,
+                                        "normalize":      f_nm,
+                                        "remove_silence": f_sl,
                                     }
                                 },
-                                # Manter chaves antigas para retrocompatibilidade com audio_fx.py legado
-                                "fx_noise_reduction": self.fx_noise_reduction,
-                                "fx_compressor":      self.fx_compressor,
-                                "fx_reverb":          self.fx_reverb,
-                                "fx_normalize":       self.fx_normalize,
+                                "fx_noise_reduction": f_hp,
+                                "fx_compressor":      f_cp,
+                                "fx_reverb":          f_rv,
+                                "fx_normalize":       f_nm,
                             }
                             apply_audio_post_processing(final_path_no_fx, str(wav_final), fx_config)
                         else:

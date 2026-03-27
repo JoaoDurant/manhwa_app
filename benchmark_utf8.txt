@@ -1,21 +1,0 @@
-
-==================================================
- BENCKMARKING TTS MODELS
-==================================================
-
---- Testing Chatterbox (Original) ---
- Load time: 0.87s
- Chatterbox Original synthesis returned None.
-
---- Testing Chatterbox (Multilingual) ---
-Fetching 6 files:   0%|Fetching 6 files: 100%|
- Load time: 0.16s
- Chatterbox Multilingual synthesis returned None.
-
---- Qwen3-TTS NOT AVAILABLE ---
-
---- IndexTTS NOT AVAILABLE ---
-
-==================================================
- BENCHMARK COMPLETE
-==================================================

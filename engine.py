@@ -20,6 +20,26 @@ from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# [DTYPE HARDENING] - Forçando float32 global para evitar mismatch no voice_encoder
+torch.set_default_dtype(torch.float32)
+
+# [LIBROSA MONKEYPATCH] - Chatterbox usa librosa.load internamente. 
+# Precisamos garantir que ele retorne float32 para as LSTMs do voice_encoder.
+try:
+    import librosa
+    _orig_load = librosa.load
+    def _patched_load(*args, **kwargs):
+        if 'dtype' not in kwargs:
+            kwargs['dtype'] = np.float32
+        wav, sr = _orig_load(*args, **kwargs)
+        if isinstance(wav, np.ndarray) and wav.dtype != np.float32:
+            wav = wav.astype(np.float32)
+        return wav, sr
+    librosa.load = _patched_load
+    logger.debug("[ENGINE] Librosa globalmente patcheado para float32.")
+except ImportError:
+    pass
+
 # =============================================================================
 # POLYFILLS — compatibilidade Transformers <-> Chatterbox
 # =============================================================================
@@ -455,13 +475,13 @@ def _get_chatterbox_device():
     device_setting = config_manager.get_string("tts_engine.device", "auto")
     if FORCE_CPU: device_setting = "cpu"
     if device_setting == "auto":
-        if _test_cuda_functionality():   resolved = "cuda"
-        elif _test_mps_functionality():  resolved = "mps"
-        else:                            resolved = "cpu"
+        if torch.cuda.is_available(): resolved = "cuda"
+        elif torch.backends.mps.is_available(): resolved = "mps"
+        else: resolved = "cpu"
     elif device_setting == "cuda":
-        resolved = "cuda" if _test_cuda_functionality() else "cpu"
+        resolved = "cuda" if torch.cuda.is_available() else "cpu"
     elif device_setting == "mps":
-        resolved = "mps" if _test_mps_functionality() else "cpu"
+        resolved = "mps" if torch.backends.mps.is_available() else "cpu"
     else:
         resolved = "cpu"
     return resolved
@@ -492,7 +512,9 @@ def load_turbo() -> bool:
         print("[DEBUG] Solicitado: load_turbo")
         if not HAS_TURBO:
             print("[ENGINE] Turbo não disponível nesta versão do chatterbox. Usando fallback (original).")
-            _is_loading = False
+            # Reset flag BEFORE calling load_original so it can acquire the lock
+            with _engine_lock:
+                _is_loading = False
             return load_original()
 
         unload_all_for_switch()
@@ -515,9 +537,12 @@ def load_turbo() -> bool:
         return True
     except Exception as e:
         logger.error(f"Falha ao carregar Turbo: {e}. Tentando fallback original.", exc_info=True)
-        _is_loading = False
+        # Reset flag BEFORE calling load_original so it can acquire the lock
+        with _engine_lock:
+            _is_loading = False
         return load_original()
     finally:
+        # Only reset if we haven't already (i.e., the normal success path)
         with _engine_lock:
             _is_loading = False
 
@@ -701,11 +726,17 @@ def load_multilingual() -> bool:
         with _engine_lock:
             _is_loading = False
 
-def load_model() -> bool:
-    """Funcao legada para compatibilidade - usa a config atual."""
-    sel = config_manager.get_string("model.repo_id", "turbo").lower()
-    if "multilingual" in sel: return load_multilingual()
-    if "original" in sel or "chatterbox" in sel and "turbo" not in sel: return load_original()
+def load_model(model_type: Optional[str] = None) -> bool:
+    """Carrega o modelo Chatterbox baseado no tipo solicitado ou na config."""
+    if model_type is None:
+        model_type = config_manager.get_string("model.repo_id", "turbo").lower()
+    else:
+        model_type = model_type.lower()
+
+    if "multilingual" in model_type: 
+        return load_multilingual()
+    if "original" in model_type or ("chatterbox" in model_type and "turbo" not in model_type): 
+        return load_original()
     return load_turbo()
 
 
@@ -807,7 +838,9 @@ def synthesize(
     use_cuda       = (model_device == "cuda")
     is_multilingual = (loaded_model_type == "multilingual")
 
-    if use_cuda and not is_multilingual and torch.cuda.is_bf16_supported():
+    # [FIX] Turbo can be sensitive to dtype mismatches (Float16 vs BFloat16/Double).
+    # We disable bf16 autocast for turbo to maintain stability.
+    if use_cuda and not is_multilingual and loaded_model_type != "turbo" and torch.cuda.is_bf16_supported():
         autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     else:
         autocast_ctx = contextlib.nullcontext()
@@ -822,10 +855,13 @@ def synthesize(
             print("[ENGINE] Gerando áudio...")
             start_time = time.time()
             with torch.inference_mode(), autocast_ctx:
-                if is_multilingual:
-                    try: print(f"ATTN: {chatterbox_model.t3.model.config.attn_implementation}")
-                    except: pass
-                
+                # [VOICE VALIDATION] - Corrigindo erro 'Sem clonagem' e paths invalidos
+                if not audio_prompt_path or not isinstance(audio_prompt_path, str) or not os.path.exists(audio_prompt_path):
+                    logger.debug(f"[VOICE] Selecionado: {audio_prompt_path} -> Path inválido ou Base. Usando None.")
+                    audio_prompt_path = None
+                else:
+                    logger.debug(f"[VOICE] Path resolvido: {audio_prompt_path}")
+
                 if loaded_model_type == "turbo":
                     wav_tensor = chatterbox_model.generate(
                         text=text,
@@ -1504,10 +1540,10 @@ def unload_all_for_switch():
 
 _switch_lock = threading.Lock()
 
-def switch_to_engine(engine: str) -> bool:
+def switch_to_engine(engine_name: str, model_type: Optional[str] = None) -> bool:
     """
     Muda para o engine especificado, descarregando o anterior primeiro.
-    Engines: original | turbo | multilingual | kokoro | qwen | indextts
+    Engines: chatterbox | original | turbo | multilingual | kokoro | qwen | indextts
     """
     if _switch_lock.locked():
         print("[ENGINE] Troca bloqueada (transicao ja em andamento)")
@@ -1523,18 +1559,15 @@ def switch_to_engine(engine: str) -> bool:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             
-        eng = engine.lower().replace("-", "_").replace(" ", "_")
-        print(f"[DEBUG] Engine solicitado: {eng}")
-        logger.info(f"switch_to_engine: {eng}")
+        eng = engine_name.lower().replace("-", "_").replace(" ", "_")
+        print(f"[DEBUG] Engine solicitado: {eng} (submodelo: {model_type})")
+        logger.info(f"switch_to_engine: {eng} | submodelo: {model_type}")
 
-        if eng == "turbo":
-            return load_turbo()
-        
-        if eng == "original":
-            return load_original()
-        
-        if eng == "multilingual":
-            return load_multilingual()
+        if eng in ("chatterbox", "turbo", "original", "multilingual"):
+            # Se chamou "turbo" diretamente, usamos isso como model_type
+            if eng != "chatterbox":
+                model_type = eng
+            return load_model(model_type=model_type)
 
         unload_all_for_switch()
         torch.cuda.empty_cache()
@@ -1551,7 +1584,7 @@ def switch_to_engine(engine: str) -> bool:
             INDEX_TTS_LOADED = _start_indextts_worker()
             return INDEX_TTS_LOADED
 
-        logger.error(f"Engine desconhecido: '{engine}'.")
+        logger.error(f"Engine desconhecido: '{engine_name}'.")
         return False
 
 

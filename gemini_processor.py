@@ -146,36 +146,45 @@ class GeminiProcessor:
         Raises:
             ValueError: When the API key is invalid or the connection fails.
         """
-        # --- 1. Inicializar e validar o cliente Gemini ---
+        # --- 1. Normalizar e validar o pool de chaves ---
+        if isinstance(api_key, str):
+            api_pool = [{"alias": "Principal", "key": api_key}] if api_key.strip() else []
+        elif isinstance(api_key, dict):
+            # Compatibilidade com formato antigo {"rev": "...", "en": "...", ...}
+            api_pool = [{"alias": k, "key": v} for k, v in api_key.items() if v and v.strip()]
+        elif isinstance(api_key, list):
+            api_pool = [e for e in api_key if isinstance(e, dict) and e.get("key", "").strip()]
+        else:
+            api_pool = []
+
+        if not api_pool:
+            raise ValueError("Nenhuma API Key válida foi fornecida.")
+
         from google import genai  # type: ignore[import]
 
-        logger.info(f"Inicializando cliente Gemini (modelo: {self.model_name})")
+        n_keys = len(api_pool)
+        logger.info(f"Inicializando Gemini (modelo: {self.model_name}) com {n_keys} chave(s): {[e['alias'] for e in api_pool]}")
         try:
-            self._client = genai.Client(api_key=api_key)
             from google.genai import types  # type: ignore[import]
             
-            # Raciocínio (Thinking) é para gemini-2.0-flash-thinking e possivelmente os novos 2.5/3.1
             is_thinking_model = any(k in self.model_name.lower() for k in ["thinking", "gemini-3.1", "gemini-3-pro"])
-            
             config_kwargs = {}
             if thinking_level and is_thinking_model:
                 config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
-            
-            # JSON Mode: Forçar saída estruturada
             config_kwargs["response_mime_type"] = "application/json"
-
             config = types.GenerateContentConfig(**config_kwargs)
 
-            # Chamada mínima para validar a chave antes de processar o roteiro inteiro
-            self._client.models.generate_content(
+            # Valida apenas a primeira chave
+            test_client = genai.Client(api_key=api_pool[0]["key"])
+            test_client.models.generate_content(
                 model=self.model_name,
-                contents="Generate a single JSON word: {\"test\": \"ok\"}",
+                contents='Generate a single JSON word: {"test": "ok"}',
                 config=config
             )
-            logger.info("API Key do Gemini validada com sucesso.")
+            logger.info(f"API Key '{api_pool[0]['alias']}' validada com sucesso.")
         except Exception as exc:
             raise ValueError(
-                f"Não foi possível conectar ao Gemini. Verifique sua API Key.\nDetalhe: {exc}"
+                f"Não foi possível conectar ao Gemini com a chave '{api_pool[0]['alias']}'.\nDetalhe: {exc}"
             ) from exc
 
         # --- 2. Parse do arquivo de entrada ---
@@ -258,7 +267,9 @@ class GeminiProcessor:
                 context_before, current_block, context_after = self._split_chunk_context(
                     paragraphs, chunk
                 )
+
                 revised = self._call_with_retry(
+                    api_pool=api_pool,
                     prompt=self._build_revision_prompt(
                         context_before, current_block, context_after
                     ),
@@ -334,6 +345,7 @@ class GeminiProcessor:
                 current_translation_prompt = (per_language_prompts or {}).get(lang) or self._translation_prompt_tmpl
 
                 translated = self._call_with_retry(
+                    api_pool=api_pool,
                     prompt=self._build_translation_prompt(
                         target_name, source_name, ctx_before_rev, current_block_revised, ctx_after_rev,
                         prompt_override=current_translation_prompt
@@ -463,87 +475,181 @@ class GeminiProcessor:
             n=n,
         )
 
+    def normalize_gemini_response(self, response) -> str:
+        """
+        Garante que a resposta seja validada e convertida para string
+        independentemente do formato da engine SDK ou de falhas json.
+        """
+        if isinstance(response, str):
+            return response.strip()
+            
+        if hasattr(response, "text") and hasattr(response, "candidates"):
+            try:
+                if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                    return response.candidates[0].content.parts[0].text.strip()
+            except Exception as e:
+                logger.debug(f"[Normalize] Falha parts: {e}")
+            try:
+                if response.text:
+                    return response.text.strip()
+            except Exception as e:
+                logger.debug(f"[Normalize] Falha text: {e}")
+                
+        if isinstance(response, dict):
+            if "candidates" in response and response["candidates"]:
+                try:
+                    return response["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except Exception:
+                    pass
+            return json.dumps(response, ensure_ascii=False)
+
+        if isinstance(response, list):
+            if len(response) > 0:
+                first = response[0]
+                if isinstance(first, str):
+                    return first.strip()
+                elif isinstance(first, dict):
+                    return json.dumps(first, ensure_ascii=False)
+            return ""
+
+        raise TypeError(f"Formato não suportado para normalização: {type(response)}")
+
+    def validate_output(self, text: str, expected_lines: int) -> list[str]:
+        """
+        Valida que a saída tem a quantidade esperada de parágrafos.
+        Substitui de forma inteligente se o JSON estiver quebrado (fallback raw text).
+        """
+        import re
+        lines = []
+        for m in re.finditer(r"^\s*\d+[.\-]?\s+(.+)$", text, flags=re.MULTILINE):
+            lines.append(m.group(1).strip())
+            
+        if len(lines) == expected_lines:
+            return lines
+            
+        # Fallback agressivo de plain-text puro
+        for separator in ['\n\n', '\n']:
+            parts = [p.strip() for p in text.split(separator) if p.strip()]
+            if len(parts) == expected_lines:
+                return parts
+            
+        raise ValueError(f"Esperado {expected_lines} itens válidos numéricos, mas extraídos {len(lines)}.")
+
     def _call_with_retry(
         self,
+        api_pool: list,   # list[{"alias": str, "key": str}]
         prompt: str,
         expected_count: int,
         fallback_texts: list[str],
-        max_retries: int = 3,
+        max_retries: int = 6,
         retry_delay: float = 5.0,
     ) -> list[str]:
-        """Call the Gemini API with validation and up to max_retries retries."""
+        """Chama a API Gemini com rotação sequencial de chaves em caso de 429."""
+        import google.genai as genai
         from google.genai import types  # type: ignore[import]
-        
-        # Build config
-        config_kwargs = {}
+
+        config_kwargs = {"response_mime_type": "application/json"}
         is_thinking_model = "thinking" in self.model_name.lower() or "gemini-2.0-flash-thinking" in self.model_name.lower()
-        
         if is_thinking_model:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(
-                thinking_level=self._thinking_level
-            )
-            # media_resolution can also be set globally in generation_config
-            # but ultra_high might not be available globally.
-            # For text-only tasks, this is mostly ignored but we include it if set.
-            if self._media_resolution:
-                # Some versions might use different structures, following the provided doc:
-                # media_resolution is usually per-part, but doc mentions global option.
-                pass 
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=self._thinking_level)
 
-        for attempt in range(1, max_retries + 1):
+        # Índice rotativo — começa sempre na chave 0 (Principal)
+        pool_idx = 0
+        normal_attempts = 0  # contagem de tentativas que NÃO são troca de chave
+
+        while normal_attempts < max_retries:
+            entry = api_pool[pool_idx]
+            current_alias = entry["alias"]
+            current_key   = entry["key"]
+            client = genai.Client(api_key=current_key)
+
             try:
-                response = self._client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
-                )
-
-                raw = response.text.strip()
-                
-                # Extração Robusta de JSON (procurar o primeiro { e o último })
-                extracted = self._extract_json(raw)
-                if not extracted:
-                    logger.debug(f"Falha na extração. Texto bruto (primeiros 200 chars): {raw[:200]!r}")
-                    raise ValueError("Nenhum bloco JSON válido encontrado na resposta.")
-                
-                data = json.loads(extracted)
-                items = data.get("paragrafos", data.get("paragraphs", []))
-
-                if not isinstance(items, list):
-                    raise ValueError("Resposta 'paragrafos' não é uma lista.")
-                if len(items) != expected_count:
-                    raise ValueError(
-                        f"Esperado {expected_count} itens, recebido {len(items)}."
+                formatted_contents = [{"parts": [{"text": prompt}]}]
+                try:
+                    response = client.models.generate_content(
+                        model=self.model_name,
+                        contents=formatted_contents,
+                        config=types.GenerateContentConfig(**config_kwargs)
                     )
-                # Validar que nenhum item é vazio ou None
-                for idx, item in enumerate(items):
-                    if not item or not isinstance(item, str):
-                        raise ValueError(f"Item {idx} inválido: {item!r}")
+                except Exception as api_exc:
+                    err_str = str(api_exc).upper()
+                    if "400" in err_str or "INVALID_ARGUMENT" in err_str or "API_KEY_INVALID" in err_str:
+                        logger.error(f"Erro Crítico API 400 na conta '{current_alias}': {api_exc}")
+                        raise StopIteration(f"Erro 400 em '{current_alias}'. Sem retry.") from api_exc
+                    raise
 
-                return items
+                try:
+                    raw = self.normalize_gemini_response(response)
+                except Exception as norm_exc:
+                    logger.debug(f"Falha na normalização: {norm_exc}")
+                    raw = ""
+
+                extracted = self._extract_json(raw)
+                data = None
+                items = None
+                if extracted:
+                    try:
+                        data = json.loads(extracted)
+                        if isinstance(data, list):
+                            if data and all(isinstance(x, str) for x in data):
+                                items = data
+                                data = {"paragrafos": items}
+                            elif data:
+                                data = data[0]
+                            else:
+                                raise ValueError("Array JSON vazia retornada do Gemini.")
+                        if not isinstance(data, dict):
+                            raise TypeError(f"Dado JSON incorreto: {type(data)}")
+                        if not items:
+                            items = data.get("paragrafos", data.get("paragraphs", []))
+                            if not items and len(data.values()) == expected_count:
+                                items = [str(v) for v in data.values()]
+                    except Exception as json_err:
+                        logger.debug(f"Falha decodificando payload JSON: {json_err}")
+
+                if not items or len(items) != expected_count:
+                    try:
+                        items = self.validate_output(raw, expected_count)
+                    except Exception as val_exc:
+                        raise ValueError(f"Parsing JSON e Expressão de Parágrafos falharam: {val_exc}")
+
+                import re
+                return [re.sub(r'^\s*\d+[\.\-\)\]:]?\s+', '', str(item)).strip() for item in items]
+
+            except StopIteration as stop_err:
+                logger.error(str(stop_err))
+                break
 
             except Exception as exc:
-                is_429 = "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)
-                
-                # Exponential backoff for 429
+                err_str = str(exc)
+                is_429 = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower()
+
+                if is_429 and len(api_pool) > 1:
+                    next_idx = (pool_idx + 1) % len(api_pool)
+                    if next_idx != pool_idx:  # ainda há outra chave
+                        next_alias = api_pool[next_idx]["alias"]
+                        logger.warning(
+                            f"Cota da conta '{current_alias}' esgotada (429). "
+                            f"Trocando imediatamente para '{next_alias}' "
+                            f"({next_idx + 1}/{len(api_pool)})..."
+                        )
+                        pool_idx = next_idx
+                        continue  # sem sleep — troca instantânea!
+
+                # Sem fallback ou já rodou todas as chaves
+                normal_attempts += 1
                 wait = retry_delay
                 if is_429:
-                    wait = retry_delay * (2 ** (attempt - 1))
-                    logger.warning(f"Quota Gemini atingida (429). Aguardando {wait}s p/ tentativa {attempt+1}...")
-                
+                    wait = retry_delay * (2 ** (normal_attempts - 1))
+                    logger.warning(f"Todas as contas atingiram o limite. Aguardando {wait:.0f}s...")
                 logger.warning(
-                    f"Tentativa {attempt}/{max_retries} falhou: {exc}. "
-                    + ("Tentando novamente..." if attempt < max_retries else "Usando texto original.")
+                    f"Tentativa {normal_attempts}/{max_retries} falhou em '{current_alias}': {err_str[:200]}. "
+                    + ("(Aguardando retry...)" if normal_attempts < max_retries else "(Desistindo)")
                 )
-                
-                if attempt < max_retries:
+                if normal_attempts < max_retries:
                     time.sleep(wait)
 
-
-        # Fallback: retornar textos originais sem modificação
-        logger.error(
-            f"Esgotadas {max_retries} tentativas. Usando {expected_count} parágrafos originais."
-        )
+        logger.error(f"Esgotadas todas as tentativas. Retornando parágrafos originais.")
         return fallback_texts
 
     def _extract_json(self, text: str) -> Optional[str]:

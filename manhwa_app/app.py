@@ -39,10 +39,22 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QPushButton, QProgressBar,
     QScrollArea, QSizePolicy, QStatusBar, QTabWidget, QTextEdit,
-    QVBoxLayout, QWidget, QSlider, QComboBox, QDoubleSpinBox, QSpinBox,
+    QVBoxLayout, QWidget, QSlider as _QSlider, QComboBox as _QComboBox, QDoubleSpinBox as _QDoubleSpinBox, QSpinBox as _QSpinBox,
     QCheckBox, QInputDialog, QDialog, QTableWidget, QHeaderView,
     QDialogButtonBox, QTableWidgetItem,
 )
+
+class QComboBox(_QComboBox):
+    def wheelEvent(self, e): e.ignore()
+
+class QSpinBox(_QSpinBox):
+    def wheelEvent(self, e): e.ignore()
+
+class QDoubleSpinBox(_QDoubleSpinBox):
+    def wheelEvent(self, e): e.ignore()
+
+class QSlider(_QSlider):
+    def wheelEvent(self, e): e.ignore()
 
 from manhwa_app.audio_pipeline import split_into_paragraphs
 from manhwa_app.video_pipeline import EFFECTS
@@ -140,7 +152,15 @@ class GeminiWorker(QThread):
     def run(self):
         try:
             from google import genai as _genai
-            client = _genai.Client(api_key=self.api_key)
+            # Resolve first valid key (supports str, dict, or list[dict])
+            _pool = self.api_key
+            if isinstance(_pool, list):
+                first_key = _pool[0]["key"] if _pool else ""
+            elif isinstance(_pool, dict):
+                first_key = next((v for v in _pool.values() if v), "")
+            else:
+                first_key = _pool or ""
+            client = _genai.Client(api_key=first_key)
 
             if self.task == "list_models":
                 models = []
@@ -2540,9 +2560,10 @@ class AudioTab(QWidget):
         txt_path = self._files[row]["path"]
 
         settings = self.window().settings_tab
-        api_key = settings.get_api_key()
-        if not api_key:
-            self._gemini_status_lbl.setText("❌ Insira sua API Key na aba <b>Configurações</b> antes de continuar.")
+        api_keys = settings.get_api_keys()
+        valid_keys = [e for e in api_keys if isinstance(e, dict) and e.get("key", "").strip()]
+        if not valid_keys:
+            self._gemini_status_lbl.setText("❌ Insira ao menos uma API Key na aba <b>Configurações</b> antes de continuar.")
             self.window().tabs.setCurrentWidget(settings)
             return
 
@@ -2566,7 +2587,7 @@ class AudioTab(QWidget):
         
         self._gemini_worker = GeminiWorker(
             txt_path=txt_path,
-            api_key=api_key,
+            api_key=api_keys,
             languages=languages,
             delay_seconds=delay,
             model_name=model_name,
@@ -3782,6 +3803,7 @@ class SettingsTab(QWidget):
         self.model_combo = QComboBox()
         # Modelos de Última Geração (Doc)
         self.model_combo.addItem("Gemini 3.1 Pro (💎 SOTA Raciocínio)", "gemini-3.1-pro-preview")
+        self.model_combo.addItem("Gemini 3.1 Flash Lite (⚡ Rápido e Econômico)", "gemini-3.1-flash-lite-preview")
         self.model_combo.addItem("Gemini 3 Pro (🧠 Raciocínio Multimodal)", "gemini-3-pro-preview")
         self.model_combo.addItem("Gemini 3 Flash (🚀 Melhor Custo/Benefício)", "gemini-3-flash-preview")
         self.model_combo.addItem("Gemini 2.5 Pro (🎯 Complexidade)", "gemini-2.5-pro")
@@ -3800,50 +3822,101 @@ class SettingsTab(QWidget):
         gg.addWidget(self.btn_fetch_models, 0, 3)
 
 
-        gg.addWidget(QLabel("API Key:"), 1, 0)
-        self.api_key_combo = QComboBox()
-        self.api_key_combo.setEditable(True)
-        self.api_key_combo.lineEdit().setPlaceholderText("Cole ou digite sua API Key...")
-        self.api_key_combo.lineEdit().setEchoMode(QLineEdit.EchoMode.Password)
+        # Linha 1: Principal
+        gg.addWidget(QLabel("Chave Principal:"), 1, 0)
+        self.api_alias_main = QLineEdit(); self.api_alias_main.setPlaceholderText("Apelido (ex: E-mail Principal)")
+        self.api_key_main = QLineEdit(); self.api_key_main.setPlaceholderText("Cole aqui a API Key principal...")
+        self.api_key_main.setEchoMode(QLineEdit.EchoMode.Password)
+        gg.addWidget(self.api_alias_main, 1, 1, 1, 1)
+        gg.addWidget(self.api_key_main, 1, 2, 1, 2)
+        
+        # Botão de Toggle Reservas
+        self.btn_toggle_reserves = QPushButton("➕ Expandir Chaves Reservas")
+        self.btn_toggle_reserves.setCheckable(True)
+        gg.addWidget(self.btn_toggle_reserves, 2, 1, 1, 3)
+
+        # Painel Reservas — dinâmico e ilimitado
+        self.reserves_frame = QFrame()
+        self.reserves_frame.setVisible(False)
+        self._reserves_layout = QVBoxLayout(self.reserves_frame)
+        self._reserves_layout.setContentsMargins(0, 4, 0, 4)
+        self._reserves_layout.setSpacing(4)
+
+        # Listas que incluem o campo principal
+        self.api_aliases: list[QLineEdit] = [self.api_alias_main]
+        self.api_keys:    list[QLineEdit] = [self.api_key_main]
+        self._reserve_rows: list[QWidget] = []   # apenas linhas de reserva
+
+        def _add_reserve_row(alias_text: str = "", key_text: str = ""):
+            n = len(self._reserve_rows) + 1
+            row_w = QWidget()
+            row_h = QHBoxLayout(row_w)
+            row_h.setContentsMargins(0, 0, 0, 0); row_h.setSpacing(4)
+            lbl = QLabel(f"Reserva {n}:")
+            lbl.setFixedWidth(72)
+            alias_in = QLineEdit(); alias_in.setPlaceholderText(f"Apelido Reserva {n}")
+            alias_in.setText(alias_text)
+            key_in = QLineEdit(); key_in.setPlaceholderText("Cole aqui API Key Reserva...")
+            key_in.setEchoMode(QLineEdit.EchoMode.Password)
+            key_in.setText(key_text)
+            # Respeita estado do olho
+            if hasattr(self, "_btn_eye") and self._btn_eye.isChecked():
+                key_in.setEchoMode(QLineEdit.EchoMode.Normal)
+            btn_del = QPushButton("✖")
+            btn_del.setFixedWidth(28)
+            btn_del.setToolTip("Remover esta reserva")
+            row_h.addWidget(lbl)
+            row_h.addWidget(alias_in, 1)
+            row_h.addWidget(key_in, 2)
+            row_h.addWidget(btn_del)
+
+            self.api_aliases.append(alias_in)
+            self.api_keys.append(key_in)
+            self._reserve_rows.append(row_w)
+            self._reserves_layout.addWidget(row_w)
+
+            def _remove():
+                idx = self._reserve_rows.index(row_w)
+                self.api_aliases.pop(idx + 1)
+                self.api_keys.pop(idx + 1)
+                self._reserve_rows.pop(idx)
+                row_w.setParent(None)
+                row_w.deleteLater()
+                # Renumerar labels
+                for j, rw in enumerate(self._reserve_rows):
+                    rw.findChild(QLabel).setText(f"Reserva {j+1}:")
+            btn_del.clicked.connect(_remove)
+
+        # Botão "+ Adicionar Reserva" dentro do painel
+        self._btn_add_reserve = QPushButton("➕  Adicionar Chave Reserva")
+        self._btn_add_reserve.clicked.connect(lambda: _add_reserve_row())
+        self._reserves_layout.addWidget(self._btn_add_reserve)
+        self._add_reserve_row_fn = _add_reserve_row   # salvar ref p/ load_session
+
+        gg.addWidget(self.reserves_frame, 3, 0, 1, 4)
+
+        def _on_toggle(checked):
+            self.reserves_frame.setVisible(checked)
+            self.btn_toggle_reserves.setText("➖ Ocultar Chaves Reservas" if checked else "➕ Expandir Chaves Reservas")
+        self.btn_toggle_reserves.toggled.connect(_on_toggle)
+        
+        self._btn_eye = QPushButton("👁 Exibir Chaves Ocultas")
+        self._btn_eye.setCheckable(True)
+        self._btn_eye.toggled.connect(self._toggle_eyes)
         
         kw = QWidget()
-        kh = QHBoxLayout(kw)
-        kh.setContentsMargins(0, 0, 0, 0)
-        kh.setSpacing(5)
-        kh.addWidget(self.api_key_combo, 1)
+        kh = QHBoxLayout(kw); kh.setContentsMargins(0,0,0,0)
+        kh.addWidget(self._btn_eye)
+        gg.addWidget(kw, 4, 1, 1, 3)
 
-        self.btn_save_key = QPushButton("💾")
-        self.btn_save_key.setToolTip("Salvar chave atual na lista")
-        self.btn_save_key.setFixedWidth(34)
-        self.btn_save_key.clicked.connect(self._save_api_key)
-        kh.addWidget(self.btn_save_key)
-
-        self.btn_rem_key = QPushButton("🗑")
-        self.btn_rem_key.setToolTip("Remover chave atual da lista")
-        self.btn_rem_key.setFixedWidth(34)
-        self.btn_rem_key.clicked.connect(self._remove_api_key)
-        kh.addWidget(self.btn_rem_key)
-
-        gg.addWidget(kw, 1, 1, 1, 2)
-
-        self._btn_eye = QPushButton("👁")
-        self._btn_eye.setFixedWidth(34)
-        self._btn_eye.setCheckable(True)
-        self._btn_eye.setToolTip("Mostrar/ocultar chave")
-        self._btn_eye.toggled.connect(
-            lambda on: self.api_key_combo.lineEdit().setEchoMode(
-                QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password)
-        )
-        gg.addWidget(self._btn_eye, 1, 3)
-
-        self.btn_test = QPushButton("🔗  Testar Conexão")
+        self.btn_test = QPushButton("🔗 Testar Conexões")
         self.btn_test.setObjectName("primary")
         self.btn_test.clicked.connect(self._test_connection)
-        gg.addWidget(self.btn_test, 2, 1)
+        gg.addWidget(self.btn_test, 5, 1)
 
         self.test_result_lbl = QLabel("")
         self.test_result_lbl.setWordWrap(True)
-        gg.addWidget(self.test_result_lbl, 2, 2, 1, 2)
+        gg.addWidget(self.test_result_lbl, 5, 2, 1, 2)
         vl.addWidget(gem_box)
 
         # ── 2. Comportamento Gemini ───────────────────────────────────
@@ -3877,7 +3950,7 @@ class SettingsTab(QWidget):
 
         bg.addWidget(QLabel("Tamanho de chunk:"), 2, 0)
         self.chunk_spin = QSpinBox()
-        self.chunk_spin.setRange(4, 40)
+        self.chunk_spin.setRange(1, 999999)
         self.chunk_spin.setValue(12)
         self.chunk_spin.setToolTip("Parágrafos por chamada à API (padrão: 12)")
         bg.addWidget(self.chunk_spin, 2, 1)
@@ -4054,22 +4127,19 @@ class SettingsTab(QWidget):
     # Public helpers
     # ------------------------------------------------------------------
 
-    def _save_api_key(self):
-        text = self.api_key_combo.currentText().strip()
-        if text and self.api_key_combo.findText(text) == -1:
-            self.api_key_combo.addItem(text)
-            self.api_key_combo.setCurrentText(text)
+    def _toggle_eyes(self, on):
+        mode = QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password
+        for k_widget in self.api_keys:
+            k_widget.setEchoMode(mode)
 
-    def _remove_api_key(self):
-        idx = self.api_key_combo.currentIndex()
-        if idx >= 0:
-            self.api_key_combo.removeItem(idx)
-
-    def get_all_api_keys(self) -> list:
-        return [self.api_key_combo.itemText(i) for i in range(self.api_key_combo.count())]
-
-    def get_api_key(self) -> str:
-        return self.api_key_combo.currentText().strip()
+    def get_api_keys(self) -> list:
+        keys_list = []
+        for alias_widget, key_widget in zip(self.api_aliases, self.api_keys):
+            k = key_widget.text().strip()
+            if k:
+                a = alias_widget.text().strip() or f"Conta {len(keys_list)+1}"
+                keys_list.append({"alias": a, "key": k})
+        return keys_list
 
     def get_model_name(self) -> str:
         return self.model_combo.currentData() or self.model_combo.currentText().strip()
@@ -4114,8 +4184,7 @@ class SettingsTab(QWidget):
     def get_session(self) -> dict:
         return {
             "gemini": {
-                "api_key": self.get_api_key(),
-                "api_keys": self.get_all_api_keys(),
+                "api_keys_pool": self.get_api_keys(),
                 "model_name": self.get_model_name(),
                 "delay": self.delay_slider.value(),
                 "languages": self.get_languages(),
@@ -4142,15 +4211,36 @@ class SettingsTab(QWidget):
     def load_session(self, data: dict):
         gem = data.get("gemini", {})
         self.language_mapping = gem.get("language_mapping", {})
-        if "api_keys" in gem:
-            self.api_key_combo.clear()
-            self.api_key_combo.addItems(gem["api_keys"])
-        if "api_key" in gem:
-            idx = self.api_key_combo.findText(gem["api_key"])
-            if idx >= 0:
-                self.api_key_combo.setCurrentIndex(idx)
-            else:
-                self.api_key_combo.setCurrentText(gem["api_key"])
+        if "api_keys_pool" in gem:
+            pool = gem["api_keys_pool"]
+            if isinstance(pool, list) and pool:
+                # Preenche o campo principal (índice 0)
+                first = pool[0]
+                self.api_aliases[0].setText(first.get("alias", ""))
+                self.api_keys[0].setText(first.get("key", ""))
+                # Cria dinamicamente as linhas de reserva para os demais
+                for item in pool[1:]:
+                    if isinstance(item, dict):
+                        self._add_reserve_row_fn(
+                            alias_text=item.get("alias", ""),
+                            key_text=item.get("key", "")
+                        )
+                # Se havia reservas, expandir o painel automaticamente
+                if len(pool) > 1:
+                    self.btn_toggle_reserves.setChecked(True)
+        elif "api_keys_dict" in gem:
+            dt = gem["api_keys_dict"]
+            entries = [(k, v) for k, v in dt.items() if v]
+            for i, (k, val) in enumerate(entries):
+                if i == 0:
+                    self.api_aliases[0].setText(k)
+                    self.api_keys[0].setText(val)
+                else:
+                    self._add_reserve_row_fn(alias_text=k, key_text=val)
+            if len(entries) > 1:
+                self.btn_toggle_reserves.setChecked(True)
+        elif "api_key" in gem and gem["api_key"]:
+            self.api_keys[0].setText(gem["api_key"])
         if "model_name" in gem:
             idx = self.model_combo.findData(gem["model_name"])
             if idx >= 0:
@@ -4200,7 +4290,9 @@ class SettingsTab(QWidget):
             self.default_voices_edit.setText(paths_["default_voices"])
 
     def reset_defaults(self):
-        self.api_key_edit.clear()
+        for alias, key in zip(self.api_aliases, self.api_keys):
+            alias.setText("")
+            key.setText("")
         self.model_combo.setCurrentIndex(0)
         self.delay_slider.setValue(4)
         for chk in [self.chk_en, self.chk_es, self.chk_fr, self.chk_de, self.chk_ja, self.chk_ko]:
@@ -4222,10 +4314,11 @@ class SettingsTab(QWidget):
     # ------------------------------------------------------------------
 
     def _test_connection(self):
-        key = self.get_api_key()
+        keys = self.get_api_keys()  # list[{alias, key}]
         model = self.get_model_name()
-        if not key:
-            self.test_result_lbl.setText("❌ Insira uma API Key antes de testar.")
+        
+        if not keys:
+            self.test_result_lbl.setText("❌ Insira ao menos uma API Key antes de testar.")
             self.test_result_lbl.setStyleSheet("color:#e05555;")
             return
         if not _GEMINI_AVAILABLE:
@@ -4233,46 +4326,56 @@ class SettingsTab(QWidget):
             self.test_result_lbl.setStyleSheet("color:#e05555;")
             return
         self.btn_test.setEnabled(False)
-        self.test_result_lbl.setText("⏳ Testando conexão...")
+        self.test_result_lbl.setText("⏳ Testando conexões...")
         self.test_result_lbl.setStyleSheet("color:#f0c040;")
 
         class _TestWorker(QThread):
             done = Signal(bool, str)
-            def __init__(self, k, m, t, r):
+            def __init__(self, pool, m, t):
                 super().__init__()
-                self._k = k
+                self._pool = pool
                 self._m = m
                 self._t = t
-                self._r = r
             def run(self):
+                results = []
                 try:
                     from google import genai as _genai
                     from google.genai import types as _types
-                    client = _genai.Client(api_key=self._k)
-                    
                     config = None
                     if self._t and "gemini-3" in self._m:
                         config = _types.GenerateContentConfig(
                             thinking_config=_types.ThinkingConfig(thinking_level=self._t)
                         )
-                    
-                    client.models.generate_content(model=self._m, contents="ok", config=config)
-                    self.done.emit(True, f"✅ Conectado ao modelo {self._m} com sucesso!")
-
+                    seen = set()
+                    for entry in self._pool:
+                        k = entry["key"]
+                        alias = entry["alias"]
+                        if k in seen:
+                            results.append(f"♻️ '{alias}' duplicada, ignorada.")
+                            continue
+                        seen.add(k)
+                        try:
+                            client = _genai.Client(api_key=k)
+                            client.models.generate_content(model=self._m, contents="ok", config=config)
+                            results.append(f"✅ '{alias}'")
+                        except Exception as e:
+                            results.append(f"❌ '{alias}': {str(e)[:80]}")
+                    msg = " | ".join(results)
+                    ok = any("✅" in r for r in results)
+                    self.done.emit(ok, msg)
                 except Exception as e:
-                    self.done.emit(False, f"❌ {e}")
+                    self.done.emit(False, f"❌ Erro: {e}")
 
         think = self.get_thinking_level()
-        res = self.get_media_resolution()
-        self._test_worker = _TestWorker(key, model, think, res)
-
+        self._test_worker = _TestWorker(keys, model, think)
         self._test_worker.done.connect(self._on_test_done)
         self._test_worker.start()
 
     def _fetch_models(self):
-        key = self.api_key_edit.text().strip()
+        keys = self.get_api_keys()  # list[{alias, key}]
+        key = keys[0]["key"] if keys else None
         if not key:
-            QMessageBox.warning(self, "Sem Chave", "Insira uma API Key para buscar os modelos.")
+            QMessageBox.warning(self, "Sem Chave", "Insira pelo menos uma API Key para buscar os modelos.")
             return
         
         self.btn_fetch_models.setEnabled(False)
@@ -4519,6 +4622,7 @@ class LanguageConfigCard(QFrame):
         super().__init__(parent)
         self.lang_code = lang_code
         self.lang_name = lang_name
+        self.custom_script_path = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -4580,6 +4684,12 @@ class LanguageConfigCard(QFrame):
         self.btn_test.setObjectName("primary")
         self.btn_test.clicked.connect(self._test_voice)
         top_row.addWidget(self.btn_test)
+
+        self.btn_script = QPushButton("📁 Script")
+        self.btn_script.setFixedWidth(85)
+        self.btn_script.setToolTip("Ignorar Gemini e usar este arquivo .txt para este idioma")
+        self.btn_script.clicked.connect(self._browse_script)
+        top_row.addWidget(self.btn_script)
         
         top_row.addStretch()
         main_v.addLayout(top_row)
@@ -4694,6 +4804,27 @@ class LanguageConfigCard(QFrame):
             self.voice_combo.addItem(f"[Custom] {Path(path).stem}", path)
             self.voice_combo.setCurrentIndex(self.voice_combo.count()-1)
 
+    def _browse_script(self):
+        if self.custom_script_path:
+            # Se já tem, pergunta se quer limpar
+            res = QMessageBox.question(self, "Limpar Roteiro", f"Já existe um roteiro selecionado:\n{Path(self.custom_script_path).name}\n\nDeseja remover o roteiro manual e voltar para o Gemini?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if res == QMessageBox.StandardButton.Yes:
+                self._clear_script()
+                return
+
+        path, _ = QFileDialog.getOpenFileName(self, f"Roteiro Manual ({self.lang_name})", "", "Texto (*.txt)")
+        if path:
+            self.custom_script_path = path
+            self.btn_script.setText("✅ Script")
+            self.btn_script.setToolTip(f"Arquivo: {Path(path).name}\nClique para remover ou trocar.")
+            self.btn_script.setStyleSheet("background: #059669; border: 1px solid #10b981;")
+
+    def _clear_script(self):
+        self.custom_script_path = None
+        self.btn_script.setText("📁 Script")
+        self.btn_script.setToolTip("Ignorar Gemini e usar este arquivo .txt para este idioma")
+        self.btn_script.setStyleSheet("")
+
     def _test_voice(self):
         text = SAMPLE_TEXTS.get(self.lang_code, SAMPLE_TEXTS["en"])
         engine_str = self.engine_combo.currentText()
@@ -4720,11 +4851,22 @@ class LanguageConfigCard(QFrame):
             "temperature": self.sp_temp.value(),
             "exaggeration": self.sp_exag.value(),
             "cfg_weight": self.sp_cfg.value(),
-            "seed": self.sp_seed.value()
+            "seed": self.sp_seed.value(),
+            "custom_script_path": self.custom_script_path
         }
 
     def load_config(self, cfg):
         if not cfg: return
+        
+        if cfg.get("custom_script_path"):
+            self.custom_script_path = cfg["custom_script_path"]
+            p = Path(self.custom_script_path)
+            if p.exists():
+                self.btn_script.setText("✅ Script")
+                self.btn_script.setToolTip(f"Arquivo: {p.name}\nClique para remover ou trocar.")
+                self.btn_script.setStyleSheet("background: #059669; border: 1px solid #10b981;")
+            else:
+                self.custom_script_path = None # File not found
         if "engine" in cfg:
             self.engine_combo.setCurrentText(cfg["engine"])
         if "model_type" in cfg and cfg.get("engine") == "chatterbox":
@@ -5031,9 +5173,10 @@ class ExpressTab(QWidget):
         
         main_win = self.window()
         cfg = main_win.settings_tab.get_session()
-        api_key = main_win.settings_tab.get_api_key()
+        api_keys = main_win.settings_tab.get_api_keys()
         
-        if not api_key:
+        valid_keys = [e for e in api_keys if isinstance(e, dict) and e.get("key", "").strip()]
+        if not valid_keys:
             QMessageBox.warning(self, "Erro", "API Key do Gemini não configurada na aba Configurações.")
             self.btn_run.setEnabled(True)
             return
@@ -5045,7 +5188,7 @@ class ExpressTab(QWidget):
             txt_path=self._files[0]["path"],
             image_paths=self._images,
             project_name=self.proj_edit.text().strip(),
-            api_key=api_key,
+            api_key=api_keys,
             source_lang=self.source_lang_combo.currentData(),
             languages=selected_langs,
             use_saved_tts=self.chk_use_saved.isChecked(),
@@ -5090,25 +5233,52 @@ class ExpressOrchestrator(QThread):
             # Use original revised (pt) + requested langs
             target_langs = list(set(self.languages))
             
-            from gemini_processor import GeminiProcessor
-            proc = GeminiProcessor(model_name=self.main_cfg.get("gemini", {}).get("model_name", "gemini-1.5-flash"))
+            # --- NOVO: Separar idiomas manuais ---
+            manual_scripts = {}
+            for code, override in self.overrides.items():
+                if override.get("custom_script_path"):
+                    manual_scripts[code] = override["custom_script_path"]
             
-            # Map paths
-            lang_paths = proc.process(
-                txt_path=self.txt_path,
-                api_key=self.api_key,
-                languages=target_langs,
-                source_lang=self.source_lang,
-                delay_seconds=float(self.main_cfg.get("gemini", {}).get("delay", 4)),
-                revision_prompt=self.main_cfg.get("gemini", {}).get("revision_prompt"),
-                translation_prompt=self.main_cfg.get("gemini", {}).get("translation_prompt"),
-                chunk_size=int(self.main_cfg.get("gemini", {}).get("chunk_size", 12)),
-                overlap=int(self.main_cfg.get("gemini", {}).get("overlap", 2)),
-                progress_callback=lambda c, t, m: self.log_message.emit(f"Gemini: {m}")
-            )
+            # Idiomas que REALMENTE precisam do Gemini
+            gemini_langs = [code for code in target_langs if code not in manual_scripts]
+            
+            # Se a própria revisão (source_lang) for manual, também removemos do Gemini
+            # Mas nota: GeminiProcessor sempre produz a revisão a partir do txt_path.
+            
+            # Se TODOS forem manuais, pulamos o Gemini
+            if not gemini_langs and (self.source_lang in manual_scripts or self.source_lang not in self.languages):
+                self.log_message.emit("Todos os roteiros são manuais. Pulando Fase 1.")
+                lang_paths = manual_scripts
+            else:
+                from gemini_processor import GeminiProcessor
+                proc = GeminiProcessor(model_name=self.main_cfg.get("gemini", {}).get("model_name", "gemini-1.5-flash"))
+                
+                # Se o idioma de origem for manual, usamos ele como base para o Gemini traduzir os outros
+                actual_txt_path = self.txt_path
+                if self.source_lang in manual_scripts:
+                    actual_txt_path = manual_scripts[self.source_lang]
+                    self.log_message.emit(f"Usando roteiro manual de {self.source_lang} como base para traduções.")
+
+                # Chamar Gemini para o que restou
+                lang_paths = proc.process(
+                    txt_path=actual_txt_path,
+                    api_key=self.api_key,
+                    languages=gemini_langs,
+                    source_lang=self.source_lang,
+                    delay_seconds=float(self.main_cfg.get("gemini", {}).get("delay", 4)),
+                    revision_prompt=self.main_cfg.get("gemini", {}).get("revision_prompt"),
+                    translation_prompt=self.main_cfg.get("gemini", {}).get("translation_prompt"),
+                    chunk_size=int(self.main_cfg.get("gemini", {}).get("chunk_size", 12)),
+                    overlap=int(self.main_cfg.get("gemini", {}).get("overlap", 2)),
+                    progress_callback=lambda c, t, m: self.log_message.emit(f"Gemini: {m}")
+                )
+                
+                # Mesclar caminhos manuais que foram ignorados pelo Gemini
+                for code, path in manual_scripts.items():
+                    lang_paths[code] = path
             
             if not lang_paths:
-                self.finished.emit(False, "Gemini não gerou arquivos.")
+                self.finished.emit(False, "Gemini não gerou arquivos e não há manuais.")
                 return
 
             self.progress.emit(40)

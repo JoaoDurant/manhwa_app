@@ -154,7 +154,8 @@ class GeminiProcessor:
             self._client = genai.Client(api_key=api_key)
             from google.genai import types  # type: ignore[import]
             
-            is_thinking_model = any(k in self.model_name.lower() for k in ["thinking", "gemini-3", "gemini-2.5"])
+            # Raciocínio (Thinking) é para gemini-2.0-flash-thinking e possivelmente os novos 2.5/3.1
+            is_thinking_model = any(k in self.model_name.lower() for k in ["thinking", "gemini-3.1", "gemini-3-pro"])
             
             config_kwargs = {}
             if thinking_level and is_thinking_model:
@@ -502,6 +503,7 @@ class GeminiProcessor:
                 # Extração Robusta de JSON (procurar o primeiro { e o último })
                 extracted = self._extract_json(raw)
                 if not extracted:
+                    logger.debug(f"Falha na extração. Texto bruto (primeiros 200 chars): {raw[:200]!r}")
                     raise ValueError("Nenhum bloco JSON válido encontrado na resposta.")
                 
                 data = json.loads(extracted)
@@ -547,10 +549,11 @@ class GeminiProcessor:
     def _extract_json(self, text: str) -> Optional[str]:
         """Extrai o conteúdo entre o primeiro { e o último } na string."""
         try:
-            # Tentar encontrar o bloco JSON
+            # Especial: Remova tudo antes do primeiro { ou [ e depois do último } ou ]
+            # Usando regex que captura o maior bloco estruturado possível
             match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
             if match:
-                return match.group(0)
+                return match.group(0).strip()
             return None
         except Exception:
             return None

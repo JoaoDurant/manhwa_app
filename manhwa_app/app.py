@@ -62,6 +62,21 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Mapeamento de prefixos de voz Kokoro por idioma
+KOKORO_LANG_MAP = {
+    "en": ["af_", "am_", "bf_", "bm_"],
+    "en-us": ["af_", "am_"],
+    "en-gb": ["bf_", "bm_"],
+    "pt": ["pf_", "pm_"],
+    "pt-br": ["pf_", "pm_"],
+    "es": ["ef_", "em_"],
+    "fr": ["ff_"],
+    "ja": ["jf_", "jm_"],
+    "zh": ["zf_", "zm_"],
+    "it": ["if_", "im_"],
+    "hi": ["hf_", "hm_"]
+}
+
 def _append_log(widget: QTextEdit, message: str):
     """Helper to append timestamped logs to a QTextEdit."""
     from datetime import datetime
@@ -80,7 +95,7 @@ class GeminiWorker(QThread):
     """Runs Gemini tasks (process content or list models) in a background thread."""
 
     progress = Signal(int, int, str)
-    finished = Signal(object)          # Can be dict for process or list for model listing
+    result_ready = Signal(object)      # Can be dict for process or list for model listing
     error = Signal(str)
 
     def __init__(self, *args, **kwargs):
@@ -108,13 +123,14 @@ class GeminiWorker(QThread):
                 self.languages = kwargs.get("languages")
                 self.delay_seconds = kwargs.get("delay_seconds")
             
-            self.model_name = kwargs.get("model_name", "gemini-1.5-flash")
+            self.model_name = kwargs.get("model_name", "gemini-3-flash-preview")
             self.revision_prompt = kwargs.get("revision_prompt")
             self.translation_prompt = kwargs.get("translation_prompt")
             self.chunk_size = kwargs.get("chunk_size", 12)
             self.overlap = kwargs.get("overlap", 2)
             self.thinking_level = kwargs.get("thinking_level", "high")
             self.media_resolution = kwargs.get("media_resolution", "media_resolution_high")
+            self.per_language_prompts = kwargs.get("per_language_prompts", {})
             self._stop_event = _threading.Event()
 
     def cancel(self):
@@ -151,8 +167,9 @@ class GeminiWorker(QThread):
                 media_resolution=self.media_resolution,
                 progress_callback=lambda a, t, m: self.progress.emit(a, t, m),
                 stop_event=self._stop_event,
+                per_language_prompts=self.per_language_prompts,
             )
-            self.finished.emit(result)
+            self.result_ready.emit(result)
         except Exception as exc:
             logger.error(f"GeminiWorker erro ({self.task}): {exc}", exc_info=True)
             self.error.emit(str(exc))
@@ -1033,10 +1050,24 @@ class LanguageConfigTab(QWidget):
                     ("pf_dora","[PT-BR] Dora (F)"),("pm_alex","[PT-BR] Alex (M)"),
                     ("pm_santa","[PT-BR] Santa (M)"),
                 ]
+                # Filtro pelo idioma da combo de card
+                l_code = lang_combo.currentText()
+                prefixes = KOKORO_LANG_MAP.get(l_code, [])
                 for voice_id, label in KOKORO_BUILTIN:
-                    combo.addItem(f"🎤 {label}", voice_id)
+                    if not prefixes or any(voice_id.startswith(p) for p in prefixes):
+                        combo.addItem(f"🎤 {label}", voice_id)
+                # Adicionar custom .pt se existirem
+                base_pt = Path(__file__).parent.parent / "Kokoro-TTS-Local-master" / "voices"
+                if base_pt.exists():
+                    for p in base_pt.glob("*.pt"): combo.addItem(f"💾 {p.stem} (Custom)", str(p))
             elif eng == "qwen":
-                combo.addItems(["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"])
+                l_code = lang_combo.currentText()
+                qp = {"zh": ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric"], "en": ["Ryan", "Aiden"], "ja": ["Ono_Anna"], "ko": ["Sohee"]}
+                rel = qp.get(l_code, [])
+                if not rel:
+                    combo.addItems(["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"])
+                else:
+                    combo.addItems(rel)
                 qdir = Path(__file__).parent / "qwen_voices"
                 if qdir.exists():
                     for p in qdir.glob("*.pt"): combo.addItem(p.stem, str(p))
@@ -1059,6 +1090,7 @@ class LanguageConfigTab(QWidget):
 
         update_voices(engine, voice_combo, voice)
         engine_combo.currentTextChanged.connect(lambda txt, c=voice_combo: update_voices(txt, c, ""))
+        lang_combo.currentTextChanged.connect(lambda txt, c=voice_combo, e=engine_combo: update_voices(e.currentText(), c, ""))
         
         # L3: Opções Avançadas (Toggle)
         adv_group = QGroupBox("⚙️ Opções TTS e Efeitos")
@@ -1216,7 +1248,6 @@ class LanguageConfigTab(QWidget):
 
     def _test_card_voice(self, eng, voice, lang, txt, btn_widget, speed, temperature, model_type="turbo"):
         if not txt.strip(): return
-        logger.info(f"[EXPRESS-DEBUG] _test_card_voice received voice='{voice}' for eng='{eng}'")
         
         # [RACE CONDITION FIX] Verificar se precisa trocar de engine ANTES de instanciar a PreviewThread
         def _check_needs_switch(engine_str: str, requested_model_type: str) -> bool:
@@ -1486,6 +1517,7 @@ class AudioTab(QWidget):
         vg.addWidget(QLabel("Idioma:"), 1, 0)
         self.preset_lang_combo = QComboBox()
         self.preset_lang_combo.addItems(["en", "pt", "es", "fr", "ja", "ko", "zh"])
+        self.preset_lang_combo.currentIndexChanged.connect(self._populate_voices)
         vg.addWidget(self.preset_lang_combo, 1, 1)
         
         btn_lang_cfg = QPushButton("⚙ Mapear Vozes (Tradução)")
@@ -1856,26 +1888,49 @@ class AudioTab(QWidget):
                 ("pm_alex",    "[PT-BR] Alex (M)"),
                 ("pm_santa",   "[PT-BR] Santa (M)"),
             ]
+            
+            # Filtro por idioma
+            lang = self.preset_lang_combo.currentText().lower()
+            prefixes = KOKORO_LANG_MAP.get(lang, [])
+            
             for voice_id, label in KOKORO_BUILTIN:
-                self.preset_voice_combo.addItem(f"🎤 {label}", voice_id)
+                # Se houver filtro para o idioma, aplica; senão mostra tudo (ou nada se preferir)
+                if not prefixes or any(voice_id.startswith(p) for p in prefixes):
+                    self.preset_voice_combo.addItem(f"🎤 {label}", voice_id)
 
             # ── Vozes .pt customizadas (pasta local) ──────────────────────────
             base_dir = Path(__file__).parent.parent / "Kokoro-TTS-Local-master" / "voices"
             if base_dir.exists():
                 for path in sorted(base_dir.glob("*.pt"), key=natural_sort_key):
-                    self.preset_voice_combo.addItem(f"💾 {path.stem} (Custom)", str(path))
+                    # Filtra vozes customizadas pelos mesmos prefixos das built-in
+                    if not prefixes or any(path.stem.startswith(p) for p in prefixes):
+                        self.preset_voice_combo.addItem(f"💾 {path.stem} (Custom)", str(path))
                     
-        elif engine == "qwen":
-            self.preset_voice_combo.addItem("Vivian (Female, Chinese, Lively)", "Vivian")
-            self.preset_voice_combo.addItem("Serena (Female, Chinese, Gentle)", "Serena")
-            self.preset_voice_combo.addItem("Uncle_Fu (Male, Chinese, Mellow)", "Uncle_Fu")
-            self.preset_voice_combo.addItem("Dylan (Male, Beijing Dialect, Clear)", "Dylan")
-            self.preset_voice_combo.addItem("Eric (Male, Sichuan Dialect, Bright)", "Eric")
-            self.preset_voice_combo.addItem("Ryan (Male, English, Dynamic)", "Ryan")
-            self.preset_voice_combo.addItem("Aiden (Male, English, Clear)", "Aiden")
-            self.preset_voice_combo.addItem("Ono_Anna (Female, Japanese, Playful)", "Ono_Anna")
-            self.preset_voice_combo.addItem("Sohee (Female, Korean, Warm)", "Sohee")
+            # Vozes Qwen filtradas por idioma
+            lang = self.preset_lang_combo.currentText().lower()
+            qwen_presets = {
+                "zh": ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric"],
+                "en": ["Ryan", "Aiden"],
+                "ja": ["Ono_Anna"],
+                "ko": ["Sohee"]
+            }
             
+            relevant = qwen_presets.get(lang, [])
+            if not relevant: # Fallback: mostra tudo se o idioma for desconhecido
+                 self.preset_voice_combo.addItem("Vivian (Female, Chinese, Lively)", "Vivian")
+                 self.preset_voice_combo.addItem("Serena (Female, Chinese, Gentle)", "Serena")
+                 self.preset_voice_combo.addItem("Uncle_Fu (Male, Chinese, Mellow)", "Uncle_Fu")
+                 self.preset_voice_combo.addItem("Dylan (Male, Beijing Dialect, Clear)", "Dylan")
+                 self.preset_voice_combo.addItem("Eric (Male, Sichuan Dialect, Bright)", "Eric")
+                 self.preset_voice_combo.addItem("Ryan (Male, English, Dynamic)", "Ryan")
+                 self.preset_voice_combo.addItem("Aiden (Male, English, Clear)", "Aiden")
+                 self.preset_voice_combo.addItem("Ono_Anna (Female, Japanese, Playful)", "Ono_Anna")
+                 self.preset_voice_combo.addItem("Sohee (Female, Korean, Warm)", "Sohee")
+            else:
+                for v in relevant:
+                    # Labels simplificados para o filtro
+                    self.preset_voice_combo.addItem(v, v)
+                    
             qwen_dir = Path(__file__).parent / "qwen_voices"
             if qwen_dir.exists():
                 for pt_file in sorted(qwen_dir.glob("*.pt"), key=natural_sort_key):
@@ -2498,8 +2553,12 @@ class AudioTab(QWidget):
         model_name = self._gemini_model_combo.currentData() or settings.get_model_name()
         
         revision_prompt = settings.get_revision_prompt()
-
         translation_prompt = settings.get_translation_prompt()
+        
+        per_language_prompts = {}
+        if getattr(settings, "chk_per_lang_prompts", None) and settings.chk_per_lang_prompts.isChecked():
+            per_language_prompts = getattr(settings, "_per_lang_prompts", {})
+
         chunk_size = settings.get_chunk_size()
         overlap = settings.get_overlap()
         thinking_level = settings.get_thinking_level()
@@ -2516,11 +2575,13 @@ class AudioTab(QWidget):
             chunk_size=chunk_size,
             overlap=overlap,
             thinking_level=thinking_level,
-            media_resolution=media_resolution
+            media_resolution=media_resolution,
+            per_language_prompts=per_language_prompts
         )
         self._gemini_worker.progress.connect(self._on_gemini_progress)
-        self._gemini_worker.finished.connect(self._on_gemini_done)
+        self._gemini_worker.result_ready.connect(self._on_gemini_done)
         self._gemini_worker.error.connect(self._on_gemini_error)
+        self._gemini_worker.finished.connect(self._on_gemini_thread_finished)
 
         self._gemini_run_btn.setEnabled(False)
         self._gemini_cancel_btn.setEnabled(True)
@@ -2554,7 +2615,8 @@ class AudioTab(QWidget):
                 # Insert generated files at the same position
                 insert_idx = row
                 for lang_code, new_path in result.items():
-                    self._files.insert(insert_idx, {"path": str(new_path), "voice": None, "lang": None})
+                    # Set the language so the TTS engine knows what to do
+                    self._files.insert(insert_idx, {"path": str(new_path), "voice": None, "lang": lang_code})
                     self.files_list.insertItem(insert_idx, Path(new_path).name)
                     insert_idx += 1
                 
@@ -2563,7 +2625,9 @@ class AudioTab(QWidget):
 
         else:
             self._gemini_status_lbl.setText("⚠ Processamento concluído sem saída.")
-        if self._gemini_worker:
+
+    def _on_gemini_thread_finished(self):
+        if hasattr(self, "_gemini_worker") and self._gemini_worker:
             self._gemini_worker.deleteLater()
             self._gemini_worker = None
 
@@ -2572,9 +2636,6 @@ class AudioTab(QWidget):
         self._gemini_cancel_btn.setEnabled(False)
         self._gemini_progress.setVisible(False)
         self._gemini_status_lbl.setText(f"❌ {message}")
-        if self._gemini_worker:
-            self._gemini_worker.deleteLater()
-            self._gemini_worker = None
 
     def _on_gemini_cancel(self):
         if self._gemini_worker and self._gemini_worker.isRunning():
@@ -3638,55 +3699,54 @@ class VideoTab(QWidget):
 # Aba de Configurações
 # ---------------------------------------------------------------------------
 
-_DEFAULT_REVISION_PROMPT = """Você é um editor profissional especializado em roteiros de manhwa e webtoon narrados em áudio.
+_DEFAULT_REVISION_PROMPT = """Você é um editor literário especialista em transformar roteiros brutos de manhwa e webtoon em narrações envolventes e profissionais.
 
-Sua tarefa: revisar APENAS os parágrafos do BLOCO ATUAL.
+Sua tarefa: reescrever e refinar o BLOCO ATUAL de parágrafos para que soem como um audiobook de alta qualidade ou uma narração de vídeo profissional.
 
-REGRAS OBRIGATÓRIAS:
-1. Mantenha o sentido e a narrativa original — não reescreva, apenas corrija e melhore fluidez
-2. Cada parágrafo deve terminar de forma que o próximo continue naturalmente (coesão narrativa)
-3. Remova ou substitua: símbolos especiais (*, #, →, —), reticências excessivas (... ... ...), onomatopeias escritas (BOOM!, POW!), parênteses com indicações de cena
-4. Escreva por extenso: números isolados vire palavras ("3" → "três"), siglas ambíguas explique ("km" → "quilômetros")
-5. Frases muito longas (mais de 40 palavras): quebre em duas frases naturais
-6. Não adicione frases novas — apenas refine o que existe
-7. Mantenha o mesmo número de parágrafos que recebeu
+REGRAS DE OURO:
+1. **TRANSFORMAÇÃO CRIATIVA**: Não se limite a corrigir gramática. Melhore o vocabulário, crie suspense e use uma linguagem que prenda o ouvinte. Pode expandir ligeiramente o texto para melhorar a imersão.
+2. **FLUIDEZ NARRATIVA**: Conecte os parágrafos. Se um parágrafo termina com uma pergunta ou um cliffhanger, garanta que o próximo mantenha o ritmo.
+3. **LIMPEZA TOTAL**: Remova TODA a "sujeira" visual: símbolos (*, #, →, — ou [ ]), nomes de personagens antes da fala (Ex: "João: Olá" -> "Olá"), onomatopeias gráficas e descrições técnicas de cena.
+4. **NATURALIDADE**: Números devem ser escritos por extenso ("7" -> "sete"). Siglas devem ser expandidas ("km" -> "quilômetros").
+5. **RITMO**: Quebre frases longas que seriam difíceis de narrar sem pausa para respirar.
+6. **ESTRUTURA**: Mantenha exatamente o mesmo número de parágrafos no JSON de saída para sincronia com o sistema.
 
-CONTEXTO (não edite, apenas leia para entender a continuidade):
-[ANTES]: {context_before}
-[DEPOIS]: {context_after}
+CONTEXTO DE CONTINUIDADE (Apenas para referência, não edite):
+[ANTERIOR]: {context_before}
+[PRÓXIMO]: {context_after}
 
-BLOCO ATUAL para revisar:
+---
+BLOCO ATUAL PARA REESCREVER:
 {current_block_formatted}
 
-Responda SOMENTE com JSON válido, sem markdown, sem explicações:
+Responda APENAS com JSON válido:
 {{"paragrafos": ["texto revisado 1", "texto revisado 2", ...]}}
 
-O array deve ter exatamente {n} elementos, na mesma ordem dos parágrafos recebidos."""
+Gere exatamente {n} elementos."""
 
-_DEFAULT_TRANSLATION_PROMPT = """Você é um tradutor profissional especializado em manhwa e webtoon para narração em áudio.
+_DEFAULT_TRANSLATION_PROMPT = """Você é um tradutor literário de elite, especializado em localizar roteiros de manhwa para narração em áudio no idioma {language_name}.
 
-Idioma de destino: {language_name}
-Idioma de origem: português brasileiro
+Sua missão: traduzir o conteúdo revisado mantendo a emoção, a gíria e o "feeling" do original, mas adaptando para a cultura do idioma alvo.
 
-REGRAS OBRIGATÓRIAS:
-1. Traduza com naturalidade no idioma alvo — não traduza literalmente palavra por palavra
-2. Mantenha o tom narrativo, a emoção e o ritmo do texto original
-3. Nomes próprios de personagens: mantenha como estão (não traduza nomes)
-4. A tradução deve soar como narração de áudio, não como texto escrito
-5. Cada parágrafo deve fluir para o próximo (mesma coesão do original)
-6. Mantenha o mesmo número de parágrafos
+REGRAS DE OURO:
+1. **TRADUÇÃO EMOÇÃO-A-EMOÇÃO**: Não traduza literalmente. Use expressões naturais do idioma alvo ({language_name}) que transmitam o mesmo impacto emocional.
+2. **NATURALIDADE DE ÁUDIO**: O texto traduzido deve ser fácil de ler e soar como uma conversa ou narração natural, não como um texto traduzido pelo Google.
+3. **PRESERVAÇÃO DE NOMES**: Mantenha nomes próprios de personagens e lugares como estão, a menos que haja uma tradução oficial consagrada.
+4. **COESÃO**: Mantenha a ligação entre parágrafos (cohesion) para que o ouvinte não sinta pulos entre as faixas de áudio.
+5. **ESTRUTURA**: Mantenha exatamente o mesmo número de parágrafos.
 
-CONTEXTO em português (não traduza, só leia para entender a continuidade):
-[ANTES]: {context_before}
-[DEPOIS]: {context_after}
+CONTEXTO DE CONTINUIDADE (Referência do original):
+[ANTERIOR]: {context_before}
+[PRÓXIMO]: {context_after}
 
-BLOCO ATUAL em português para traduzir:
+---
+BLOCO ATUAL PARA TRADUZIR:
 {current_block_formatted}
 
-Responda SOMENTE com JSON válido, sem markdown, sem explicações:
+Responda APENAS com JSON válido:
 {{"paragrafos": ["texto traduzido 1", "texto traduzido 2", ...]}}
 
-O array deve ter exatamente {n} elementos, na mesma ordem dos parágrafos recebidos."""
+Gere exatamente {n} elementos."""
 
 
 class SettingsTab(QWidget):
@@ -3694,6 +3754,8 @@ class SettingsTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._per_lang_prompts = {}
+        self._current_prompt_lang = "Generic"
         self._setup_ui()
 
     def _setup_ui(self):
@@ -3718,10 +3780,13 @@ class SettingsTab(QWidget):
 
         gg.addWidget(QLabel("Modelo:"), 0, 0)
         self.model_combo = QComboBox()
-        # Modelos Solicitados
-        self.model_combo.addItem("Gemini 2.5 Flash (🔥 Recomendado)", "gemini-2.5-flash")
-        self.model_combo.addItem("Gemini 3 Flash", "gemini-3-flash-preview")
-        self.model_combo.addItem("Gemini 3.1 Flash", "gemini-3.1-flash-lite-preview")
+        # Modelos de Última Geração (Doc)
+        self.model_combo.addItem("Gemini 3.1 Pro (💎 SOTA Raciocínio)", "gemini-3.1-pro-preview")
+        self.model_combo.addItem("Gemini 3 Pro (🧠 Raciocínio Multimodal)", "gemini-3-pro-preview")
+        self.model_combo.addItem("Gemini 3 Flash (🚀 Melhor Custo/Benefício)", "gemini-3-flash-preview")
+        self.model_combo.addItem("Gemini 2.5 Pro (🎯 Complexidade)", "gemini-2.5-pro")
+        self.model_combo.addItem("Gemini 2.5 Flash (⚡ Velocidade)", "gemini-2.5-flash")
+        self.model_combo.addItem("Gemini 2.5 Flash Lite (☁️ Economia)", "gemini-2.5-flash-lite")
 
         self.model_combo.setEditable(False)
         self.model_combo.setMinimumHeight(40)
@@ -3861,16 +3926,38 @@ class SettingsTab(QWidget):
         vl.addWidget(rev_box)
 
         # ── 4. Prompt de Tradução ─────────────────────────────────────
-        tr_box = QGroupBox("🌐  Prompt de Tradução  (variáveis: {language_name} {context_before} {context_after} {current_block_formatted} {n})")
+        tr_box = QGroupBox("🌐  Prompt de Tradução")
         tv = QVBoxLayout(tr_box)
+        
+        # Per-language controls
+        per_lang_h = QHBoxLayout()
+        self.chk_per_lang_prompts = QCheckBox("Usar prompts específicos por idioma")
+        self.chk_per_lang_prompts.setToolTip("Se marcado, permite definir um prompt diferente para cada idioma selecionado.")
+        per_lang_h.addWidget(self.chk_per_lang_prompts)
+        
+        per_lang_h.addStretch()
+        per_lang_h.addWidget(QLabel("Editar prompt de:"))
+        self.combo_prompt_lang = QComboBox()
+        self.combo_prompt_lang.addItem("Genérico (Padrão)", "Generic")
+        # Will be updated with other languages later or kept dynamic
+        self.combo_prompt_lang.setFixedWidth(150)
+        self.combo_prompt_lang.currentIndexChanged.connect(self._on_prompt_lang_changed)
+        per_lang_h.addWidget(self.combo_prompt_lang)
+        tv.addLayout(per_lang_h)
+
+        info_tr = QLabel("Variáveis: {language_name} {context_before} {context_after} {current_block_formatted} {n}")
+        info_tr.setStyleSheet("color:#888; font-size:10px;")
+        tv.addWidget(info_tr)
+
         self.translation_prompt_edit = QTextEdit()
         self.translation_prompt_edit.setPlainText(_DEFAULT_TRANSLATION_PROMPT)
         self.translation_prompt_edit.setMinimumHeight(200)
         self.translation_prompt_edit.setFont(QFont("Consolas", 10))
+        self.translation_prompt_edit.textChanged.connect(self._on_translation_prompt_edited)
         tv.addWidget(self.translation_prompt_edit)
-        btn_reset_tr = QPushButton("↺  Restaurar Prompt Padrão")
-        btn_reset_tr.clicked.connect(
-            lambda: self.translation_prompt_edit.setPlainText(_DEFAULT_TRANSLATION_PROMPT))
+        
+        btn_reset_tr = QPushButton("↺  Restaurar Prompt Padrão (Idioma Atual)")
+        btn_reset_tr.clicked.connect(self._reset_current_translation_prompt)
         tv.addWidget(btn_reset_tr)
         vl.addWidget(tr_box)
 
@@ -4038,6 +4125,8 @@ class SettingsTab(QWidget):
                 "media_resolution": self.get_media_resolution(),
                 "revision_prompt": self.get_revision_prompt(),
                 "translation_prompt": self.get_translation_prompt(),
+                "use_per_language_prompts": self.chk_per_lang_prompts.isChecked(),
+                "per_language_translation_prompts": self._per_lang_prompts,
                 "language_mapping": getattr(self, "language_mapping", {})
             },
             "appearance": {
@@ -4080,25 +4169,23 @@ class SettingsTab(QWidget):
         if "media_resolution" in gem:
             idx = self.media_res_combo.findData(gem["media_resolution"])
             if idx >= 0: self.media_res_combo.setCurrentIndex(idx)
+            
         if "revision_prompt" in gem:
             self.revision_prompt_edit.setPlainText(gem["revision_prompt"])
         if "translation_prompt" in gem:
             self.translation_prompt_edit.setPlainText(gem["translation_prompt"])
+
+        # Per-language prompts
+        self.chk_per_lang_prompts.setChecked(gem.get("use_per_language_prompts", False))
+        self._per_lang_prompts = gem.get("per_language_translation_prompts", {})
+        self._update_prompt_lang_combo()
+        self.combo_prompt_lang.setCurrentIndex(0) # Generic
 
         if "languages" in gem:
             mapping = {"en": self.chk_en, "es": self.chk_es, "fr": self.chk_fr,
                        "de": self.chk_de, "ja": self.chk_ja, "ko": self.chk_ko}
             for code, chk in mapping.items():
-
                 chk.setChecked(code in gem["languages"])
-        if "chunk_size" in gem:
-            self.chunk_spin.setValue(int(gem["chunk_size"]))
-        if "overlap" in gem:
-            self.overlap_spin.setValue(int(gem["overlap"]))
-        if "revision_prompt" in gem:
-            self.revision_prompt_edit.setPlainText(gem["revision_prompt"])
-        if "translation_prompt" in gem:
-            self.translation_prompt_edit.setPlainText(gem["translation_prompt"])
 
         app_ = data.get("appearance", {})
         if "theme" in app_:
@@ -4362,6 +4449,47 @@ class SettingsTab(QWidget):
             except Exception as e:
                 QMessageBox.critical(self, "Erro", f"Falha ao importar: {e}")
 
+    def _update_prompt_lang_combo(self):
+        self.combo_prompt_lang.blockSignals(True)
+        current = self.combo_prompt_lang.currentData()
+        self.combo_prompt_lang.clear()
+        self.combo_prompt_lang.addItem("Genérico (Padrão)", "Generic")
+        
+        mapping = [
+            ("Inglês (en)", "en"), ("Espanhol (es)", "es"), ("Francês (fr)", "fr"),
+            ("Alemão (de)", "de"), ("Japonês (ja)", "ja"), ("Coreano (ko)", "ko"),
+        ]
+        for name, code in mapping:
+            self.combo_prompt_lang.addItem(name, code)
+            
+        idx = self.combo_prompt_lang.findData(current)
+        if idx >= 0:
+            self.combo_prompt_lang.setCurrentIndex(idx)
+        self.combo_prompt_lang.blockSignals(False)
+
+    def _on_prompt_lang_changed(self, index):
+        lang_code = self.combo_prompt_lang.currentData()
+        self._current_prompt_lang = lang_code
+        
+        self.translation_prompt_edit.blockSignals(True)
+        if lang_code == "Generic":
+            self.translation_prompt_edit.setPlainText(self.get_session()["gemini"].get("translation_prompt", _DEFAULT_TRANSLATION_PROMPT))
+        else:
+            prompt = self._per_lang_prompts.get(lang_code, _DEFAULT_TRANSLATION_PROMPT)
+            self.translation_prompt_edit.setPlainText(prompt)
+        self.translation_prompt_edit.blockSignals(False)
+
+    def _on_translation_prompt_edited(self):
+        lang_code = self._current_prompt_lang
+        text = self.translation_prompt_edit.toPlainText()
+        if lang_code and lang_code != "Generic":
+            self._per_lang_prompts[lang_code] = text
+        # If generic, it's handled by get_session directly from the widget
+
+    def _reset_current_translation_prompt(self):
+        self.translation_prompt_edit.setPlainText(_DEFAULT_TRANSLATION_PROMPT)
+        self._on_translation_prompt_edited()
+
 
 # ---------------------------------------------------------------------------
 # Janela Principal
@@ -4535,15 +4663,23 @@ class LanguageConfigCard(QFrame):
                 ("pf_dora","[PT-BR] Dora (F)"),("pm_alex","[PT-BR] Alex (M)"),
                 ("pm_santa","[PT-BR] Santa (M)"),
             ]
+            # Filtro por idioma
+            prefixes = KOKORO_LANG_MAP.get(self.lang_code, [])
             for voice_id, label in KOKORO_BUILTIN:
-                self.voice_combo.addItem(f"🎤 {label}", voice_id)
+                if not prefixes or any(voice_id.startswith(p) for p in prefixes):
+                    self.voice_combo.addItem(f"🎤 {label}", voice_id)
             # Custom .pt files
             base = Path(__file__).parent.parent / "Kokoro-TTS-Local-master" / "voices"
             if base.exists():
                 for p in sorted(base.glob("*.pt")):
                     self.voice_combo.addItem(f"💾 {p.stem} (Custom)", str(p))
         elif eng == "qwen":
-            self.voice_combo.addItems(["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"])
+            qp = {"zh": ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric"], "en": ["Ryan", "Aiden"], "ja": ["Ono_Anna"], "ko": ["Sohee"]}
+            rel = qp.get(self.lang_code, [])
+            if not rel:
+                self.voice_combo.addItems(["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"])
+            else:
+                self.voice_combo.addItems(rel)
             qdir = Path(__file__).parent / "qwen_voices"
             if qdir.exists():
                 for p in qdir.glob("*.pt"): self.voice_combo.addItem(p.stem, str(p))

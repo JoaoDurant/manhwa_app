@@ -613,6 +613,14 @@ class AudioPipeline(QObject):
 
         for idx, (paragraph, source_file, p_cfg) in enumerate(pending_paragraphs, start=start_index + 1):
             lang = p_cfg.get("lang", "en")
+            
+            # Mapeamento específico para Kokoro (1 letra: a=AmEn, p=PT-BR, etc)
+            _k_map = {"pt": "p", "pt-br": "p", "en": "a", "en-us": "a", "en-gb": "b", "es": "e", "fr": "f", "ja": "j", "zh": "z"}
+            kokoro_lang = _k_map.get(lang.lower(), "a")
+            
+            # Mapeamento para Chatterbox (Exige 2 letras: pt, es, en, etc)
+            chatter_lang = lang.lower().split("-")[0]
+
             voice_path = p_cfg.get("voice")
             engine_str = p_cfg.get("engine", self.tts_engine)
             p_speed = p_cfg.get("speed", self.speed)
@@ -687,16 +695,12 @@ class AudioPipeline(QObject):
                     import time
                     t0_gen = time.time()
                     logger.info(f"[PIPELINE] Iniciando geração de áudio (Parágrafo {idx}) | Texto len: {len(tts_text_input)} chars | Engine: {engine_str}")
-                    logger.info(f"[PIPELINE-DEBUG] Final voice for Kokoro='{voice_path}', engine='{engine_str}'")
                     
                     # --- NOVO DISPATCHER UNIFICADO (engine.py + utils.py) ---
                     # Substitui os blocos If/Else fragmentados por um ponto único de entrada
                     
                     active_eng = getattr(_engine, "get_active_engine")() if hasattr(_engine, "get_active_engine") else "none"
                     current_model = getattr(_engine, "loaded_model_type", "none")
-                    
-                    print(f"[DEBUG] AudioPipeline: engine_str='{engine_str}', model_type='{self.model_type}'")
-                    print(f"[DEBUG] Engine State: active='{active_eng}', loaded_type='{current_model}'")
 
                     # [BUG 2 FIX] _needs_engine_switch: mapeia nomes de engine para sistemas
                     # 'kokoro' é um sistema separado de 'chatterbox' (turbo/original/multilingual).
@@ -742,8 +746,6 @@ class AudioPipeline(QObject):
                         import engine as eng_local
                         active_eng = getattr(eng_local, "get_active_engine")() if hasattr(eng_local, "get_active_engine") else "none"
                         logger.info(f"[PIPELINE] Troca de engine confirmada: {active_eng}")
-                    else:
-                        print(f"[DEBUG] Switch não necessário: {active_eng}/{current_model} já é o engine correto")
 
 
                     success = _utils.generate_paragraph_audio(
@@ -752,6 +754,8 @@ class AudioPipeline(QObject):
                         engine_name=engine_str,
                         audio_prompt_path=voice_path,
                         kokoro_voice=voice_path,  # [FIX] Kokoro expects 'kokoro_voice' in kwargs
+                        kokoro_lang=kokoro_lang,   # [FIX] Idioma de 1 letra para Kokoro
+                        language=chatter_lang,      # [FIX] Idioma de 2 letras para Chatterbox (Multilingual)
                         qwen_speaker=self.qwen_speaker if hasattr(self, 'qwen_speaker') else "Ryan",
                         qwen_language="Auto",
                         indextts_speed=p_speed,

@@ -37,56 +37,54 @@ LANGUAGE_NAMES: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # Prompts do sistema
 # ---------------------------------------------------------------------------
+_REVISION_SYSTEM = """Você é um editor literário especialista em transformar roteiros brutos de manhwa e webtoon em narrações envolventes e profissionais.
 
-_REVISION_SYSTEM = """Você é um editor profissional especializado em roteiros de manhwa e webtoon narrados em áudio.
+Sua tarefa: reescrever e refinar o BLOCO ATUAL de parágrafos para que soem como um audiobook de alta qualidade ou uma narração de vídeo profissional.
 
-Sua tarefa: revisar APENAS os parágrafos do BLOCO ATUAL.
+REGRAS DE OURO:
+1. **TRANSFORMAÇÃO CRIATIVA**: Não se limite a corrigir gramática. Melhore o vocabulário, crie suspense e use uma linguagem que prenda o ouvinte. Pode expandir ligeiramente o texto para melhorar a imersão.
+2. **FLUIDEZ NARRATIVA**: Conecte os parágrafos. Se um parágrafo termina com uma pergunta ou um cliffhanger, garanta que o próximo mantenha o ritmo.
+3. **LIMPEZA TOTAL**: Remova TODA a "sujeira" visual: símbolos (*, #, →, — ou [ ]), nomes de personagens antes da fala (Ex: "João: Olá" -> "Olá"), onomatopeias gráficas e descrições técnicas de cena.
+4. **NATURALIDADE**: Números devem ser escritos por extenso ("7" -> "sete"). Siglas devem ser expandidas ("km" -> "quilômetros").
+5. **RITMO**: Quebre frases longas que seriam difíceis de narrar sem pausa para respirar.
+6. **ESTRUTURA**: Mantenha exatamente o mesmo número de parágrafos no JSON de saída para sincronia com o sistema.
 
-REGRAS OBRIGATÓRIAS:
-1. Mantenha o sentido e a narrativa original — não reescreva, apenas corrija e melhore fluidez
-2. Cada parágrafo deve terminar de forma que o próximo continue naturalmente (coesão narrativa)
-3. Remova ou substitua: símbolos especiais (*, #, →, —), reticências excessivas (... ... ...), onomatopeias escritas (BOOM!, POW!), parênteses com indicações de cena
-4. Escreva por extenso: números isolados vire palavras ("3" → "três"), siglas ambíguas explique ("km" → "quilômetros")
-5. Frases muito longas (mais de 40 palavras): quebre em duas frases naturais
-6. Não adicione frases novas — apenas refine o que existe
-7. Mantenha o mesmo número de parágrafos que recebeu
+CONTEXTO DE CONTINUIDADE (Apenas para referência, não edite):
+[ANTERIOR]: {context_before}
+[PRÓXIMO]: {context_after}
 
-CONTEXTO (não edite, apenas leia para entender a continuidade):
-[ANTES]: {context_before}
-[DEPOIS]: {context_after}
-
-BLOCO ATUAL para revisar:
+---
+BLOCO ATUAL PARA REESCREVER:
 {current_block_formatted}
 
-Responda SOMENTE com JSON válido, sem markdown, sem explicações:
+Responda APENAS com JSON válido:
 {{"paragrafos": ["texto revisado 1", "texto revisado 2", ...]}}
 
-O array deve ter exatamente {n} elementos, na mesma ordem dos parágrafos recebidos."""
+Gere exatamente {n} elementos."""
 
-_TRANSLATION_SYSTEM = """Você é um tradutor profissional especializado em manhwa e webtoon para narração em áudio.
+_TRANSLATION_SYSTEM = """Você é um tradutor literário de elite, especializado em localizar roteiros de manhwa para narração em áudio no idioma {language_name}.
 
-Idioma de destino: {language_name}
-Idioma de origem: {source_language_name}
+Sua missão: traduzir o conteúdo revisado mantendo a emoção, a gíria e o "feeling" do original, mas adaptando para a cultura do idioma alvo.
 
-REGRAS OBRIGATÓRIAS:
-1. Traduza com naturalidade no idioma alvo — não traduza literalmente palavra por palavra
-2. Mantenha o tom narrativo, a emoção e o ritmo do texto original
-3. Nomes próprios de personagens: mantenha como estão (não traduza nomes)
-4. A tradução deve soar como narração de áudio, não como texto escrito
-5. Cada parágrafo deve fluir para o próximo (mesma coesão do original)
-6. Mantenha o mesmo número de parágrafos
+REGRAS DE OURO:
+1. **TRADUÇÃO EMOÇÃO-A-EMOÇÃO**: Não traduza literalmente. Use expressões naturais do idioma alvo ({language_name}) que transmitam o mesmo impacto emocional.
+2. **NATURALIDADE DE ÁUDIO**: O texto traduzido deve ser fácil de ler e soar como uma conversa ou narração natural, não como um texto traduzido pelo Google.
+3. **PRESERVAÇÃO DE NOMES**: Mantenha nomes próprios de personagens e lugares como estão, a menos que haja uma tradução oficial consagrada.
+4. **COESÃO**: Mantenha a ligação entre parágrafos (cohesion) para que o ouvinte não sinta pulos entre as faixas de áudio.
+5. **ESTRUTURA**: Mantenha exatamente o mesmo número de parágrafos.
 
-CONTEXTO em português (não traduza, só leia para entender a continuidade):
-[ANTES]: {context_before}
-[DEPOIS]: {context_after}
+CONTEXTO DE CONTINUIDADE (Referência do original):
+[ANTERIOR]: {context_before}
+[PRÓXIMO]: {context_after}
 
-BLOCO ATUAL em português para traduzir:
+---
+BLOCO ATUAL PARA TRADUZIR:
 {current_block_formatted}
 
-Responda SOMENTE com JSON válido, sem markdown, sem explicações:
+Responda APENAS com JSON válido:
 {{"paragrafos": ["texto traduzido 1", "texto traduzido 2", ...]}}
 
-O array deve ter exatamente {n} elementos, na mesma ordem dos parágrafos recebidos."""
+Gere exatamente {n} elementos."""
 
 
 class GeminiProcessor:
@@ -102,6 +100,11 @@ class GeminiProcessor:
     def __init__(self, model_name: str = "gemini-2.0-flash"):
         self.model_name = model_name
         self._client = None  # inicializado em process() com a chave da UI
+        self._revision_prompt_tmpl = _REVISION_SYSTEM
+        self._translation_prompt_tmpl = _TRANSLATION_SYSTEM
+        self._overlap = 2
+        self._thinking_level = "high"
+        self._media_resolution = "media_resolution_high"
 
     # ------------------------------------------------------------------
     # Método principal
@@ -116,12 +119,13 @@ class GeminiProcessor:
         delay_seconds: float = 4.0,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         stop_event=None,
-        revision_prompt: str = None,
-        translation_prompt: str = None,
+        revision_prompt: Optional[str] = None,
+        translation_prompt: Optional[str] = None,
         chunk_size: int = 12,
         overlap: int = 2,
         thinking_level: str = "high",
         media_resolution: str = "media_resolution_high",
+        per_language_prompts: Optional[dict[str, str]] = None,
     ) -> dict[str, str]:
         """Revise and optionally translate a numbered .txt file.
 
@@ -150,16 +154,21 @@ class GeminiProcessor:
             self._client = genai.Client(api_key=api_key)
             from google.genai import types  # type: ignore[import]
             
-            config = None
-            if thinking_level and "gemini-3" in self.model_name:
-                config = types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_level=thinking_level)
-                )
+            is_thinking_model = any(k in self.model_name.lower() for k in ["thinking", "gemini-3", "gemini-2.5"])
+            
+            config_kwargs = {}
+            if thinking_level and is_thinking_model:
+                config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+            
+            # JSON Mode: Forçar saída estruturada
+            config_kwargs["response_mime_type"] = "application/json"
+
+            config = types.GenerateContentConfig(**config_kwargs)
 
             # Chamada mínima para validar a chave antes de processar o roteiro inteiro
             self._client.models.generate_content(
                 model=self.model_name,
-                contents="ok",
+                contents="Generate a single JSON word: {\"test\": \"ok\"}",
                 config=config
             )
             logger.info("API Key do Gemini validada com sucesso.")
@@ -195,8 +204,23 @@ class GeminiProcessor:
         # --- 3. Cache ---
         cache_dir = Path("gemini_cache")
         cache_dir.mkdir(exist_ok=True)
-        # Use content explicitly so edits bypass old cache
-        cache_key = hashlib.md5(raw_text.encode("utf-8")).hexdigest()[:8]
+        # Use content + prompts + params explicitly so edits bypass old cache
+        base_hash = hashlib.md5(raw_text.encode("utf-8")).hexdigest()[:8]
+        
+        # Include all settings that affect output
+        settings_payload = {
+            "rev_prompt": revision_prompt,
+            "trans_prompt": translation_prompt,
+            "per_lang": per_language_prompts,
+            "chunk": chunk_size,
+            "overlap": overlap,
+            "model": self.model_name
+        }
+        import json
+        settings_str = json.dumps(settings_payload, sort_keys=True)
+        settings_hash = hashlib.md5(settings_str.encode("utf-8")).hexdigest()[:8]
+
+        cache_key = f"{base_hash}_{settings_hash}"
         cache_file = cache_dir / f"{cache_key}_{txt_path_obj.stem}.json"
         cache = self._load_cache(cache_file, txt_path, total_paragraphs, languages)
 
@@ -305,9 +329,13 @@ class GeminiProcessor:
                     cache["revised"].get(str(num), text) for (num, text) in context_after
                 ]
 
+                # Use the custom prompt for this language if provided, else generic
+                current_translation_prompt = (per_language_prompts or {}).get(lang) or self._translation_prompt_tmpl
+
                 translated = self._call_with_retry(
                     prompt=self._build_translation_prompt(
-                        target_name, source_name, ctx_before_rev, current_block_revised, ctx_after_rev
+                        target_name, source_name, ctx_before_rev, current_block_revised, ctx_after_rev,
+                        prompt_override=current_translation_prompt
                     ),
                     expected_count=len(current_block_revised),
                     fallback_texts=[p[1] for p in current_block_revised],
@@ -369,7 +397,7 @@ class GeminiProcessor:
 
     def _split_chunk_context(
         self, paragraphs: list[tuple[int, str]], chunk_nums: list[int]
-    ) -> tuple[list[str], list[tuple[int, str]], list[str]]:
+    ) -> tuple[list[tuple[int, str]], list[tuple[int, str]], list[tuple[int, str]]]:
         """Dado um chunk, retorna o contexto anterior, o bloco atual e o contexto posterior."""
         overlap = getattr(self, "_overlap", 2)
         start_idx = -1
@@ -382,14 +410,14 @@ class GeminiProcessor:
         
         # Contexto anterior (overlap parágrafos antes)
         before_start = max(0, start_idx - overlap)
-        context_before = [p[1] for p in paragraphs[before_start:start_idx]]
+        context_before = paragraphs[before_start:start_idx]
         
         # Bloco atual
         current_block = paragraphs[start_idx:end_idx]
         
         # Contexto posterior (overlap parágrafos depois)
         after_end = min(len(paragraphs), end_idx + overlap)
-        context_after = [p[1] for p in paragraphs[end_idx:after_end]]
+        context_after = paragraphs[end_idx:after_end]
         
         return context_before, current_block, context_after
 
@@ -397,10 +425,10 @@ class GeminiProcessor:
         return "\n".join(f"{num}. {text}" for num, text in block)
 
     def _build_revision_prompt(
-        self, context_before: list[str], current_block: list[tuple[int, str]], context_after: list[str]
+        self, context_before: list[tuple[int, str]], current_block: list[tuple[int, str]], context_after: list[tuple[int, str]]
     ) -> str:
-        ctx_b = "\n".join(context_before) if context_before else "(início do texto)"
-        ctx_a = "\n".join(context_after) if context_after else "(fim do texto)"
+        ctx_b = "\n".join(t for n, t in context_before) if context_before else "(início do texto)"
+        ctx_a = "\n".join(t for n, t in context_after) if context_after else "(fim do texto)"
         blk = self._format_block(current_block)
         n = len(current_block)
         return self._revision_prompt_tmpl.format(
@@ -414,15 +442,18 @@ class GeminiProcessor:
         self,
         language_name: str,
         source_language_name: str,
-        context_before: list[str],
+        context_before: list[tuple[int, str]],
         current_block: list[tuple[int, str]],
-        context_after: list[str],
+        context_after: list[tuple[int, str]],
+        prompt_override: str = None,
     ):
-        ctx_b = "\n".join(context_before) if context_before else "(início do texto)"
-        ctx_a = "\n".join(context_after) if context_after else "(fim do texto)"
+        ctx_b = "\n".join(p[1] for p in context_before) if context_before else "(início do texto)"
+        ctx_a = "\n".join(p[1] for p in context_after) if context_after else "(fim do texto)"
         blk = self._format_block(current_block)
         n = len(current_block)
-        return self._translation_prompt_tmpl.format(
+        
+        tmpl = prompt_override or self._translation_prompt_tmpl
+        return tmpl.format(
             language_name=language_name,
             source_language_name=source_language_name,
             context_before=ctx_b,
@@ -444,7 +475,9 @@ class GeminiProcessor:
         
         # Build config
         config_kwargs = {}
-        if "gemini-3" in self.model_name:
+        is_thinking_model = "thinking" in self.model_name.lower() or "gemini-2.0-flash-thinking" in self.model_name.lower()
+        
+        if is_thinking_model:
             config_kwargs["thinking_config"] = types.ThinkingConfig(
                 thinking_level=self._thinking_level
             )
@@ -465,12 +498,13 @@ class GeminiProcessor:
                 )
 
                 raw = response.text.strip()
-                # Remover blocos markdown se o modelo os incluir inadvertidamente
-                if raw.startswith("```"):
-                    raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.IGNORECASE)
-                    raw = re.sub(r"\n?```$", "", raw)
-
-                data = json.loads(raw)
+                
+                # Extração Robusta de JSON (procurar o primeiro { e o último })
+                extracted = self._extract_json(raw)
+                if not extracted:
+                    raise ValueError("Nenhum bloco JSON válido encontrado na resposta.")
+                
+                data = json.loads(extracted)
                 items = data.get("paragrafos", data.get("paragraphs", []))
 
                 if not isinstance(items, list):
@@ -509,6 +543,17 @@ class GeminiProcessor:
             f"Esgotadas {max_retries} tentativas. Usando {expected_count} parágrafos originais."
         )
         return fallback_texts
+
+    def _extract_json(self, text: str) -> Optional[str]:
+        """Extrai o conteúdo entre o primeiro { e o último } na string."""
+        try:
+            # Tentar encontrar o bloco JSON
+            match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+            if match:
+                return match.group(0)
+            return None
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Cache helpers

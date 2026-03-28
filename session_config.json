@@ -1,11 +1,11 @@
 {
   "theme": "🌑 Dark (Padrão)",
-  "bg_overlay_alpha": 174,
+  "bg_overlay_alpha": 220,
   "audio_tab": {
-    "project": "testeeee",
+    "project": "aaa",
     "output_root": "output",
     "preset_lang": "en",
-    "preset_voice": "Sem clonagem (Voz do Modelo)"
+    "preset_voice": "af_heart"
   },
   "language_config_tab": {
     "language_mapping": {
@@ -31,7 +31,7 @@
     }
   },
   "tts_tab": {
-    "tts_engine": "chatterbox",
+    "tts_engine": "kokoro",
     "model_type": "turbo",
     "temperature": 0.85,
     "speed": 1.0,
@@ -81,27 +81,30 @@
   },
   "settings_tab": {
     "gemini": {
-      "api_key": "AIzaSyDBSxKkopBc2Dc60pE8G4ha6O6SU0cimYM",
+      "api_key": "AIzaSyDaCh0AJ0RH7uB1-JV577H_DBOOYm-VbRQ",
       "api_keys": [
-        "AIzaSyDBSxKkopBc2Dc60pE8G4ha6O6SU0cimYM"
+        "AIzaSyD7Y4jHPzYBAEApaXzC7Y5uCeA7kQEPIB8",
+        "AIzaSyDaCh0AJ0RH7uB1-JV577H_DBOOYm-VbRQ"
       ],
-      "model_name": "gemini-3.1-flash-lite-preview",
+      "model_name": "gemini-3-flash-preview",
       "delay": 4,
-      "languages": [
-        "en",
-        "es"
-      ],
+      "languages": [],
       "chunk_size": 10,
       "overlap": 5,
       "thinking_level": "medium",
       "media_resolution": "media_resolution_ultra_high",
-      "revision_prompt": "Você é um editor profissional especializado em roteiros de manhwa e webtoon narrados em áudio.\n\nSua tarefa: revisar APENAS os parágrafos do BLOCO ATUAL.\n\nREGRAS OBRIGATÓRIAS:\n1. Mantenha o sentido e a narrativa original — não reescreva, apenas corrija e melhore fluidez\n2. Cada parágrafo deve terminar de forma que o próximo continue naturalmente (coesão narrativa)\n3. Remova ou substitua: símbolos especiais (*, #, →, —), reticências excessivas (... ... ...), onomatopeias escritas (BOOM!, POW!), parênteses com indicações de cena\n4. Escreva por extenso: números isolados vire palavras (\"3\" → \"três\"), siglas ambíguas explique (\"km\" → \"quilômetros\")\n5. Frases muito longas (mais de 40 palavras): quebre em duas frases naturais\n6. Não adicione frases novas — apenas refine o que existe\n7. Mantenha o mesmo número de parágrafos que recebeu\n\nCONTEXTO (não edite, apenas leia para entender a continuidade):\n[ANTES]: {context_before}\n[DEPOIS]: {context_after}\n\nBLOCO ATUAL para revisar:\n{current_block_formatted}\n\nResponda SOMENTE com JSON válido, sem markdown, sem explicações:\n{{\"paragrafos\": [\"texto revisado 1\", \"texto revisado 2\", ...]}}\n\nO array deve ter exatamente {n} elementos, na mesma ordem dos parágrafos recebidos.",
-      "translation_prompt": "Você é um tradutor profissional especializado em manhwa e webtoon para narração em áudio.\n\nIdioma de destino: {language_name}\nIdioma de origem: português brasileiro\n\nREGRAS OBRIGATÓRIAS:\n1. Traduza com naturalidade no idioma alvo — não traduza literalmente palavra por palavra\n2. Mantenha o tom narrativo, a emoção e o ritmo do texto original\n3. Nomes próprios de personagens: mantenha como estão (não traduza nomes)\n4. A tradução deve soar como narração de áudio, não como texto escrito\n5. Cada parágrafo deve fluir para o próximo (mesma coesão do original)\n6. Mantenha o mesmo número de parágrafos\n\nCONTEXTO em português (não traduza, só leia para entender a continuidade):\n[ANTES]: {context_before}\n[DEPOIS]: {context_after}\n\nBLOCO ATUAL em português para traduzir:\n{current_block_formatted}\n\nResponda SOMENTE com JSON válido, sem markdown, sem explicações:\n{{\"paragrafos\": [\"texto traduzido 1\", \"texto traduzido 2\", ...]}}\n\nO array deve ter exatamente {n} elementos, na mesma ordem dos parágrafos recebidos.",
+      "revision_prompt": "Você é um editor especializado em roteiros de manhwa/webtoon narrados em áudio.\nRevise APENAS os parágrafos do BLOCO ATUAL. Não altere a estrutura nem o número total de parágrafos.\n\n\n━━━ FORMATO DE SAÍDA (obrigatório) ━━━\nA saída deve ser assim:\n1. texto\n2. texto\n(e assim por diante)\nO número de linhas deve ser IDÊNTICO ao número de parágrafos do bloco.\n\n\n━━━ OBJETIVO ━━━\nTransforme o texto em narração contínua e envolvente.\nO ouvinte não deve perceber onde termina um parágrafo e começa outro.\nEscreva sempre em terceira pessoa, sem aspas, sem interrogação, sem exclamação.\nUse linguagem coloquial e direta, compatível com narração oral de manhwa.\nEvite termos formais ou literários como \"confeccionar\", \"natureza do objeto\".\n\n\n━━━ CONEXÃO ENTRE PARÁGRAFOS ━━━\nTrate o ponto final de cada parágrafo como vírgula para o seguinte.\nQuando a ação seguinte for consequência direta ou continuação da anterior,\ninicie-o com conector: \"e\", \"mas\", \"então\", \"porém\", \"até que\", \"enquanto\", \"quando\", \"pois\".\nUse \"até que\" apenas quando uma ação em curso é fisicamente interrompida por outra.\nEstado estático (alguém desesperado, em silêncio, esperando) não é ação interrompível — use \"nesse instante\", \"então\" ou \"e\". ← NOVO v7\n\n\nEXEMPLO de \"até que\" correto:\n✓  \"o monge fala com o garoto até que um grito feminino corta a conversa\"\n\n\nEXEMPLO de \"até que\" errado — interrupção de estado:\n❌ \"o arremessador sente a pressão no monte / até que o narrador anuncia Kim Dan\" → use \"nesse instante o narrador anuncia\" ← NOVO v7\n\n\nEXEMPLO de \"até que\" errado — transição de diálogo:\n❌ \"até que o ancião pergunta se ele já vai para o jogo\" → use \"então o ancião pergunta\"\n\n\n━━━ PRONOMES E SUJEITO ━━━\nQuando o mesmo personagem continua a ação no parágrafo seguinte,\nomita o pronome ou nome — não repita \"ele fala\", \"ela diz\", \"o protagonista então\".\nUse pronome ou nome só quando houver troca de personagem ou risco real de ambiguidade.\nQuando a omissão gerar dúvida sobre quem executa a ação, reintroduza o nome — clareza tem prioridade sobre concisão.\nQuando o parágrafo abre com gerúndio, nomeie o agente dentro da mesma frase — não confie no sujeito do parágrafo anterior.\nQuando o parágrafo anterior tem um personagem como sujeito e o seguinte muda, reintroduza o nome no início.\nQuando dois ou mais personagens aparecem no parágrafo anterior, nomeie explicitamente quem age no parágrafo seguinte.\nNunca abra com gerúndio sem nomear o agente na mesma frase quando dois personagens estão em cena.\nEvite agente oculto em voz passiva: troque \"recebe a instrução de\", \"ouve que deve\" por quem de fato age.\n\n\n━━━ REDUNDÂNCIA ━━━\nAntes de revisar cada parágrafo, leia os 2 seguintes.\nSe dois parágrafos vizinhos descrevem a mesma ação com palavras diferentes,\nelimine a repetição no segundo — nunca no primeiro.\nPrefira sintetizar a cortar.\n\n\n━━━ RITMO DE AÇÃO ━━━\nEm cenas de ação rápida (arremesso, luta, corrida, impacto),\nuna parágrafos com vírgula em vez de ponto final para criar aceleração.\n\n\nEXEMPLO:\n❌ \"ele arremessa. a bola sobe. o público grita\"\n✓  \"ele arremessa, a bola dispara para o alto e o público explode\"\n\n\n━━━ EXPRESSÕES A ELIMINAR ━━━\n- \"com um sorriso\" e variações (\"sorriu\", \"com um leve sorriso\") → ação concreta ou omissão\n- \"de forma [adj]\", \"de um jeito [adj]\", \"com um ar [adj]\" → gesto concreto ou omissão\n- \"com um semblante [adj]\", \"com uma expressão [adj]\" → gesto concreto ou omissão\n- Expressões faciais abstratas: \"expressão determinada\", \"semblante sério\" → ação corporal ou omissão\n- \"ecoam\", \"ressoam\", \"ficam no ar\" como metáfora de lembrança → substitua por imagem de distância (\"ficam para trás\", \"se perdem no caminho\") ← NOVO v7\n- Exceção permitida: imagens cinematográficas específicas — \"o olhar fica afiado\", \"os olhos estreitam\"\n- Quando não houver ação concreta, omita — nunca troque por sinônimo igualmente vago\n- Aspas, interrogação e exclamação → proibidos no texto narrado\n\n\n━━━ VARIAÇÃO SINTÁTICA ━━━\nProíba 3 ou mais aberturas seguidas com gerúndio.\nIsso inclui gerúndios diretos (\"Fazendo...\") e indiretos (\"fazendo com que\", \"deixando-o\").\nAlterne com: sujeito direto, conector inicial (\"e\", \"mas\"), advérbio de tempo (\"logo\", \"então\", \"ali\").\nTodo parágrafo precisa de pelo menos um verbo conjugado — evite frases nominais sem verbo. ← NOVO v7\n\n\n━━━ TRANSIÇÃO DE TOM ━━━\nQuando a cena muda de leve para grave (ou vice-versa),\no último parágrafo da cena anterior deve ter peso proporcional à virada.\nNão termine uma cena cômica e abra cena tensa com a mesma cadência.\n\n\n━━━ REGRAS TÉCNICAS ━━━\n- Remova símbolos (* # → —), onomatopeias escritas e parênteses de cena\n- Números por extenso; siglas explicadas na primeira ocorrência\n- Frases acima de 40 palavras: quebre em duas naturais\n- Mantenha exatamente o mesmo número de parágrafos do bloco\n- Não invente informações novas\n- Sem aspas no texto narrado\n- Não elimine detalhes de caracterização (ex: \"sem dó\", \"confiante\") a menos que sejam redundantes com o parágrafo imediatamente anterior\n- Mantenha vírgulas em orações subordinadas longas e em apostos — a pontuação interna guia a respiração do narrador\n\n\n━━━ CONTEXTO (leia para manter coerência, não edite) ━━━\n[ANTES]: {context_before}\n[DEPOIS]: {context_after}\n\n\n━━━ BLOCO ATUAL ━━━\n{current_block_formatted}\n\n",
+      "translation_prompt": "Você é um tradutor nativo dos Estados Unidos, fluente em inglês americano e português do Brasil.\n\n\nSua tarefa é traduzir o texto abaixo para o inglês americano, mantendo o estilo original da escrita — um tom informal, dinâmico, sarcástico e narrativo, com um toque de humor, porem adequando a cultura dos E.U.A usando uma linguagem acessivel\n\n\nA tradução deve seguir as diretrizes de linguagem do YouTube, garantindo que o conteúdo seja adequado para monetização e engajamento com o público da plataforma.\n\n\nMatenha o texto leve, use eufemismo para isso, evitando palavras como merda, droga, morte.\n\n\nAdapte as piadas para algo similar para os nativos americanos.\n\n\nCada parágrafo esta numerado, (referente a imagem de cada quadro do manhwa)  para o texto não sair da sicronização.\n\n\na palavra Prota e a abreviação de Protagonista\n\n\nCorrija as inconcistencia caso encontre.\n\n\nCulturalmente no Brasil a palavra Protagonista é chamada de Prota, porem deve ser adptada para a cultura dos E.U.A\n\n\nTodos os numeros e valores devem ser obrigatóriamente transcritos por extenso (exeto a Lista numerica dos paragrafos, 1., 2. 3. ...)\n\n\nAo traduzir coloque o texto dentro de um canva\n\n\nnão mude a quantidade de parágrafos nem junte eles\n\n",
+      "use_per_language_prompts": true,
+      "per_language_translation_prompts": {
+        "es": "Você é um tradutor nativo da América Latina, fluente em espanhol latino-americano e português do Brasil.\nSua tarefa é traduzir o texto abaixo do português do Brasil para o espanhol latino-americano, mantendo o estilo original da escrita — um tom informal, dinâmico, sarcástico e narrativo, com um leve toque de humor, sempre adaptando o conteúdo à cultura latino-americana com uma linguagem acessível e natural.\nA tradução deve seguir rigorosamente as diretrizes de linguagem do YouTube, garantindo que o conteúdo seja adequado para monetização e engajamento com o público da plataforma.\nMantenha o texto leve e fluido, usando eufemismos quando necessário, evitando palavras ofensivas ou sensíveis como termos explícitos relacionados a fezes, drogas ou morte.\nAdapte piadas, expressões e referências culturais para equivalentes que façam sentido para falantes nativos do espanhol latino-americano, preservando a intenção original do humor.\nCada parágrafo está numerado (referente à imagem de cada quadro do manhwa) e essa numeração deve ser mantida exatamente para que o texto não saia da sincronização.\nA palavra “Prota” é uma abreviação de “Protagonista”. Caso apareça no texto, adapte para uma forma natural e comum no espanhol latino-americano, evitando termos que soem artificiais ou excessivamente formais.\nCaso encontre inconsistências narrativas, de continuidade ou de sentido, corrija-as de forma discreta, sem alterar a intenção original da cena.\nTodos os números e valores devem ser obrigatoriamente escritos por extenso no corpo do texto, com exceção da numeração dos parágrafos (um, dois, três não — manter 1., 2., 3. …).\nAo finalizar a tradução, todo o texto deve ser colocado dentro de um canvas.\n\n\n",
+        "en": "Você é um tradutor nativo dos Estados Unidos, fluente em inglês americano e português do Brasil.\n\n\nSua tarefa é traduzir o texto abaixo para o inglês americano, mantendo o estilo original da escrita — um tom informal, dinâmico, sarcástico e narrativo, com um toque de humor, porem adequando a cultura dos E.U.A usando uma linguagem acessivel\n\n\nA tradução deve seguir as diretrizes de linguagem do YouTube, garantindo que o conteúdo seja adequado para monetização e engajamento com o público da plataforma.\n\n\nMatenha o texto leve, use eufemismo para isso, evitando palavras como merda, droga, morte.\n\n\nAdapte as piadas para algo similar para os nativos americanos.\n\n\nCada parágrafo esta numerado, (referente a imagem de cada quadro do manhwa)  para o texto não sair da sicronização.\n\n\na palavra Prota e a abreviação de Protagonista\n\n\nCorrija as inconcistencia caso encontre.\n\n\nCulturalmente no Brasil a palavra Protagonista é chamada de Prota, porem deve ser adptada para a cultura dos E.U.A\n\n\nTodos os numeros e valores devem ser obrigatóriamente transcritos por extenso (exeto a Lista numerica dos paragrafos, 1., 2. 3. ...)\n\n\nAo traduzir coloque o texto dentro de um canva\n\n\nnão mude a quantidade de parágrafos nem junte eles\n\n"
+      },
       "language_mapping": {}
     },
     "appearance": {
       "theme": "🌑 Dark (Padrão)",
-      "bg_overlay_alpha": 174
+      "bg_overlay_alpha": 220
     },
     "paths": {
       "default_output": "output",
@@ -113,20 +116,10 @@
     "source_lang": "pt",
     "selected_langs": [
       "pt",
-      "en"
+      "en",
+      "es"
     ],
-    "overrides": {
-      "pt": {
-        "voice": null,
-        "engine": "kokoro",
-        "model_type": "default",
-        "speed": 1.0,
-        "temperature": 0.65,
-        "exaggeration": 0.0,
-        "cfg_weight": 0.5,
-        "seed": -1
-      }
-    },
+    "overrides": {},
     "use_saved_tts": true
   }
 }

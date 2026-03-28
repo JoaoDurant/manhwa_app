@@ -154,6 +154,24 @@ for _mod_path, _attr in _analyzer_patches.items():
         logger.info(f"[PATCH] AlignmentStreamAnalyzer substituido em {_mod_path}")
 del _mod_path, _attr, _mod, _analyzer_patches
 
+# =============================================================================
+# GLOBAL MONKEY PATCH — VoiceEncoder DType Fix
+#
+# WHY THIS IS NEEDED:
+#   When cloning a voice via `audio_prompt_path`, librosa or PySTFT may produce 
+#   float64 mels. The VoiceEncoder's LSTM weights are float32, causing a crash:
+#   "RNN input dtype (torch.float64) does not match weight dtype (torch.float32)"
+# =============================================================================
+try:
+    from chatterbox.models.voice_encoder.voice_encoder import VoiceEncoder
+    _orig_ve_forward = VoiceEncoder.forward
+    def _patched_ve_forward(self, mels):
+        return _orig_ve_forward(self, mels.to(torch.float32))
+    VoiceEncoder.forward = _patched_ve_forward
+    logger.info("[PATCH] VoiceEncoder.forward patcheado para forçar torch.float32 nas mels.")
+except ImportError:
+    pass
+
 # Selecionar classe preferida: Turbo > Original
 if CHATTERBOX_TURBO_AVAILABLE:
     _ChatterboxClass  = _ChatterboxTurbo
@@ -225,8 +243,10 @@ except ImportError:
 
 # Globals Kokoro
 kokoro_pipeline     = None
-KOKORO_LOADED: bool = False
-_kokoro_lock        = threading.Lock()
+KOKORO_LOADED = False
+kokoro_loaded_lang = None  # Tracks the language currently bound to KPipeline
+_kokoro_lock = threading.Lock()
+_kokoro_voice_cache = {}
 
 # =============================================================================
 # QWEN3 TTS — import defensivo (padrao TTS-Story)
@@ -964,17 +984,17 @@ def load_kokoro_engine(
     Carrega KPipeline como singleton.
     PADRAO TTS-STORY: KPipeline(lang_code=lang_code, device=device)
 
-    lang_codes: "a"=AmEn, "b"=BrEn, "j"=Japanese, "z"=Chinese,
-                "p"=PT-BR, "e"=Spanish, "f"=French
+    lang_p = PT-BR, lang_e = Spanish, lang_f = French, etc.
     """
-    global kokoro_pipeline, KOKORO_LOADED
+    global kokoro_pipeline, KOKORO_LOADED, kokoro_loaded_lang
     global _is_loading, _is_generating
 
     if _is_generating:
         print("IGNORADO: geração já em andamento (kokoro)")
         return False
 
-    if KOKORO_LOADED: return True
+    if KOKORO_LOADED and kokoro_pipeline is not None and kokoro_loaded_lang == lang_code:
+        return True
 
     with _engine_lock:
         if _is_loading:
@@ -983,7 +1003,8 @@ def load_kokoro_engine(
 
     try:
         with _kokoro_lock:
-            if KOKORO_LOADED: return True
+            if KOKORO_LOADED and kokoro_pipeline is not None and kokoro_loaded_lang == lang_code:
+                return True
 
             if not KOKORO_AVAILABLE:
                 logger.error(
@@ -1002,8 +1023,9 @@ def load_kokoro_engine(
             logger.info(f"Carregando Kokoro | lang={lang_code} | device={resolved}")
             kokoro_pipeline = KPipeline(lang_code=lang_code, device=resolved)
             KOKORO_LOADED   = True
-            print(f"[ENGINE] [Kokoro] Carregado com sucesso em {resolved} | Tempo: {time.time() - t0_kload:.2f}s")
-            logger.info(f"Kokoro carregado com sucesso em {resolved}.")
+            kokoro_loaded_lang = lang_code
+            print(f"[ENGINE] [Kokoro] Carregado com sucesso em {resolved} | lang: {lang_code} | Tempo: {time.time() - t0_kload:.2f}s")
+            logger.info(f"Kokoro carregado com sucesso em {resolved} para lang '{lang_code}'.")
             if torch.cuda.is_available(): torch.cuda.synchronize()
             return True
         except Exception as e:

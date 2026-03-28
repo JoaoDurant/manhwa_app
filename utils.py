@@ -1471,6 +1471,7 @@ def generate_paragraph_audio(
     chatter_e   = kwargs.get("exaggeration", 0.5)
     chatter_c   = kwargs.get("cfg_weight", 0.5)
     chatter_s   = kwargs.get("seed", 0)
+    chatter_l   = kwargs.get("language", "a")
 
     audio_array = None
     sample_rate = None
@@ -1482,10 +1483,9 @@ def generate_paragraph_audio(
         # KOKORO
         # =========================================================
         if e in ("kokoro",):
-            if not KOKORO_LOADED:
-                if not load_kokoro_engine(lang_code=kokoro_lang):
-                    logger.error("[DISPATCHER] Abortado: Falha no carregamento do Kokoro.")
-                    return False
+            if not load_kokoro_engine(lang_code=kokoro_lang):
+                logger.error("[DISPATCHER] Abortado: Falha no carregamento do Kokoro.")
+                return False
             logger.info(f"[DISPATCHER] Iniciando geracao Kokoro | Voice: {kokoro_v}")
             raw_output = synthesize_kokoro(
                 text, voice=kokoro_v, speed=kokoro_s, lang_code=kokoro_lang
@@ -1553,7 +1553,7 @@ def generate_paragraph_audio(
             raw_output = synthesize(
                 text=text, audio_prompt_path=audio_prompt_path,
                 temperature=chatter_t, exaggeration=chatter_e, cfg_weight=chatter_c,
-                seed=chatter_s
+                seed=chatter_s, language=chatter_l
             )
             logger.debug(f"[DISPATCHER] Retorno bruto Chatterbox: {type(raw_output)}")
             audio_array = normalize_audio_output(raw_output)
@@ -1648,7 +1648,6 @@ def resolve_voice_path(voice_val: Any) -> Optional[str]:
         return None
         
     s_val = str(voice_val).strip()
-    print(f"[RESOLVE-DEBUG] voice_val={repr(voice_val)} | s_val={repr(s_val)}", flush=True)
     
     # Check for labels that mean "no cloning" or "default model voice"
     # Labels like "Sem clonagem (Voz do Modelo)" or "None" or "0" should be None

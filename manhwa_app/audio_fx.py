@@ -19,14 +19,15 @@ def apply_audio_post_processing(input_wav: str, output_wav: str, config: dict) -
     # Extrai configs do bloco "production" -> "audio" (ou usa fallbacks da interface antiga)
     prod_conf = config.get("production", {}).get("audio", {})
     
-    # Mapeamento dinâmico: se a config nova não existir, olha pra config antiga pra retrocompatibilidade
-    do_highpass = prod_conf.get("highpass", config.get("fx_enhancer", False))
-    do_lowpass  = prod_conf.get("lowpass", config.get("fx_noise_reduction", False))
-    do_deesser  = prod_conf.get("deesser", False)
-    do_compand  = prod_conf.get("compressor", config.get("fx_compressor", False))
-    do_reverb   = prod_conf.get("reverb", config.get("fx_reverb", False))
-    do_silence  = prod_conf.get("remove_silence", False)
-    do_loudnorm = prod_conf.get("normalize", config.get("fx_normalize", False))
+    # Mapeamento dinâmico: Prioriza a config nova (production.audio), 
+    # depois as novas keys de interface (fx_highpass, etc), e por fim fallbacks legados.
+    do_highpass = prod_conf.get("highpass",      config.get("fx_highpass", config.get("fx_enhancer", False)))
+    do_lowpass  = prod_conf.get("lowpass",       config.get("fx_noise_reduction", False))
+    do_deesser  = prod_conf.get("deesser",       config.get("fx_deesser", False))
+    do_compand  = prod_conf.get("compressor",    config.get("fx_compressor", False))
+    do_reverb   = prod_conf.get("reverb",        config.get("fx_reverb", False))
+    do_silence  = prod_conf.get("remove_silence", config.get("fx_silence", False))
+    do_loudnorm = prod_conf.get("normalize",      config.get("fx_loudnorm", config.get("fx_normalize", False)))
 
     filters = []
 

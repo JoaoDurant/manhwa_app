@@ -10,6 +10,34 @@ def remove_accents(text: str) -> str:
     nfkd_form = unicodedata.normalize('NFKD', text)
     return "".join([c for c in nfkd_form if not unicodedata.combining(c)])
 
+def convert_numbers(text: str, lang: str = "en") -> str:
+    """
+    Converte números para suas representações por extenso,
+    para garantir que a IA (e a verificação Whisper) validem a leitura corretamente.
+    Ex: 12 -> 'doze'
+    """
+    try:
+        from num2words import num2words
+    except ImportError:
+        return text
+
+    # Mapear idioma curto de TTS para idioma do num2words
+    l = lang.lower()
+    if l in ("p", "pt", "pt-br"): n2w_lang = "pt-br"
+    elif l in ("e", "es"): n2w_lang = "es"
+    elif l in ("f", "fr"): n2w_lang = "fr"
+    elif l in ("de",): n2w_lang = "de"
+    else: n2w_lang = "en"
+
+    def replace_num(match):
+        num_str = match.group()
+        try:
+            return num2words(int(num_str), lang=n2w_lang)
+        except Exception:
+            return num_str
+
+    return re.sub(r'\b\d+\b', replace_num, text)
+
 def clean_text(text: str) -> str:
     """
     Remove caracteres desnecessários, mantendo letras, números, espaços e pontuação básica.
@@ -35,8 +63,10 @@ def clean_text(text: str) -> str:
 def remove_prefixes(text: str) -> str:
     """
     Remove padrões numéricos iniciais de lista como '1. ', '2- ', '3)', '04. ' etc.
-    Exemplo: '1. Olá' -> 'Olá'
+    Remove também possíveis caracteres invisíveis ou de controle no início do texto.
     """
+    # Remove BOM e caracteres de controle no início
+    text = re.sub(r'^[\ufeff\x00-\x20\xa0]+', '', text)
     # Use re.sub repetidamente no caso de lixo empilhado, mas 1 vez já cobre 99%
     return re.sub(r'^\s*\d+[\.\-\)]\s*', '', text)
 
@@ -113,7 +143,7 @@ def apply_phonetic(text: str) -> str:
     
     return text
 
-def process_text(text: str, config: dict) -> str:
+def process_text(text: str, config: dict, lang: str = "en") -> str:
     """
     Pipeline principal para tratamento do texto antes do envio ao TTS.
     """
@@ -122,6 +152,10 @@ def process_text(text: str, config: dict) -> str:
         
     # Sempre remove prefixos númericos do início (1. 2.)
     text = remove_prefixes(text)
+
+    # Converte números por extenso se solicitado
+    if config.get("convert_numbers", True):
+        text = convert_numbers(text, lang)
     
     if config.get("clean_symbols", True):
         text = clean_text(text)

@@ -1474,7 +1474,7 @@ def generate_paragraph_audio(
     chatter_l   = kwargs.get("language", "a")
 
     audio_array = None
-    sample_rate = None
+    target_sample_rate = kwargs.get("sample_rate", 24000)
 
     try:
         t0_dispatch = time.time()
@@ -1569,6 +1569,23 @@ def generate_paragraph_audio(
         if audio_array is None:
             logger.error(f"[DISPATCHER] Engine '{e}' falhou silenciosamente (retorno None).")
             return False
+
+        # [NEW] Resampling if target_sample_rate differs from engine output rate
+        if target_sample_rate and sample_rate and target_sample_rate != sample_rate:
+            try:
+                import librosa
+                logger.info(f"[DISPATCHER] Resampling: {sample_rate}Hz → {target_sample_rate}Hz")
+                # Usa soxr_hq se disponível (muito mais rápido que kaiser_best no Windows)
+                res_type = 'soxr_hq'
+                try: 
+                    import soxr 
+                except ImportError: 
+                    res_type = 'kaiser_fast' # Fallback para rapidez se soxr estiver ausente
+                
+                audio_array = librosa.resample(y=audio_array, orig_sr=sample_rate, target_sr=target_sample_rate, res_type=res_type)
+                sample_rate = target_sample_rate
+            except Exception as e_res:
+                logger.warning(f"[DISPATCHER] Resampling falhou ({e_res}). Usando taxa original {sample_rate}Hz")
 
         # normalize_audio_output ja garante float32, mono e ndarray
         success = save_audio_to_file(audio_array, sample_rate, output_path)

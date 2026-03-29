@@ -2,10 +2,10 @@
   "theme": "🌑 Dark (Padrão)",
   "bg_overlay_alpha": 220,
   "audio_tab": {
-    "project": "aaa",
+    "project": "eng reincaned opa",
     "output_root": "output",
     "preset_lang": "en",
-    "preset_voice": "af_heart"
+    "preset_voice": "am_liam"
   },
   "language_config_tab": {
     "language_mapping": {
@@ -85,8 +85,8 @@
     "norm_loudness": true,
     "max_retries": 3,
     "whisper_model": "base",
-    "similarity_threshold": 0.97,
-    "use_spacy": false,
+    "similarity_threshold": 0.95,
+    "use_spacy": true,
     "ref_vad_trimming": false,
     "fx_highpass": true,
     "fx_deesser": true,
@@ -94,6 +94,7 @@
     "fx_silence": true,
     "fx_reverb": false,
     "fx_loudnorm": true,
+    "use_phonetic": false,
     "qwen_task": "CustomVoice",
     "qwen_instruct": "",
     "qwen_ref_text": ""
@@ -101,7 +102,7 @@
   "video_tab": {
     "layout": "mixed",
     "effect": "auto",
-    "transition": "fade",
+    "transition": "none",
     "transition_time": 0.05,
     "bg_music_path": "",
     "bg_music_volume": 10,
@@ -171,48 +172,40 @@
     }
   },
   "express_tab": {
-    "project_name": "primeiro_video",
+    "project_name": "aaaaa",
     "source_lang": "pt",
-    "selected_langs": [
-      "pt",
+    "target_langs": [
       "en",
       "es"
     ],
+    "use_saved_tts": true,
     "overrides": {
-      "pt": {
-        "voice": "pm_alex",
-        "engine": "kokoro",
-        "model_type": "default",
-        "speed": 1.0,
-        "temperature": 0.65,
-        "exaggeration": 0.0,
-        "cfg_weight": 0.5,
-        "seed": -1,
-        "custom_script_path": "C:/Users/desot/Downloads/MANHWA REINCARNED PT.txt"
-      },
       "en": {
         "voice": "am_liam",
         "engine": "kokoro",
         "model_type": "default",
-        "speed": 1.0,
+        "speed": 1.1,
         "temperature": 0.65,
         "exaggeration": 0.0,
         "cfg_weight": 0.5,
-        "seed": -1,
-        "custom_script_path": "C:/Users/desot/Downloads/MANHWA REINCARNED eng.txt"
+        "seed": 3000,
+        "custom_script_path": "C:/Users/desot/Downloads/MANHWA REINCARNED eng.txt",
+        "custom_images_path": null
       },
       "es": {
-        "voice": "E:\\audiobook_maker\\voices\\f5tts\\voz esp\\voz esp.wav",
+        "voice": null,
         "engine": "chatterbox",
         "model_type": "multilingual",
-        "speed": 1.0,
+        "speed": 1.1,
         "temperature": 0.65,
         "exaggeration": 0.0,
         "cfg_weight": 0.5,
         "seed": -1,
-        "custom_script_path": null
+        "custom_script_path": "C:/Users/desot/Downloads/MANHWA REINCARNED esp.txt",
+        "custom_images_path": null
       }
     },
-    "use_saved_tts": true
+    "base_txt": null,
+    "base_imgs": "C:/Users/desot/Downloads/nn/cortes/upscayl_png_digital-art-4x_2x"
   }
 }

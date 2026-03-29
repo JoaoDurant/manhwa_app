@@ -96,14 +96,25 @@ def split_into_paragraphs(text: str) -> List[str]:
     Divide o texto em parágrafos.
     O usuário utiliza Enter para separar parágrafos correspondentes a 1 arquivo de áudio.
     """
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Separa quebras explícitas (1 ou mais newlines representam parágrafos distintos)
-    raw = re.split(r"\n+", text)
+    # Remove BOM (Byte Order Mark) e normaliza quebras
+    text = text.replace('\ufeff', '').replace("\r\n", "\n").replace("\r", "\n")
+    
+    # Se o texto "fora de formato" usar quebras duplas para parágrafos, usamos isso.
+    # Caso contrário, separamos por cada quebra.
+    if "\n\n" in text:
+        raw = re.split(r"\n\n+", text)
+    else:
+        raw = re.split(r"\n+", text)
     
     result = []
     
     for block in raw:
-        clean_block = block.strip()
+        # Se o bloco começa com um número sozinho numa linha (ex: "1\nTexto"), é um número de painel de script. Removemos ele.
+        block = re.sub(r'^\s*\d+\s*\n+', '', block)
+        
+        # Transforma possíveis quebras de bloco "sujas" (ex: PDF ou colunas) em espaços
+        clean_block = block.replace("\n", " ")
+        clean_block = re.sub(r"\s+", " ", clean_block).strip()
         if clean_block and len(clean_block) >= 3:
             result.append(clean_block)
             
@@ -119,16 +130,14 @@ def _normalize_text_for_tts(text: str, lang: str = "en") -> str:
     # 1) Normalizar espaços duplos
     text = re.sub(r' {2,}', ' ', text)
 
-    # 2) Para ling. latinas (es, pt, it, fr, de): substituir vírgulas por pausa mais longa.
-    #    O alinhador trata vírgulas consecutivas como repetição de token e força EOS.
-    if lang in ("es", "pt", "it", "fr", "de"):
-        # Vírgula seguida de espaço e palavra -> ponto e vírgula (pausa mais longa e token distinto)
-        text = re.sub(r',\s+', '.  ', text)
-        # Vírgula seguida de aspas ou parênteses
-        text = re.sub(r',(["\'«\(\)])', r'.\1', text)
-
-    # 3) Remover pontuação dupla/tripla
-    text = re.sub(r'[.!?]{2,}', '...', text)
+    # 2) Evitar conversão agressiva de vírgulas se for Kokoro (Kokoro entende pontuação perfeitamente).
+    # O Chatterbox antigo forçava EOS, então mantemos a conversão de vírgulas APENAS para contornar problemas antigos.
+    # Mas como o app inteiro agora prioriza Kokoro, não vamos modificar a pontuação natural da escrita,
+    # caso contrário "Olá, tudo bem" vira "Olá. tudo bem", o que altera a entonação da IA.
+    
+    # Limpeza básica em vez de alterar a pontuação:
+    # 3) Remover pontuação dupla/tripla (exceto reticências naturais ou !!!)
+    text = re.sub(r'\.{4,}', '...', text)
     # 4) Remover espaço antes de pontuação
     text = re.sub(r' +([.!?,;:])', r'\1', text)
 
@@ -254,17 +263,20 @@ class AudioPipeline(QObject):
         repetition_penalty: float = 1.2,
         norm_loudness: bool = True,
         ref_vad_trimming: bool = False,
-        fx_noise_reduction: bool = False,
+        fx_highpass: bool = False,
+        fx_deesser: bool = False,
         fx_compressor: bool = False,
-        fx_eq: bool = False,
+        fx_silence: bool = False,
         fx_reverb: bool = False,
-        fx_enhancer: bool = False,
-        fx_normalize: bool = False,
+        fx_loudnorm: bool = False,
         use_spacy: bool = False,
+        use_phonetic: bool = False,
         qwen_task: str = "CustomVoice",
         qwen_instruct: str = "",
         qwen_ref_text: str = "",
         parent=None,
+        sample_rate: int = 24000,
+        **kwargs,
     ):
         super().__init__(parent)
         self._lock = threading.Lock()
@@ -282,19 +294,21 @@ class AudioPipeline(QObject):
         self.seed                  = seed
         self.speed                 = speed
         self.output_format         = output_format
+        self.sample_rate           = sample_rate
         self.min_p                 = min_p
         self.top_p                 = top_p
         self.top_k                 = top_k
         self.repetition_penalty    = repetition_penalty
         self.norm_loudness         = norm_loudness
         self.ref_vad_trimming      = ref_vad_trimming
-        self.fx_noise_reduction    = fx_noise_reduction
+        self.fx_highpass           = fx_highpass
+        self.fx_deesser            = fx_deesser
         self.fx_compressor         = fx_compressor
-        self.fx_eq                 = fx_eq
+        self.fx_silence            = fx_silence
         self.fx_reverb             = fx_reverb
-        self.fx_enhancer           = fx_enhancer
-        self.fx_normalize          = fx_normalize
+        self.fx_loudnorm           = fx_loudnorm
         self.use_spacy             = use_spacy
+        self.use_phonetic          = use_phonetic
         self.qwen_task             = qwen_task
         self.qwen_instruct         = qwen_instruct
         self.qwen_ref_text         = qwen_ref_text
@@ -488,7 +502,7 @@ class AudioPipeline(QObject):
             txt_path = fcfg["path"]
             
             try:
-                text = Path(txt_path).read_text(encoding="utf-8", errors="replace")
+                text = Path(txt_path).read_text(encoding="utf-8-sig", errors="replace")
             except Exception as e:
                 self.log_message.emit(f"⚠ Não foi possível ler '{txt_path}': {e}")
                 continue
@@ -551,7 +565,7 @@ class AudioPipeline(QObject):
         if self.use_spacy:
             self.log_message.emit("Pre-carregando SpaCy (NLP)…")
             # Inicializa SpaCy para cada idioma único presente
-            langs_in_use = set(p[3] for p in all_paragraphs)
+            langs_in_use = set(p[2].get("lang", "en") for p in all_paragraphs)
             for lng in langs_in_use:
                 init_spacy(lng)
 
@@ -631,14 +645,16 @@ class AudioPipeline(QObject):
             wav_final = audios_dir / f"audio_{idx}.wav"
             wav_tmp   = audios_dir / f"audio_{idx}_tmp.wav"
             
-            # CORRIGIDO: Restaurada a limpeza do cache para evitar WDDM swap (lentidão severa no Windows)
-            # que foi a causa relatada do aumento para ~2 mins por parágrafo
-            if torch.cuda.is_available():
+            # CORRIGIDO: Removida a limpeza de cache por parágrafo para evitar quebras de pipeline na GPU.
+            # No Windows/WDDM, sincronizar a GPU constantemente causa latência de agendamento severa.
+            # A manutenção agora é feita apenas se detectado erro ou preventivamente a cada 50 parágrafo.
+            if torch.cuda.is_available() and idx > 0 and idx % 50 == 0:
                 try:
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
+                    self.log_message.emit("♻️ Manutenção preventiva VRAM concluída.")
                 except Exception as _sync_err:
-                    self.log_message.emit(f"  ⚠ GPU sync/cache falhou (ignorado): {str(_sync_err)[:100]}")
+                    self.log_message.emit(f"  ⚠ GPU maintenance falhou (ignorado): {str(_sync_err)[:100]}")
 
             success  = False
             best_sim = 0.0
@@ -664,9 +680,21 @@ class AudioPipeline(QObject):
                         "improve_punctuation": True,
                         "add_natural_pauses": True,
                         "lowercase": False,
-                        "use_phonetic": False
+                        "use_phonetic": False,
+                        "convert_numbers": True
                     })
-                    tts_text_input = process_text(tts_text_input, advanced_text_config)
+                    
+                    # 1. Base clean text para o Whisper (Com números por extenso, mas SEM conversão fonética exótica)
+                    advanced_text_config["use_phonetic"] = False
+                    verification_text = process_text(tts_text_input, advanced_text_config, lang=kokoro_lang)
+                    
+                    # 2. Texto final para o TTS (COM conversão fonética, se o usuário ativou na UI)
+                    tts_text_input = verification_text
+                    if getattr(self, "use_phonetic", False):
+                        from manhwa_app.advanced_text_processor import apply_phonetic
+                        tts_text_input = apply_phonetic(tts_text_input)
+                else:
+                    verification_text = tts_text_input
 
                 # CORRIGIDO: normalização TTS específica para idiomas latinos
                 # Ex: espanhol com vírgulas causa EOS prematuro no alinhador Chatterbox.
@@ -762,7 +790,8 @@ class AudioPipeline(QObject):
                         temperature=p_temp,
                         exaggeration=p_cfg.get("exaggeration", self.exaggeration),
                         cfg_weight=p_cfg.get("cfg_weight", self.cfg_weight),
-                        seed=p_cfg.get("seed", self.seed)
+                        seed=p_cfg.get("seed", self.seed),
+                        sample_rate=self.sample_rate
                     )
 
                     if not success:
@@ -783,12 +812,12 @@ class AudioPipeline(QObject):
                         paragraph_end_time = time.time()
                         self.log_message.emit(f"  ⏱ ↳ Geração do parágrafo durou {paragraph_end_time - paragraph_start_time:.1f}s")
 
-                        # ---- Verificação via Whisper: APENAS a partir da 2ª tentativa ----
-                        # Na 1ª tentativa, confiar na síntese e pular STT (economiza ~15-30s/par.)
-                        if use_whisper_verification and attempt > 1:
+                        # ---- Verificação via Whisper ----
+                        # Como o Kokoro é rápido, podemos habilitar whisper a cada geração (se habilitado na aba)
+                        if use_whisper_verification and attempt >= 1:
                             transcription = transcribe_audio(str(wav_tmp), self.whisper_model)
                             if transcription:
-                                sim = _text_similarity(paragraph, transcription)
+                                sim = _text_similarity(verification_text, transcription)
                                 best_sim = max(best_sim, sim)
                                 if sim < self.similarity_threshold and attempt < self.max_retries:
                                     self.log_message.emit(f"  ↻ [#{idx}] Sim={sim:.2f} < {self.similarity_threshold} → retentando...")
@@ -812,29 +841,33 @@ class AudioPipeline(QObject):
 
                         # ---- FX de áudio (opcionais) ----
                         # CORRIGIDO: usa parâmetros de p_cfg se existirem, senão fallback global
-                        f_hp = p_cfg.get("fx_highpass", self.fx_noise_reduction)
+                        f_hp = p_cfg.get("fx_highpass", self.fx_highpass)
+                        f_de = p_cfg.get("fx_deesser", self.fx_deesser)
                         f_cp = p_cfg.get("fx_compressor", self.fx_compressor)
-                        f_eq = p_cfg.get("fx_deesser", self.fx_eq)
+                        f_sl = p_cfg.get("fx_silence", self.fx_silence)
                         f_rv = p_cfg.get("fx_reverb", self.fx_reverb)
-                        f_sl = p_cfg.get("fx_silence", self.fx_enhancer)
-                        f_nm = p_cfg.get("fx_loudnorm", self.fx_normalize)
+                        f_ln = p_cfg.get("fx_loudnorm", self.fx_loudnorm)
 
-                        _any_fx = f_hp or f_cp or f_eq or f_rv or f_sl or f_nm
+                        _any_fx = f_hp or f_de or f_cp or f_sl or f_rv or f_ln
                         if _any_fx:
                             fx_config = {
                                 "production": {
                                     "audio": {
                                         "highpass":       f_hp,
+                                        "deesser":        f_de,
                                         "compressor":     f_cp,
                                         "reverb":         f_rv,
-                                        "normalize":      f_nm,
                                         "remove_silence": f_sl,
+                                        "normalize":      f_ln,
                                     }
                                 },
-                                "fx_noise_reduction": f_hp,
-                                "fx_compressor":      f_cp,
-                                "fx_reverb":          f_rv,
-                                "fx_normalize":       f_nm,
+                                # Legacy fallbacks for audio_fx.py
+                                "fx_highpass":   f_hp,
+                                "fx_deesser":    f_de,
+                                "fx_compressor": f_cp,
+                                "fx_reverb":     f_rv,
+                                "fx_silence":    f_sl,
+                                "fx_loudnorm":   f_ln
                             }
                             apply_audio_post_processing(final_path_no_fx, str(wav_final), fx_config)
                         else:

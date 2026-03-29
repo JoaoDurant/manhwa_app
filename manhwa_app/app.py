@@ -201,8 +201,8 @@ class GeminiWorker(QThread):
 class ModelLoaderThread(QThread):
     finished_loading = Signal(bool, str)
 
-    def __init__(self, tts_engine: str, model_type: str):
-        super().__init__()
+    def __init__(self, tts_engine: str, model_type: str, parent=None):
+        super().__init__(parent)
         self.tts_engine = tts_engine
         self.model_type = model_type
 
@@ -628,12 +628,14 @@ class TtsConfigTab(QWidget):
         self.fx_silence_chk = QCheckBox("Remove Silêncio (> 0.5s)")
         self.fx_reverb_chk = QCheckBox("Reverb Leve (Sala)")
         self.fx_loudnorm_chk = QCheckBox("Loudnorm (-16 LUFS, Padrão Youtube)")
+        self.phonetic_chk = QCheckBox("Alfabeto Fonético Int. (Tradução para Kokoro TTS)")
         
         self.fx_highpass_chk.setChecked(True)
         self.fx_deesser_chk.setChecked(True)
         self.fx_comp_chk.setChecked(True)
         self.fx_silence_chk.setChecked(True)
         self.fx_loudnorm_chk.setChecked(True)
+        self.phonetic_chk.setChecked(False)
 
         fxg.addWidget(self.spacy_chk, 0, 0, 1, 2)
         fxg.addWidget(self.fx_highpass_chk, 1, 0)
@@ -642,6 +644,7 @@ class TtsConfigTab(QWidget):
         fxg.addWidget(self.fx_silence_chk, 2, 1)
         fxg.addWidget(self.fx_reverb_chk, 3, 0)
         fxg.addWidget(self.fx_loudnorm_chk, 3, 1)
+        fxg.addWidget(self.phonetic_chk, 4, 0, 1, 2)
         
         root.addWidget(fx_group)
 
@@ -795,6 +798,7 @@ class TtsConfigTab(QWidget):
             "fx_silence":    self.fx_silence_chk.isChecked(),
             "fx_reverb":     self.fx_reverb_chk.isChecked(),
             "fx_loudnorm":   self.fx_loudnorm_chk.isChecked(),
+            "use_phonetic":  self.phonetic_chk.isChecked(),
         }
         
         # Get Qwen params explicitly (since they belong to AudioTab but are vital for pipeline)
@@ -835,6 +839,7 @@ class TtsConfigTab(QWidget):
             if idx >= 0: self.whisper_combo.setCurrentIndex(idx)
         if "similarity_threshold" in data: self.sim_spin.setValue(data["similarity_threshold"])
         if "use_spacy" in data: self.spacy_chk.setChecked(data["use_spacy"])
+        if "use_phonetic" in data: self.phonetic_chk.setChecked(data["use_phonetic"])
         if "ref_vad_trimming" in data: self.vad_chk.setChecked(data["ref_vad_trimming"])
         # CORRIGIDO: usar nomes corretos dos widgets; mapeamento de session keys antigas/novas
         if "fx_highpass" in data: self.fx_highpass_chk.setChecked(data["fx_highpass"])
@@ -866,6 +871,7 @@ class TtsConfigTab(QWidget):
         self.whisper_combo.setCurrentIndex(0)
         self.sim_spin.setValue(0.0)         # 0 = Whisper desabilitado (mais rápido)
         self.spacy_chk.setChecked(False)    # spaCy desabilitado por padrão
+        self.phonetic_chk.setChecked(False)
         self.vad_chk.setChecked(False)
         # CORRIGIDO: usar os nomes reais dos widgets de FX
         self.fx_highpass_chk.setChecked(True)
@@ -1363,6 +1369,7 @@ class LanguageConfigTab(QWidget):
             fx_reverb=cfg.get("fx_reverb", False),
             fx_enhancer=cfg.get("fx_silence", False),
             fx_normalize=cfg.get("fx_loudnorm", False),
+            use_phonetic=cfg.get("use_phonetic", False),
         )
         
         self._preview_thread = QThread()
@@ -1727,7 +1734,9 @@ class AudioTab(QWidget):
             tts_engine=cfg.get("tts_engine", "chatterbox"),
             model_type=cfg.get("model_type", "turbo"),
             whisper_model=cfg.get("whisper_model", "base"),
-            similarity_threshold=cfg.get("similarity_threshold", 0.75),
+            # CORRIGIDO: Forçar similarity_threshold=0.0 no Preview para evitar o carregamento
+            # desnecessário do Faster-Whisper, que causa um atraso de ~8 segundos antes de gerar.
+            similarity_threshold=0.0,
             max_retries=1,
             temperature=cfg.get("temperature", 0.8),
             exaggeration=cfg.get("exaggeration", 0.5),
@@ -1741,16 +1750,17 @@ class AudioTab(QWidget):
             repetition_penalty=cfg.get("repetition_penalty", 1.2),
             norm_loudness=cfg.get("norm_loudness", True),
             ref_vad_trimming=cfg.get("ref_vad_trimming", False),
-            # CORRIGIDO: usar novas chaves canonicas de FX (get_session retorna fx_highpass, fx_deesser, etc.)
-            fx_noise_reduction=cfg.get("fx_highpass", False),
+            # CORRIGIDO: Nomes de FX para AudioPipeline (fx_highpass, fx_compressor, etc.)
+            fx_highpass=cfg.get("fx_highpass", False),
             fx_compressor=cfg.get("fx_compressor", False),
-            fx_eq=cfg.get("fx_deesser", False),
+            fx_deesser=cfg.get("fx_deesser", False),
             fx_reverb=cfg.get("fx_reverb", False),
-            fx_enhancer=cfg.get("fx_silence", False),
-            fx_normalize=cfg.get("fx_loudnorm", False),
+            fx_silence=cfg.get("fx_silence", False),
+            fx_loudnorm=cfg.get("fx_loudnorm", False),
             use_spacy=cfg.get("use_spacy", False),
+            use_phonetic=cfg.get("use_phonetic", False),
         )
-        self._preview_thread = QThread()
+        self._preview_thread = QThread(self)
         self._preview_thread.setStackSize(16 * 1024 * 1024)  # Evita stack overflow silencioso com modelos grandes (Qwen)
         self._preview_pipeline.moveToThread(self._preview_thread)
         self._preview_thread.started.connect(self._preview_pipeline.run)
@@ -2215,16 +2225,15 @@ class AudioTab(QWidget):
             repetition_penalty=cfg.get("repetition_penalty", 1.2),
             norm_loudness=cfg.get("norm_loudness", True),
             ref_vad_trimming=cfg.get("ref_vad_trimming", False),
-            # CORRIGIDO: usar novas chaves de FX emitidas por get_session()
-            # AudioPipeline espera: fx_noise_reduction, fx_compressor, fx_reverb, fx_normalize, fx_enhancer
-            # Mapeamento: get_session() novo → AudioPipeline param
-            fx_noise_reduction=cfg.get("fx_highpass", False),   # highpass → noise_reduction (ativador geral de limpeza)
+            # CORRIGIDO: Nomes de FX agora coincidem com o construtor do AudioPipeline
+            fx_highpass=cfg.get("fx_highpass", False),
             fx_compressor=cfg.get("fx_compressor", False),
-            fx_eq=cfg.get("fx_deesser", False),                  # deesser → eq slot
+            fx_deesser=cfg.get("fx_deesser", False),
             fx_reverb=cfg.get("fx_reverb", False),
-            fx_enhancer=cfg.get("fx_silence", False),            # silence removal → enhancer slot
-            fx_normalize=cfg.get("fx_loudnorm", False),          # fx_loudnorm → normalize
+            fx_silence=cfg.get("fx_silence", False),
+            fx_loudnorm=cfg.get("fx_loudnorm", False),
             use_spacy=cfg.get("use_spacy", False),
+            use_phonetic=cfg.get("use_phonetic", False),
         )
         self._worker_thread = QThread(self)
         self._worker_thread.setStackSize(16 * 1024 * 1024)
@@ -2368,7 +2377,8 @@ class AudioTab(QWidget):
             temperature=cfg.get("temperature", 0.8),
             exaggeration=cfg.get("exaggeration", 0.5),
             cfg_weight=cfg.get("cfg_weight", 0.5),
-            seed=cfg.get("seed", 0)
+            seed=cfg.get("seed", 0),
+            use_phonetic=cfg.get("use_phonetic", False)
         )
         self._regen_thread = QThread(self)
         self._regen_pipeline = pipeline
@@ -4623,6 +4633,7 @@ class LanguageConfigCard(QFrame):
         self.lang_code = lang_code
         self.lang_name = lang_name
         self.custom_script_path = None
+        self.custom_images_path = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -4690,6 +4701,12 @@ class LanguageConfigCard(QFrame):
         self.btn_script.setToolTip("Ignorar Gemini e usar este arquivo .txt para este idioma")
         self.btn_script.clicked.connect(self._browse_script)
         top_row.addWidget(self.btn_script)
+        
+        self.btn_imgs = QPushButton("🖼️ Imagens")
+        self.btn_imgs.setFixedWidth(85)
+        self.btn_imgs.setToolTip("Usar esta pasta de imagens para este idioma")
+        self.btn_imgs.clicked.connect(self._browse_images)
+        top_row.addWidget(self.btn_imgs)
         
         top_row.addStretch()
         main_v.addLayout(top_row)
@@ -4825,6 +4842,26 @@ class LanguageConfigCard(QFrame):
         self.btn_script.setToolTip("Ignorar Gemini e usar este arquivo .txt para este idioma")
         self.btn_script.setStyleSheet("")
 
+    def _browse_images(self):
+        if self.custom_images_path:
+            res = QMessageBox.question(self, "Limpar Imagens", f"Já existe uma pasta específica:\n{Path(self.custom_images_path).name}\n\nDeseja remover e voltar para as imagens base?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if res == QMessageBox.StandardButton.Yes:
+                self._clear_images()
+                return
+
+        folder = QFileDialog.getExistingDirectory(self, f"Pasta de Imagens ({self.lang_name})")
+        if folder:
+            self.custom_images_path = folder
+            self.btn_imgs.setText("✅ Imagens")
+            self.btn_imgs.setToolTip(f"Pasta: {Path(folder).name}\nClique para remover ou trocar.")
+            self.btn_imgs.setStyleSheet("background: #db2777; border: 1px solid #ec4899;")
+
+    def _clear_images(self):
+        self.custom_images_path = None
+        self.btn_imgs.setText("🖼️ Imagens")
+        self.btn_imgs.setToolTip("Usar esta pasta de imagens para este idioma")
+        self.btn_imgs.setStyleSheet("")
+
     def _test_voice(self):
         text = SAMPLE_TEXTS.get(self.lang_code, SAMPLE_TEXTS["en"])
         engine_str = self.engine_combo.currentText()
@@ -4852,7 +4889,8 @@ class LanguageConfigCard(QFrame):
             "exaggeration": self.sp_exag.value(),
             "cfg_weight": self.sp_cfg.value(),
             "seed": self.sp_seed.value(),
-            "custom_script_path": self.custom_script_path
+            "custom_script_path": self.custom_script_path,
+            "custom_images_path": self.custom_images_path
         }
 
     def load_config(self, cfg):
@@ -4867,6 +4905,17 @@ class LanguageConfigCard(QFrame):
                 self.btn_script.setStyleSheet("background: #059669; border: 1px solid #10b981;")
             else:
                 self.custom_script_path = None # File not found
+
+        if cfg.get("custom_images_path"):
+            self.custom_images_path = cfg["custom_images_path"]
+            p = Path(self.custom_images_path)
+            if p.exists():
+                self.btn_imgs.setText("✅ Imagens")
+                self.btn_imgs.setToolTip(f"Pasta: {p.name}\nClique para remover ou trocar.")
+                self.btn_imgs.setStyleSheet("background: #db2777; border: 1px solid #ec4899;")
+            else:
+                self.custom_images_path = None # Folder not found
+
         if "engine" in cfg:
             self.engine_combo.setCurrentText(cfg["engine"])
         if "model_type" in cfg and cfg.get("engine") == "chatterbox":
@@ -5072,6 +5121,87 @@ class ExpressTab(QWidget):
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
         """)
 
+    def _run_all(self):
+        selected_langs = [code for code, chk in self.lang_checkboxes.items() if chk.isChecked()]
+        if not selected_langs:
+            QMessageBox.warning(self, "Erro", "Selecione ao menos um idioma.")
+            return
+
+        overrides = self._get_overrides()
+        
+        # --- Bypassar TXT base se todos forem manuais ---
+        has_base_txt = bool(self._files)
+        langs_needing_gemini = [l for l in selected_langs if not overrides.get(l, {}).get("custom_script_path")]
+        
+        if not has_base_txt and langs_needing_gemini:
+            QMessageBox.warning(self, "Erro", f"Selecione um arquivo .txt base ou forneça roteiros manuais para todos os idiomas selecionados ({', '.join(langs_needing_gemini)}).")
+            return
+
+        # --- Bypassar IMAGENS base se todos tiverem local ---
+        has_base_imgs = bool(self._images)
+        langs_needing_imgs = [l for l in selected_langs if not overrides.get(l, {}).get("custom_images_path")]
+        
+        if not has_base_imgs and langs_needing_imgs:
+             QMessageBox.warning(self, "Erro", f"Selecione uma pasta de imagens base ou forneça pastas locais para: {', '.join(langs_needing_imgs)}")
+             return
+
+        # --- Verificação de contagem de parágrafos vs imagens ---
+        mismatches = []
+        for l_code in selected_langs:
+            manual_script = overrides.get(l_code, {}).get("custom_script_path")
+            script_path = manual_script if manual_script else (self._files[0]["path"] if self._files else None)
+            
+            manual_imgs_folder = overrides.get(l_code, {}).get("custom_images_path")
+            if manual_imgs_folder:
+                from pathlib import Path
+                local_imgs = sorted([str(p) for p in Path(manual_imgs_folder).glob("*") if p.suffix.lower() in [".jpg", ".png", ".webp", ".jpeg"]], key=natural_sort_key)
+                img_count = len(local_imgs)
+            else:
+                img_count = len(self._images)
+
+            if script_path:
+                p_count = self._count_paragraphs(script_path)
+                if p_count != img_count:
+                    mismatches.append(f"• {l_code.upper()}: {p_count} parágrafos vs {img_count} imagens")
+
+        if mismatches:
+            msg = "⚠️ <b>DESLOCAMENTO DETECTADO</b>\n\nA contagem de parágrafos não bate com a de imagens:\n\n" + "\n".join(mismatches) + "\n\nDeseja continuar mesmo assim?"
+            res = QMessageBox.warning(self, "Aviso de Sincronia", msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if res == QMessageBox.StandardButton.No:
+                return
+
+        self.btn_run.setEnabled(False)
+        self.log_text.clear()
+        self.progress_bar.setValue(0)
+        
+        main_win = self.window()
+        cfg = main_win.settings_tab.get_session()
+        api_keys = main_win.settings_tab.get_api_keys()
+        
+        if langs_needing_gemini:
+            valid_keys = [e for e in api_keys if isinstance(e, dict) and e.get("key", "").strip()]
+            if not valid_keys:
+                QMessageBox.warning(self, "Erro", "Gemini indisponível. Forneça todos os roteiros (.txt) manualmente para ignorar esta verificação.")
+                self.btn_run.setEnabled(True)
+                return
+
+        self._orchestrator = ExpressOrchestrator(
+            parent=self,
+            txt_path=self._files[0]["path"] if self._files else None,
+            image_paths=self._images,
+            project_name=self.proj_edit.text().strip(),
+            api_key=api_keys,
+            source_lang=self.source_lang_combo.currentData(),
+            languages=selected_langs,
+            use_saved_tts=self.chk_use_saved.isChecked(),
+            main_cfg=cfg,
+            overrides=overrides
+        )
+        self._orchestrator.log_message.connect(lambda m: self.log_text.append(m))
+        self._orchestrator.progress.connect(self.progress_bar.setValue)
+        self._orchestrator.finished.connect(self._on_done)
+        self._orchestrator.start()
+
     def _pick_txt(self):
         path, _ = QFileDialog.getOpenFileName(self, "Selecionar Roteiro", "", "Texto (*.txt)")
         if path: self._set_txt(path)
@@ -5108,9 +5238,9 @@ class ExpressTab(QWidget):
     def _get_overrides(self):
         ov = {}
         for code, card in self.language_cards.items():
-            cfg = card.get_config()
-            if cfg["voice"] or cfg["engine"] != "chatterbox":
-                ov[code] = cfg
+            # Include ALL active language configurations to ensure validation logic 
+            # correctly sees manual scripts and engine choices.
+            ov[code] = card.get_config()
         return ov
 
     def _set_txt(self, path):
@@ -5119,93 +5249,96 @@ class ExpressTab(QWidget):
 
     def _set_images(self, folder):
         from pathlib import Path
+        self._images_folder = folder
         imgs = sorted([str(p) for p in Path(folder).glob("*") if p.suffix.lower() in [".jpg", ".png", ".webp", ".jpeg"]], key=natural_sort_key)
         self._images = imgs
         self.img_lbl.setText(f"✅ {len(imgs)} imagens carregadas")
 
-    def get_session(self):
+    def get_session(self) -> dict:
+        selected_langs = [code for code, chk in self.lang_checkboxes.items() if chk.isChecked()]
+        overrides = self._get_overrides()
         return {
             "project_name": self.proj_edit.text(),
             "source_lang": self.source_lang_combo.currentData(),
-            "selected_langs": [code for code, chk in self.lang_checkboxes.items() if chk.isChecked()],
-            "overrides": self._get_overrides(),
-            "use_saved_tts": self.chk_use_saved.isChecked()
+            "target_langs": selected_langs,
+            "use_saved_tts": self.chk_use_saved.isChecked(),
+            "overrides": overrides,
+            "base_txt": self._files[0]["path"] if self._files else None,
+            "base_imgs": self._images_folder if hasattr(self, "_images_folder") else None
         }
 
-    def load_session(self, data):
+    def load_session(self, data: dict):
         if not data: return
-        if "project_name" in data: 
-            self.proj_edit.setText(data["project_name"])
-        if "source_lang" in data:
-            idx = self.source_lang_combo.findData(data["source_lang"])
-            if idx >= 0: self.source_lang_combo.setCurrentIndex(idx)
+        self.proj_edit.setText(data.get("project_name", "projeto_expresso_1"))
         
-        if "selected_langs" in data:
-            for code, chk in self.lang_checkboxes.items():
-                if code == "pt": continue 
-                chk.setChecked(code in data["selected_langs"])
+        idx = self.source_lang_combo.findData(data.get("source_lang", "pt"))
+        if idx >= 0: self.source_lang_combo.setCurrentIndex(idx)
         
-        if "use_saved_tts" in data:
-            self.chk_use_saved.setChecked(data["use_saved_tts"])
+        self.chk_use_saved.setChecked(data.get("use_saved_tts", True))
+        
+        # Restore target langs
+        target_langs = data.get("target_langs", ["pt"])
+        for code, chk in self.lang_checkboxes.items():
+            chk.blockSignals(True)
+            chk.setChecked(code in target_langs)
+            chk.blockSignals(False)
             
+        # Update cards
+        for code in target_langs:
+            if code in self.lang_checkboxes:
+                self._add_lang_card(code, self.lang_checkboxes[code].property("lang_name"))
+        
+        # Clean up old cards if not in target_langs
+        for code in list(self.language_cards.keys()):
+            if code not in target_langs:
+                self._remove_lang_card(code)
+                
+        # Restore overrides
         overrides = data.get("overrides", {})
-        for code, card in self.language_cards.items():
-            if code in overrides:
-                card.load_config(overrides[code])
-        self._pending_overrides = overrides
+        for code, cfg in overrides.items():
+            if code in self.language_cards:
+                self.language_cards[code].load_config(cfg)
+                
+        if data.get("base_txt"):
+            self._set_txt(data["base_txt"])
+        if data.get("base_imgs"):
+            self._set_images(data["base_imgs"])
 
-    def _run_all(self):
-        if not self._files:
-            QMessageBox.warning(self, "Erro", "Selecione um arquivo .txt primeiro.")
-            return
-        if not self._images:
-            QMessageBox.warning(self, "Erro", "Selecione as imagens primeiro.")
-            return
+    def reset_defaults(self):
+        self.proj_edit.setText("projeto_expresso_1")
+        self.source_lang_combo.setCurrentIndex(0)
+        self.chk_use_saved.setChecked(True)
+        for code, chk in self.lang_checkboxes.items():
+            chk.setChecked(code == "pt")
+        self._files = []
+        self._images = []
+        self._images_folder = None
+        self.txt_lbl.setText("📄\n<b>CLIQUE OU ARRASTE</b>\nRoteiro (.txt)")
+        self.img_lbl.setText("🖼️\n<b>CLIQUE OU ARRASTE</b>\nPasta de Imagens")
+        # Clear cards except PT
+        for code in list(self.language_cards.keys()):
+            if code != "pt":
+                self._remove_lang_card(code)
 
-        selected_langs = [code for code, chk in self.lang_checkboxes.items() if chk.isChecked()]
-        if not selected_langs:
-            QMessageBox.warning(self, "Erro", "Selecione ao menos um idioma.")
-            return
+    def _count_paragraphs(self, script_path):
+        try:
+            from manhwa_app.audio_pipeline import split_into_paragraphs
+            from pathlib import Path
+            text = Path(script_path).read_text(encoding="utf-8-sig", errors="replace")
+            return len(split_into_paragraphs(text))
+        except Exception:
+            return 0
 
-        self.btn_run.setEnabled(False)
-        self.log_text.clear()
-        self.progress_bar.setValue(0)
-        
-        main_win = self.window()
-        cfg = main_win.settings_tab.get_session()
-        api_keys = main_win.settings_tab.get_api_keys()
-        
-        valid_keys = [e for e in api_keys if isinstance(e, dict) and e.get("key", "").strip()]
-        if not valid_keys:
-            QMessageBox.warning(self, "Erro", "API Key do Gemini não configurada na aba Configurações.")
-            self.btn_run.setEnabled(True)
-            return
-
-        overrides = self._get_overrides()
-
-        self._orchestrator = ExpressOrchestrator(
-            parent=self,
-            txt_path=self._files[0]["path"],
-            image_paths=self._images,
-            project_name=self.proj_edit.text().strip(),
-            api_key=api_keys,
-            source_lang=self.source_lang_combo.currentData(),
-            languages=selected_langs,
-            use_saved_tts=self.chk_use_saved.isChecked(),
-            main_cfg=cfg,
-            overrides=overrides
-        )
-        self._orchestrator.log_message.connect(lambda m: _append_log(self.log_text, m))
-        self._orchestrator.progress.connect(self.progress_bar.setValue)
-        self._orchestrator.finished.connect(self._on_done)
-        self._orchestrator.start()
-
-    def _on_done(self, success, msg):
+    def _on_done(self, success, message):
         self.btn_run.setEnabled(True)
         if success:
-            QMessageBox.information(self, "Concluído", f"Pipeline concluído com sucesso!\n{msg}")
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Sucesso", f"Pipeline concluído com sucesso!\n\n{message}")
         else:
-            QMessageBox.critical(self, "Erro", f"Pipeline falhou:\n{msg}")
+            if not self._worker or not getattr(self._worker, "_cancelled", False):
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.critical(self, "Erro", f"O pipeline falhou:\n\n{message}")
+
 
 class ExpressOrchestrator(QThread):
     log_message = Signal(str)
@@ -5230,59 +5363,52 @@ class ExpressOrchestrator(QThread):
             self.log_message.emit("--- FASE 1: Revisão e Tradução Gemini ---")
             self.progress.emit(10)
             
-            # Use original revised (pt) + requested langs
             target_langs = list(set(self.languages))
-            
-            # --- NOVO: Separar idiomas manuais ---
             manual_scripts = {}
             for code, override in self.overrides.items():
                 if override.get("custom_script_path"):
                     manual_scripts[code] = override["custom_script_path"]
             
-            # Idiomas que REALMENTE precisam do Gemini
             gemini_langs = [code for code in target_langs if code not in manual_scripts]
             
-            # Se a própria revisão (source_lang) for manual, também removemos do Gemini
-            # Mas nota: GeminiProcessor sempre produz a revisão a partir do txt_path.
-            
-            # Se TODOS forem manuais, pulamos o Gemini
-            if not gemini_langs and (self.source_lang in manual_scripts or self.source_lang not in self.languages):
-                self.log_message.emit("Todos os roteiros são manuais. Pulando Fase 1.")
+            if not gemini_langs or (not self.txt_path and not any(manual_scripts.values())):
+                self.log_message.emit("Todos os roteiros são manuais ou Gemini omitido. Pulando Fase 1.")
                 lang_paths = manual_scripts
             else:
-                from gemini_processor import GeminiProcessor
-                proc = GeminiProcessor(model_name=self.main_cfg.get("gemini", {}).get("model_name", "gemini-1.5-flash"))
-                
-                # Se o idioma de origem for manual, usamos ele como base para o Gemini traduzir os outros
-                actual_txt_path = self.txt_path
-                if self.source_lang in manual_scripts:
-                    actual_txt_path = manual_scripts[self.source_lang]
-                    self.log_message.emit(f"Usando roteiro manual de {self.source_lang} como base para traduções.")
+                if not self.txt_path and gemini_langs:
+                     self.log_message.emit("⚠️ Tentativa de usar Gemini sem roteiro base. Usando apenas manuais.")
+                     lang_paths = manual_scripts
+                else:
+                    from gemini_processor import GeminiProcessor
+                    proc = GeminiProcessor(model_name=self.main_cfg.get("gemini", {}).get("model_name", "gemini-1.5-flash"))
+                    
+                    actual_txt_path = self.txt_path
+                    if self.source_lang in manual_scripts:
+                        actual_txt_path = manual_scripts[self.source_lang]
+                        self.log_message.emit(f"Usando roteiro manual de {self.source_lang.upper()} como base para traduções.")
 
-                # Chamar Gemini para o que restou
-                lang_paths = proc.process(
-                    txt_path=actual_txt_path,
-                    api_key=self.api_key,
-                    languages=gemini_langs,
-                    source_lang=self.source_lang,
-                    delay_seconds=float(self.main_cfg.get("gemini", {}).get("delay", 4)),
-                    revision_prompt=self.main_cfg.get("gemini", {}).get("revision_prompt"),
-                    translation_prompt=self.main_cfg.get("gemini", {}).get("translation_prompt"),
-                    chunk_size=int(self.main_cfg.get("gemini", {}).get("chunk_size", 12)),
-                    overlap=int(self.main_cfg.get("gemini", {}).get("overlap", 2)),
-                    progress_callback=lambda c, t, m: self.log_message.emit(f"Gemini: {m}")
-                )
-                
-                # Mesclar caminhos manuais que foram ignorados pelo Gemini
-                for code, path in manual_scripts.items():
-                    lang_paths[code] = path
+                    lang_paths = proc.process(
+                        txt_path=actual_txt_path,
+                        api_key=self.api_key,
+                        languages=gemini_langs,
+                        source_lang=self.source_lang,
+                        delay_seconds=float(self.main_cfg.get("gemini", {}).get("delay", 4)),
+                        revision_prompt=self.main_cfg.get("gemini", {}).get("revision_prompt"),
+                        translation_prompt=self.main_cfg.get("gemini", {}).get("translation_prompt"),
+                        chunk_size=int(self.main_cfg.get("gemini", {}).get("chunk_size", 12)),
+                        overlap=int(self.main_cfg.get("gemini", {}).get("overlap", 2)),
+                        progress_callback=lambda c, t, m: self.log_message.emit(f"Gemini: {m}")
+                    )
+                    
+                    for code, path in manual_scripts.items():
+                        lang_paths[code] = path
             
             if not lang_paths:
-                self.finished.emit(False, "Gemini não gerou arquivos e não há manuais.")
+                self.finished.emit(False, "Nenhum roteiro disponível.")
                 return
 
-            self.progress.emit(40)
-            self.log_message.emit("--- FASE 2: Geração de Áudio e Vídeo por Idioma ---")
+            self.progress.emit(30)
+            self.log_message.emit("\n--- FASE 2: Geração de Áudio e Vídeo por Idioma ---")
 
             main_win = self.parent().window()
             mapping = main_win.language_config_tab.mapping if self.use_saved_tts else {}
@@ -5295,13 +5421,27 @@ class ExpressOrchestrator(QThread):
             results_summary = []
 
             for i, (l_code, l_path) in enumerate(lang_paths.items()):
-                # Filtrar para processar apenas o que o usuário escolheu
                 if l_code not in self.languages:
                     continue
                     
                 self.log_message.emit(f"\n[IDIOMA: {l_code.upper()}]")
                 sub_project = f"{self.project_name}_{l_code}"
                 
+                # --- SELEÇÃO DE IMAGENS ---
+                manual_imgs_folder = self.overrides.get(l_code, {}).get("custom_images_path")
+                if manual_imgs_folder:
+                    self.log_message.emit(f"🖼️ Usando pasta de imagens local para {l_code.upper()}.")
+                    # CORRIGIDO: Removido local import que causava UnboundLocalError por shadowing. Global Path (line 10) é usado.
+                    p_manual = Path(manual_imgs_folder)
+                    current_images = sorted([str(p) for p in p_manual.glob("*") if p.suffix.lower() in [".jpg", ".png", ".webp", ".jpeg"]], key=natural_sort_key)
+                else:
+                    self.log_message.emit(f"🖼️ Usando pasta de imagens Base para {l_code.upper()}.")
+                    current_images = self.image_paths
+
+                if not current_images:
+                    self.log_message.emit(f"⚠ Nenhuma imagem disponível para {l_code.upper()}. Pulando vídeo.")
+                    continue
+
                 # Config baseada no tts_global + mapeamento + overrides
                 c_cfg = {
                     "path": l_path, 
@@ -5314,11 +5454,10 @@ class ExpressOrchestrator(QThread):
                     "cfg_weight": tts_global.get("cfg_weight", 0.5),
                     "seed": tts_global.get("seed", -1)
                 }
-                # Se usar o mapeamento salvo (Aba Idiomas)
+                
                 if self.use_saved_tts and l_code in mapping:
                     c_cfg.update(mapping[l_code])
                 
-                # Se tiver overrides específicos desta sessão (Express Tab)
                 if l_code in self.overrides:
                     c_cfg.update(self.overrides[l_code])
 
@@ -5343,8 +5482,8 @@ class ExpressOrchestrator(QThread):
                 output_mp4 = f"output/{sub_project}/{sub_project}_final.mp4"
                 
                 # Montar pares Áudio/Imagem
-                n = min(len(audio_files), len(self.image_paths))
-                pairs = [(audio_files[j], self.image_paths[j]) for j in range(n)]
+                n = min(len(audio_files), len(current_images))
+                pairs = [(audio_files[j], current_images[j]) for j in range(n)]
 
                 self.log_message.emit(f"🎥 Montando vídeo: {output_mp4}")
                 video_pipe = VideoPipeline(
@@ -5423,7 +5562,7 @@ class MainWindow(QMainWindow):
             self.audio_tab.btn_generate.setEnabled(False)
             self.audio_tab.btn_generate.setText("Carregando modelo...")
         
-        self._loader_thread = ModelLoaderThread(engine_name, model_type)
+        self._loader_thread = ModelLoaderThread(engine_name, model_type, parent=self)
         self._loader_thread.setStackSize(16 * 1024 * 1024)
         self._loader_thread.finished_loading.connect(self._on_model_preloaded)
         self._loader_thread.start()
@@ -5853,6 +5992,7 @@ class MainWindow(QMainWindow):
             self.tts_tab.reset_defaults()
             self.video_tab.reset_defaults()
             self.settings_tab.reset_defaults()
+            self.express_tab.reset_defaults()
             self.theme_combo.setCurrentText("\U0001f311 Dark (Padr\u00e3o)")
             self._clear_background()
             QMessageBox.information(self, "Resetado", "Configurações restauradas com sucesso.")

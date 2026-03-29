@@ -1026,7 +1026,21 @@ def load_kokoro_engine(
             kokoro_loaded_lang = lang_code
             print(f"[ENGINE] [Kokoro] Carregado com sucesso em {resolved} | lang: {lang_code} | Tempo: {time.time() - t0_kload:.2f}s")
             logger.info(f"Kokoro carregado com sucesso em {resolved} para lang '{lang_code}'.")
-            if torch.cuda.is_available(): torch.cuda.synchronize()
+            
+            if torch.cuda.is_available(): 
+                torch.cuda.synchronize()
+                # Otimização Blackwell/Windows: Evitar re-benchmarking de kernels em cada variação de texto
+                torch.backends.cudnn.benchmark = False
+                
+                # Warmup: Pre-carrega kernels CUDA com uma string curta
+                try:
+                    print(f"[ENGINE] [Kokoro] Aquecendo CUDA kernels...")
+                    _w0 = time.time()
+                    _gen = kokoro_pipeline("warm", voice="af_heart", speed=1.0)
+                    for _ in _gen: pass
+                    print(f"[ENGINE] [Kokoro] Warmup concluído em {time.time() - _w0:.2f}s")
+                except: pass
+
             return True
         except Exception as e:
             err = str(e).lower()
@@ -1048,6 +1062,7 @@ def load_kokoro_engine(
 
 
 
+@torch.inference_mode()
 def synthesize_kokoro(
     text: str,
     voice: str = "af_heart",
@@ -1082,12 +1097,46 @@ def synthesize_kokoro(
         try:
             import time
             t0_ksynth = time.time()
-            print(f"[ENGINE] [Kokoro] Iniciando sintese | Texto len: {len(text)} chars | Voice: {voice}")
-            
+            # [DEEP DIAGNOSTICS] - Verificando o dispositivo real dos pesos
+            try:
+                # KPipeline (pip package) holds the model in .model
+                _model_device = "unknown"
+                if hasattr(kokoro_pipeline, "model"):
+                    _model_device = str(next(kokoro_pipeline.model.parameters()).device)
+                    # Força para a GPU se estiver na CPU por engano
+                    _target = "cuda" if torch.cuda.is_available() else "cpu"
+                    if _target == "cuda" and "cpu" in _model_device.lower():
+                        print(f"[ENGINE] [Kokoro] [FIX] Redirecionando pesos CPU -> GPU...")
+                        kokoro_pipeline.model.to("cuda")
+                        _model_device = "cuda:0"
+                    
+                    # Otimização Kokoro: Mantemos Float32 (Half causa RuntimeError com o pacote kokoro-pip)
+                    # if _target == "cuda" and next(kokoro_pipeline.model.parameters()).dtype == torch.float32:
+                    #     print(f"[ENGINE] [Kokoro] [FIX] Ativando FP16 (Half Precision)...")
+                    #     kokoro_pipeline.model.half()
+
+                print(f"[ENGINE] [Kokoro] Iniciando sintese | Texto len: {len(text)} chars | Voice: {voice} | Device: {_model_device}")
+            except Exception as _diag_err:
+                logger.debug(f"Falha no diagnostico Kokoro: {_diag_err}")
+
             audio_parts = []
-            for gs, ps, audio in kokoro_pipeline(text, voice=voice, speed=speed):
+            _t_start_loop = time.time()
+            _g2p_done = False
+            
+            # Generator loop: Kokoro faz G2P no início e depois itera os segmentos
+            generator = kokoro_pipeline(text, voice=voice, speed=speed)
+            
+            for gs, ps, audio in generator:
+                if not _g2p_done:
+                    _t_g2p = time.time() - _t_start_loop
+                    print(f"[DEBUG] [Kokoro] G2P/Phonemes Time: {_t_g2p:.4f}s")
+                    _g2p_done = True
+                
                 if audio is not None and len(audio) > 0:
                     audio_parts.append(audio)
+            
+            _t_total_inference = time.time() - _t_start_loop
+            print(f"[DEBUG] [Kokoro] Total Synthesis Time (Loop): {_t_total_inference:.4f}s")
 
             if not audio_parts:
                 print("[ERROR] [ENGINE] [Kokoro] Nenhum audio gerado pelo generator.")

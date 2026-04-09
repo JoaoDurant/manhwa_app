@@ -91,7 +91,7 @@ def improve_punctuation(text: str) -> str:
     # Limpa espaços duplos gerados pelas substituições
     return re.sub(r' {2,}', ' ', text).strip()
 
-def preprocess_text_for_speech(text: str) -> str:
+def preprocess_text_for_speech(text: str, lang: str = "pt") -> str:
     """
     Transforma o texto bruto em uma versão NATURAL para fala (TTS),
     como se fosse narrado por um humano. Cumpre as regras do usuário:
@@ -119,6 +119,13 @@ def preprocess_text_for_speech(text: str) -> str:
     # 4. Limpeza de travamentos: Converte travessões soltos ou hifens duplos em pausas (vírgulas)
     text = re.sub(r'\s*--+\s*', ', ', text)
     text = re.sub(r'\s*—\s*', ', ', text)
+
+    # 5. HARDCODES E CORREÇÕES DE PRONÚNCIA (Kokoro-PT quirks)
+    # Apenas se aplica quando o idioma apontar para o português
+    if lang.lower() in ("pt", "pt-br", "p"):
+        # Palavras terminadas em 'chim'. Usando 'sh' que é mapeado forçadamente para /ʃ/ na maioria dos NLP
+        text = re.sub(r'\bespadachim\b', 'espadashim', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bespadachins\b', 'espadashins', text, flags=re.IGNORECASE)
     
     # Arrumar espaços duplos e pontuação duplicada
     text = re.sub(r',{2,}', ',', text)
@@ -171,7 +178,7 @@ def process_text(text: str, config: dict, lang: str = "en") -> str:
 
     # Aplica formatação de fala realista natural (TTS) requesitada
     if config.get("natural_speech", True):
-        text = preprocess_text_for_speech(text)
+        text = preprocess_text_for_speech(text, lang)
         
     if config.get("improve_punctuation", True) or config.get("add_natural_pauses", True):
         text = improve_punctuation(text)
@@ -182,3 +189,42 @@ def process_text(text: str, config: dict, lang: str = "en") -> str:
     # Limpeza final de espaços gerados pelos regex
     text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+def improve_pronunciation_for_tts(text: str, lang: str = "pt") -> str:
+    """
+    Aplica modificações no texto para forçar uma pronúncia mais natural/clara,
+    usado como FALLBACK quando a geração inicial falha na verificação Whisper.
+    """
+    l = lang.lower()
+    
+    # 1. Pontuação de respiração (Adiciona vírgulas em frases longas sem pausas)
+    if len(text) > 60 and "," not in text:
+        # Tenta inserir uma vírgula no meio do texto, após uma palavra
+        words = text.split()
+        if len(words) > 8:
+            mid = len(words) // 2
+            words[mid] = words[mid] + ","
+            text = " ".join(words)
+
+    # 2. Melhorias específicas por idioma
+    if l in ("pt", "pt-br", "p"):
+        # Ênfase em monossílabos que às vezes o TTS engole
+        text = re.sub(r'\bque\b', 'quê', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bpor que\b', 'por quê', text, flags=re.IGNORECASE)
+        
+        # Correção fonética leve para finais que soam "secos"
+        # (Apenas se não houver pontuação)
+        text = re.sub(r'([a-z])\.\s*$', r'\1...', text, flags=re.IGNORECASE)
+        
+    elif l in ("en", "en-us", "a"):
+        # Em inglês, às vezes o TTS corre demais em palavras com 'th'
+        # ou abreviações. Aqui podemos expandir algumas comuns.
+        text = text.replace("St.", "Street")
+        text = text.replace("Dr.", "Doctor")
+        text = text.replace("Mr.", "Mister")
+        text = text.replace("Mrs.", "Misses")
+
+    # 3. Garante que reticências tenham espaço para o TTS "respirar"
+    text = text.replace("...", "... , ")
+    
+    return re.sub(r'\s+', ' ', text).strip()

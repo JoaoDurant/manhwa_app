@@ -69,7 +69,7 @@ try:
     # Importar config do diretório raiz
     from config import config_manager as _config_manager
     from manhwa_app.text_processor import process_text_fluency, init_spacy
-    from manhwa_app.advanced_text_processor import process_text
+    from manhwa_app.advanced_text_processor import process_text, improve_pronunciation_for_tts
     from manhwa_app.audio_fx import apply_audio_post_processing
     from manhwa_app.models import get_qwen_model, get_whisper_model, unload_whisper, transcribe_audio
     _ENGINE_AVAILABLE = True
@@ -250,7 +250,7 @@ class AudioPipeline(QObject):
         model_type: str = "turbo",      # "turbo" ou "default"
         whisper_model: str = "base",
         similarity_threshold: float = 0.75,
-        max_retries: int = 3,
+        max_retries: int = 5,
         temperature: float = 0.65,
         exaggeration: float = 0.5,
         cfg_weight: float = 0.5,
@@ -657,12 +657,17 @@ class AudioPipeline(QObject):
                     self.log_message.emit(f"  ⚠ GPU maintenance falhou (ignorado): {str(_sync_err)[:100]}")
 
             success  = False
-            best_sim = 0.0
+            best_sim = -1.0
+            best_wav_path = None
 
             # Medição de tempo exato por parágrafo para detectar memory leak (ex: acúmulo de KV cache)
             paragraph_start_time = time.time()
 
-            for attempt in range(1, self.max_retries + 1):
+            # Forçar pelo menos 5 tentativas se o usuário estiver reclamando de qualidade (conforme solicitado)
+            # Mas respeitamos o valor da UI se ele for maior.
+            actual_max_retries = max(self.max_retries, 5)
+
+            for attempt in range(1, actual_max_retries + 1):
                 if self._cancelled:
                     break
 
@@ -690,6 +695,13 @@ class AudioPipeline(QObject):
                     
                     # 2. Texto final para o TTS (COM conversão fonética, se o usuário ativou na UI)
                     tts_text_input = verification_text
+                    
+                    # [NOVO] Alteração agressiva de texto para melhorar pronúncia nas últimas tentativas
+                    if attempt >= 4:
+                        self.log_message.emit(f"  ⚡ [#{idx}] Tentativa {attempt}: Aplicando reforço de pronúncia no texto...")
+                        # Passamos o kokoro_lang (1 char) ou o lang original
+                        tts_text_input = improve_pronunciation_for_tts(tts_text_input, lang=kokoro_lang)
+
                     if getattr(self, "use_phonetic", False):
                         from manhwa_app.advanced_text_processor import apply_phonetic
                         tts_text_input = apply_phonetic(tts_text_input)
@@ -790,7 +802,8 @@ class AudioPipeline(QObject):
                         temperature=p_temp,
                         exaggeration=p_cfg.get("exaggeration", self.exaggeration),
                         cfg_weight=p_cfg.get("cfg_weight", self.cfg_weight),
-                        seed=p_cfg.get("seed", self.seed),
+                        # [NOVO] Semente dinâmica para garantir regeneração real a cada tentativa
+                        seed=p_cfg.get("seed", self.seed) + (attempt - 1) if self.seed != 0 else 0,
                         sample_rate=self.sample_rate
                     )
 
@@ -818,9 +831,18 @@ class AudioPipeline(QObject):
                             transcription = transcribe_audio(str(wav_tmp), self.whisper_model)
                             if transcription:
                                 sim = _text_similarity(verification_text, transcription)
-                                best_sim = max(best_sim, sim)
-                                if sim < self.similarity_threshold and attempt < self.max_retries:
-                                    self.log_message.emit(f"  ↻ [#{idx}] Sim={sim:.2f} < {self.similarity_threshold} → retentando...")
+                                
+                                # [NOVO] Rastreamento da melhor versão
+                                if sim > best_sim:
+                                    best_sim = sim
+                                    # Salva este como o melhor até agora
+                                    best_path = audios_dir / f"audio_{idx}_best.wav"
+                                    shutil.copy2(str(wav_tmp), str(best_path))
+                                    best_wav_path = best_path
+                                    self.log_message.emit(f"  ⭐ [#{idx}] Nova melhor similaridade: {sim:.2f}")
+
+                                if sim < self.similarity_threshold and attempt < actual_max_retries:
+                                    self.log_message.emit(f"  ↻ [#{idx}] Sim={sim:.2f} < {self.similarity_threshold} (Tentativa {attempt}/{actual_max_retries}) → retentando...")
                                     _cleanup(wav_tmp)
                                     continue  # re-tenta
                             
@@ -904,7 +926,50 @@ class AudioPipeline(QObject):
                             pass
                     _cleanup(wav_tmp)
 
+            # [NOVO] Se após todas as tentativas não atingiu o threshold, mas temos uma "melhor" versão salva
+            if not success and best_wav_path and best_wav_path.exists():
+                self.log_message.emit(f"  ⚠ [#{idx}] Threshold não atingido ({best_sim:.2f} < {self.similarity_threshold}). Usando a melhor versão encontrada.")
+                # O loop de efeitos/silêncio abaixo espera que wav_tmp seja o arquivo a processar
+                shutil.copy2(str(best_wav_path), str(wav_tmp))
+                _cleanup(best_wav_path)
+                # Forçamos sucesso para prosseguir com o processamento do "melhor disponível"
+                # (O usuário pediu para "ficar com a melhor pronúncia")
+                
+                # --- Reaplica o bloco de processamento final (silêncio + FX) ---
+                try:
+                    # ---- Verificação final de sample_rate ----
+                    # No Kokoro costuma ser 24000, mas vamos garantir
+                    _s_rate = sample_rate if 'sample_rate' in locals() else 24000
+                    
+                    _wav_tmp_path = Path(str(wav_tmp))
+                    silence_out = str(_wav_tmp_path.with_name(_wav_tmp_path.stem.replace("_tmp", "_silence") + _wav_tmp_path.suffix))
+                    final_path_no_fx = _remove_silence_from_file(str(wav_tmp), silence_out, _s_rate)
+
+                    f_hp = p_cfg.get("fx_highpass", self.fx_highpass)
+                    f_de = p_cfg.get("fx_deesser", self.fx_deesser)
+                    f_cp = p_cfg.get("fx_compressor", self.fx_compressor)
+                    f_sl = p_cfg.get("fx_silence", self.fx_silence)
+                    f_rv = p_cfg.get("fx_reverb", self.fx_reverb)
+                    f_ln = p_cfg.get("fx_loudnorm", self.fx_loudnorm)
+
+                    _any_fx = f_hp or f_de or f_cp or f_sl or f_rv or f_ln
+                    if _any_fx:
+                        fx_config = {"production": {"audio": {"highpass": f_hp, "deesser": f_de, "compressor": f_cp, "reverb": f_rv, "remove_silence": f_sl, "normalize": f_ln}}}
+                        apply_audio_post_processing(final_path_no_fx, str(wav_final), fx_config)
+                    else:
+                        shutil.copy2(final_path_no_fx, str(wav_final))
+
+                    _cleanup(wav_tmp)
+                    _cleanup(silence_out)
+                    success = True
+                except Exception as _final_err:
+                    self.log_message.emit(f"  ✗ [#{idx}] Erro ao processar melhor versão: {_final_err}")
+
             if success:
+                # [NOVO] Limpa o lixo temporário do fallback na pasta
+                if best_wav_path and best_wav_path.exists():
+                    _cleanup(best_wav_path)
+                    
                 # CORRIGIDO: verificar que o arquivo realmente existe antes de emitir
                 # Evita preencher a lista de áudios com paths inválidos
                 if wav_final.exists():

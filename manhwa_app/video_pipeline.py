@@ -79,7 +79,7 @@ _CPU_COUNT = os.cpu_count() or 4
 # Movimentos disponíveis
 EFFECTS = [
     "zoom_in", "zoom_out", "pan_up", "pan_down",
-    "pan_left", "pan_right", "zoom_pan_diag"
+    "pan_left", "pan_right"
 ]
 
 
@@ -441,6 +441,7 @@ class VideoPipeline(QObject):
         pairs: List[Tuple[Union[str, Tuple[str, str]], Union[str, Tuple[str, str]]]],
         output_path: str,
         effect_mode: str = "auto",
+        layout_mode: str = "single",
         transition_mode: str = "fade",
         transition_time: float = 0.2,
         bg_music_path: str = "",
@@ -452,6 +453,7 @@ class VideoPipeline(QObject):
         self.pairs           = pairs
         self.output_path     = output_path
         self.effect_mode     = effect_mode
+        self.layout_mode     = layout_mode
         self.transition_mode = transition_mode
         self.transition_time = transition_time
         self.bg_music_path   = bg_music_path
@@ -489,8 +491,18 @@ class VideoPipeline(QObject):
         scenes_dir.mkdir(parents=True, exist_ok=True)
 
         clip_tasks = []
+        single_clip_count = 0
+        
+        # Embaralha a ordem base dos efeitos UMA VEZ por vídeo.
+        # Assim, o padrão se repete de forma coesa (Ex: A->C->B->D -> A->C->B->D) 
+        # mas muda toda vez que você clica em gerar, tirando a repetição constante do Preview!
+        import random
+        base_effects = ["pan_up", "pan_down", "zoom_in", "zoom_out"]
+        random.shuffle(base_effects)
+        
         for clip_i, pair in enumerate(self.pairs, start=1):
-            if isinstance(pair[0], tuple):
+            is_split = isinstance(pair[0], tuple)
+            if is_split:
                 a1, a2 = pair[0]
                 img1, img2 = pair[1]
                 audio_path = (a1, a2)
@@ -499,18 +511,23 @@ class VideoPipeline(QObject):
             else:
                 audio_path, image_path = pair
                 duration = _audio_duration(audio_path)
+                single_clip_count += 1
                 
             if duration <= 0:
                 continue
 
             if self.effect_mode == "auto":
-                effect = ["zoom_in", "zoom_out", "pan_up", "pan_down"][(clip_i - 1) % 4]
+                if is_split:
+                    effect = "auto"
+                else:
+                    effect = base_effects[(single_clip_count - 1) % 4]
             else:
                 effect = self.effect_mode
                 
             clip_name = f"scene_{clip_i:03d}.mp4"
             clip_mp4 = str(scenes_dir / clip_name)
             
+            # Formata qual será a animação base de feedback pro log
             clip_tasks.append((clip_i, audio_path, image_path, effect, duration, clip_mp4))
 
         if not clip_tasks:
@@ -705,4 +722,3 @@ class VideoPipeline(QObject):
                 self.finished.emit(False, f"Concat falhou. Ver log para detalhes.")
         except Exception as e:
             self.finished.emit(False, f"Erro no Mux final: {e}")
-

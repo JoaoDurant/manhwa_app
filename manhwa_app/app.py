@@ -1720,23 +1720,50 @@ class AudioTab(QWidget):
             _sp.Popen(["explorer", str(folder.resolve())])
 
     def configure_and_run_queued(self, task: "QueueTask"):
-        """Configura a aba Áudio para uma tarefa da fila e inicia geração."""
+        """Configura a aba Áudio para uma tarefa da fila e inicia geração.
+
+        A fila usa as configurações do sistema (TTS, Áudio, Imagens, etc.) como base.
+        Apenas os campos com override definido na tarefa são substituídos.
+        """
         self.project_edit.setText(task.project_name)
         lang  = task.lang_override  or self.preset_lang_combo.currentText()
         voice = task.voice_override or ""
         self._files = [{"path": task.txt_path, "voice": voice, "lang": lang}]
         self._refresh_list()
-        
+
         if task.lang_override:
             idx = self.preset_lang_combo.findText(task.lang_override)
             if idx >= 0: self.preset_lang_combo.setCurrentIndex(idx)
-        
+
         if task.voice_override:
             idx = self.preset_voice_combo.findData(task.voice_override)
-            if idx >= 0: self.preset_voice_combo.setCurrentIndex(idx)
-            
+            if idx >= 0:
+                self.preset_voice_combo.setCurrentIndex(idx)
+            else:
+                # Path de arquivo de clonagem (.wav/.mp3/.pt) — adiciona temporariamente
+                from pathlib import Path as _P
+                if _P(task.voice_override).exists():
+                    self.preset_voice_combo.addItem(
+                        f"📎 {_P(task.voice_override).name} (fila)", task.voice_override
+                    )
+                    idx = self.preset_voice_combo.findData(task.voice_override)
+                    if idx >= 0: self.preset_voice_combo.setCurrentIndex(idx)
+
+        # Propaga engine e submodelo override para a TtsConfigTab (mantém resto do sistema)
+        if task.engine_override or task.model_type_override:
+            main_win = self.window()
+            if hasattr(main_win, "tts_tab"):
+                tts = main_win.tts_tab
+                if task.engine_override:
+                    idx = tts.engine_combo.findData(task.engine_override)
+                    if idx >= 0: tts.engine_combo.setCurrentIndex(idx)
+                if task.model_type_override:
+                    idx = tts.model_combo.findData(task.model_type_override)
+                    if idx >= 0: tts.model_combo.setCurrentIndex(idx)
+
         self._queued_overrides = task
         self._start_normal()
+
 
     def get_generated_paths(self) -> List[str]:
 
@@ -3568,14 +3595,20 @@ class QueueTab(QWidget):
         fl.addWidget(QLabel("Engine Override:"), row, 0)
         self.q_engine_combo = QComboBox()
         self.q_engine_combo.addItem("— Usar Atual —", None)
-        for eng in ["chatterbox", "kokoro", "qwen", "indextts"]:
-            self.q_engine_combo.addItem(eng, eng)
+        self.q_engine_combo.addItem("Chatterbox TTS", "chatterbox")
+        self.q_engine_combo.addItem("Kokoro TTS", "kokoro")
+        self.q_engine_combo.addItem("Qwen3-TTS", "qwen")
+        self.q_engine_combo.addItem("IndexTTS (Zero-Shot)", "indextts")
+        self.q_engine_combo.currentIndexChanged.connect(self._on_q_engine_changed)
         fl.addWidget(self.q_engine_combo, row, 1)
 
+        # Submodelo — apenas visível quando Chatterbox está selecionado
         self.q_model_combo = QComboBox()
         self.q_model_combo.addItem("— Submodelo Atual —", None)
-        self.q_model_combo.addItem("turbo", "turbo")
-        self.q_model_combo.addItem("fast", "fast")
+        self.q_model_combo.addItem("⚡ Turbo  (Inglês, rápido)", "turbo")
+        self.q_model_combo.addItem("🌐 Multilingual  (Vários idiomas)", "multilingual")
+        self.q_model_combo.addItem("🔊 Original  (Expressivo)", "original")
+        self.q_model_combo.setToolTip("Apenas para Chatterbox TTS")
         fl.addWidget(self.q_model_combo, row, 2); row += 1
 
         fl.addWidget(QLabel("Voz (ID ou Caminho):"), row, 0)
@@ -3657,6 +3690,12 @@ class QueueTab(QWidget):
         f, _ = QFileDialog.getOpenFileName(self, "Arquivo de Voz", "", "Voz (*.pt *.wav *.mp3 *.pth)")
         if f:
             self.q_voice_edit.setText(f)
+
+    def _on_q_engine_changed(self):
+        """Mostra o submodelo apenas quando Chatterbox está selecionado (igual ao TtsConfigTab)."""
+        eng = self.q_engine_combo.currentData()
+        is_chatterbox = (eng == "chatterbox" or eng is None)
+        self.q_model_combo.setVisible(is_chatterbox)
 
     def _on_mode_changed(self):
         m = self.mode_combo.currentData()

@@ -12,6 +12,7 @@ import contextlib
 import subprocess
 import tempfile
 import threading
+import sys
 import numpy as np
 import torch
 import time
@@ -125,7 +126,7 @@ class _DummyAlignmentAnalyzer:
             if hasattr(tfmr, "config"):
                 try: tfmr.config.output_attentions = False
                 except Exception: pass
-                try: tfmr.config.attn_implementation = "eager"
+                try: tfmr.config.attn_implementation = "sdpa"
                 except Exception: pass
 
     def step(self, logits, next_token=None, **kwargs):
@@ -209,8 +210,8 @@ try:
 except ImportError:
     # Fallback to local copy
     kokoro_path = str(_REPO_ROOT / "Kokoro-TTS-Local-master")
+    import sys
     if kokoro_path not in sys.path:
-        import sys
         sys.path.append(kokoro_path)
     
     try:
@@ -599,15 +600,15 @@ def load_original() -> bool:
         logger.info(f"Chatterbox Original carregado em {model_device}.")
         if torch.cuda.is_available(): torch.cuda.synchronize()
 
-        # Force eager attn on the Original model to prevent output_attentions crash
+        # Enable SDPA for speed and VRAM reduction
         if hasattr(chatterbox_model, "t3") and hasattr(chatterbox_model.t3, "model"):
             if hasattr(chatterbox_model.t3.model, "config"):
                 try:
-                    chatterbox_model.t3.model.config.attn_implementation = "eager"
+                    chatterbox_model.t3.model.config.attn_implementation = "sdpa"
                     chatterbox_model.t3.model.config.output_attentions = False
                 except Exception: pass
         if hasattr(chatterbox_model, "set_attn_implementation"):
-            try: chatterbox_model.set_attn_implementation("eager")
+            try: chatterbox_model.set_attn_implementation("sdpa")
             except Exception: pass
 
         # Re-patch AlignmentStreamAnalyzer with known eos_idx
@@ -661,24 +662,24 @@ def load_multilingual() -> bool:
         _optimize_for_device(model_device)
 
         from chatterbox import ChatterboxMultilingualTTS as _Mtl
-        # FIX 1: Try passing attn_implementation=eager directly to from_pretrained.
+        # FIX 1: Try passing attn_implementation=sdpa directly to from_pretrained.
         # Newer versions of the lib may accept it; older ones will raise TypeError.
-        print("[ENGINE] Tentando carregar Multilingual com attn_implementation=eager...")
+        print("[ENGINE] Tentando carregar Multilingual com attn_implementation=sdpa...")
         try:
-            chatterbox_model = _Mtl.from_pretrained(device=model_device, attn_implementation="eager")
-            logger.info("[MULTILINGUAL] Carregado com attn_implementation=eager via from_pretrained.")
+            chatterbox_model = _Mtl.from_pretrained(device=model_device, attn_implementation="sdpa")
+            logger.info("[MULTILINGUAL] Carregado com attn_implementation=sdpa via from_pretrained.")
         except TypeError:
             logger.warning("[MULTILINGUAL] from_pretrained nao aceita attn_implementation. Carregando sem o argumento.")
             chatterbox_model = _Mtl.from_pretrained(device=model_device)
 
-        # FORÇAR EM TODAS AS CAMADAS
+        # FORÇAR SDPA EM TODAS AS CAMADAS para otimização
         if hasattr(chatterbox_model, "t3") and hasattr(chatterbox_model.t3, "model"):
             if hasattr(chatterbox_model.t3.model, "config"):
-                chatterbox_model.t3.model.config.attn_implementation = "eager"
+                chatterbox_model.t3.model.config.attn_implementation = "sdpa"
             
         # FORÇAR também via método (Transformers moderno)
         if hasattr(chatterbox_model, "set_attn_implementation"):
-            chatterbox_model.set_attn_implementation("eager")
+            chatterbox_model.set_attn_implementation("sdpa")
 
         # FIX 2: Force output_attentions=False on ALL submodules that have a config.
         # This catches any attention layer that may still hold a stale flag.
@@ -708,8 +709,13 @@ def load_multilingual() -> bool:
         except Exception as _fp:
             logger.warning(f"[MULTILINGUAL] Instance forward patch falhou (nao critico): {_fp}")
 
-        try: chatterbox_model = chatterbox_model.float()
-        except AttributeError: pass
+        # [OTIMIZAÇÃO 5070 Ti] BFloat16 em vez de float32 para acelerar geração e cortar uso de VRAM
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            try: chatterbox_model = chatterbox_model.bfloat16()
+            except AttributeError: pass
+        else:
+            try: chatterbox_model = chatterbox_model.half()
+            except AttributeError: pass
 
         loaded_model_type = "multilingual"
         loaded_model_class_name = "ChatterboxMultilingualTTS"
@@ -858,17 +864,16 @@ def synthesize(
     use_cuda       = (model_device == "cuda")
     is_multilingual = (loaded_model_type == "multilingual")
 
-    # [FIX] Turbo can be sensitive to dtype mismatches (Float16 vs BFloat16/Double).
-    # We disable bf16 autocast for turbo to maintain stability.
-    if use_cuda and not is_multilingual and loaded_model_type != "turbo" and torch.cuda.is_bf16_supported():
+    # [OTIMIZAÇÃO] Habilitar autocast bfloat16 para TODOS os modelos na série RTX 40/50
+    if use_cuda and torch.cuda.is_bf16_supported():
         autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    elif use_cuda:
+        autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16)
     else:
         autocast_ctx = contextlib.nullcontext()
 
     with _engine_lock:
         _is_generating = True
-
-    if torch.cuda.is_available(): torch.cuda.synchronize()
 
     with _synthesis_lock:
         try:

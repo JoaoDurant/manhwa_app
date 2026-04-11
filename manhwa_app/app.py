@@ -1697,8 +1697,8 @@ class AudioTab(QWidget):
         def _on_regen_done(success, msg):
             Path(tmp_txt).unlink(missing_ok=True)
             self._regen_thread.quit()
-            # BUG FIX: era 'thread.wait' (NameError) — referência correta é self._regen_thread
-            self._regen_thread.wait(3000)   # timeout de 3s
+            # CORRIGIDO: aguardar a thread terminar para evitar 'QThread destroyed while running'
+            thread.wait(3000)   # timeout de 3s
             new_wav = (Path(self.output_root_edit.text().strip() or "output") / project / "audios" / "audio_1.wav")
             if success and new_wav.exists():
                 import shutil
@@ -1720,50 +1720,23 @@ class AudioTab(QWidget):
             _sp.Popen(["explorer", str(folder.resolve())])
 
     def configure_and_run_queued(self, task: "QueueTask"):
-        """Configura a aba Áudio para uma tarefa da fila e inicia geração.
-
-        A fila usa as configurações do sistema (TTS, Áudio, Imagens, etc.) como base.
-        Apenas os campos com override definido na tarefa são substituídos.
-        """
+        """Configura a aba Áudio para uma tarefa da fila e inicia geração."""
         self.project_edit.setText(task.project_name)
         lang  = task.lang_override  or self.preset_lang_combo.currentText()
         voice = task.voice_override or ""
         self._files = [{"path": task.txt_path, "voice": voice, "lang": lang}]
         self._refresh_list()
-
+        
         if task.lang_override:
             idx = self.preset_lang_combo.findText(task.lang_override)
             if idx >= 0: self.preset_lang_combo.setCurrentIndex(idx)
-
+        
         if task.voice_override:
             idx = self.preset_voice_combo.findData(task.voice_override)
-            if idx >= 0:
-                self.preset_voice_combo.setCurrentIndex(idx)
-            else:
-                # Path de arquivo de clonagem (.wav/.mp3/.pt) — adiciona temporariamente
-                from pathlib import Path as _P
-                if _P(task.voice_override).exists():
-                    self.preset_voice_combo.addItem(
-                        f"📎 {_P(task.voice_override).name} (fila)", task.voice_override
-                    )
-                    idx = self.preset_voice_combo.findData(task.voice_override)
-                    if idx >= 0: self.preset_voice_combo.setCurrentIndex(idx)
-
-        # Propaga engine e submodelo override para a TtsConfigTab (mantém resto do sistema)
-        if task.engine_override or task.model_type_override:
-            main_win = self.window()
-            if hasattr(main_win, "tts_tab"):
-                tts = main_win.tts_tab
-                if task.engine_override:
-                    idx = tts.engine_combo.findData(task.engine_override)
-                    if idx >= 0: tts.engine_combo.setCurrentIndex(idx)
-                if task.model_type_override:
-                    idx = tts.model_combo.findData(task.model_type_override)
-                    if idx >= 0: tts.model_combo.setCurrentIndex(idx)
-
+            if idx >= 0: self.preset_voice_combo.setCurrentIndex(idx)
+            
         self._queued_overrides = task
         self._start_normal()
-
 
     def get_generated_paths(self) -> List[str]:
 
@@ -3595,20 +3568,14 @@ class QueueTab(QWidget):
         fl.addWidget(QLabel("Engine Override:"), row, 0)
         self.q_engine_combo = QComboBox()
         self.q_engine_combo.addItem("— Usar Atual —", None)
-        self.q_engine_combo.addItem("Chatterbox TTS", "chatterbox")
-        self.q_engine_combo.addItem("Kokoro TTS", "kokoro")
-        self.q_engine_combo.addItem("Qwen3-TTS", "qwen")
-        self.q_engine_combo.addItem("IndexTTS (Zero-Shot)", "indextts")
-        self.q_engine_combo.currentIndexChanged.connect(self._on_q_engine_changed)
+        for eng in ["chatterbox", "kokoro", "qwen", "indextts"]:
+            self.q_engine_combo.addItem(eng, eng)
         fl.addWidget(self.q_engine_combo, row, 1)
 
-        # Submodelo — apenas visível quando Chatterbox está selecionado
         self.q_model_combo = QComboBox()
         self.q_model_combo.addItem("— Submodelo Atual —", None)
-        self.q_model_combo.addItem("⚡ Turbo  (Inglês, rápido)", "turbo")
-        self.q_model_combo.addItem("🌐 Multilingual  (Vários idiomas)", "multilingual")
-        self.q_model_combo.addItem("🔊 Original  (Expressivo)", "original")
-        self.q_model_combo.setToolTip("Apenas para Chatterbox TTS")
+        self.q_model_combo.addItem("turbo", "turbo")
+        self.q_model_combo.addItem("fast", "fast")
         fl.addWidget(self.q_model_combo, row, 2); row += 1
 
         fl.addWidget(QLabel("Voz (ID ou Caminho):"), row, 0)
@@ -3646,40 +3613,6 @@ class QueueTab(QWidget):
         btn_add.clicked.connect(self._add_task)
         fl.addWidget(btn_add, row, 0, 1, 3); row += 1
         lv.addWidget(add_group)
-
-        # ── Testar Voz ────────────────────────────────────────────────
-        test_group = QGroupBox("🎙 Testar Voz (Preview Rápido)")
-        tl = QGridLayout(test_group)
-        tl.setSpacing(8)
-
-        tl.addWidget(QLabel("Texto:"), 0, 0)
-        self.test_text_edit = QLineEdit()
-        self.test_text_edit.setPlaceholderText(
-            "Digite um texto curto para testar a voz configurada acima…"
-        )
-        tl.addWidget(self.test_text_edit, 0, 1)
-
-        btn_row = QHBoxLayout()
-        self.btn_test_voice = QPushButton("▶ Testar Voz")
-        self.btn_test_voice.setMinimumHeight(34)
-        self.btn_test_voice.setObjectName("primary")
-        self.btn_test_voice.clicked.connect(self._test_voice_preview)
-        self.btn_test_stop = QPushButton("⏹ Parar")
-        self.btn_test_stop.setMinimumHeight(34)
-        self.btn_test_stop.setEnabled(False)
-        self.btn_test_stop.clicked.connect(self._stop_test_preview)
-        btn_row.addWidget(self.btn_test_voice)
-        btn_row.addWidget(self.btn_test_stop)
-        btn_row.addStretch()
-        tl.addLayout(btn_row, 1, 0, 1, 2)
-
-        self.lbl_test_status = QLabel("Pronto.")
-        self.lbl_test_status.setStyleSheet("color:#888; font-size:10px;")
-        tl.addWidget(self.lbl_test_status, 2, 0, 1, 2)
-        lv.addWidget(test_group)
-        self._test_thread = None
-        self._test_player = None
-
 
         lv.addWidget(QLabel("📋 Tarefas Pendentes:"))
         self.scroll = QScrollArea()
@@ -3725,134 +3658,6 @@ class QueueTab(QWidget):
         if f:
             self.q_voice_edit.setText(f)
 
-    def _test_voice_preview(self):
-        """Gera um preview de áudio curto usando as configs da tarefa atual (sem adicionar à fila)."""
-        text = self.test_text_edit.text().strip()
-        if not text:
-            # Usa texto de exemplo baseado no idioma selecionado
-            lang = self.q_lang_combo.currentData() or "en"
-            text = SAMPLE_TEXTS.get(lang, SAMPLE_TEXTS["en"])
-
-        # Se uma geração anterior ainda roda, cancela primeiro
-        if self._test_thread and self._test_thread.isRunning():
-            self._stop_test_preview()
-
-        self.btn_test_voice.setEnabled(False)
-        self.btn_test_stop.setEnabled(True)
-        self.lbl_test_status.setText("⏳ Gerando preview…")
-
-        # Monta config baseada nas seleções do form da fila
-        main_win = self.window()
-        tts_cfg = main_win.tts_tab.get_session() if hasattr(main_win, "tts_tab") else {}
-
-        engine  = self.q_engine_combo.currentData() or tts_cfg.get("tts_engine", "chatterbox")
-        model_t = self.q_model_combo.currentData()  or tts_cfg.get("model_type", "turbo")
-        voice   = self.q_voice_edit.text().strip()  or None
-        lang    = self.q_lang_combo.currentData()   or "en"
-
-        import tempfile, os
-        tmp_fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
-        os.close(tmp_fd)
-
-        class _PreviewWorker(QThread):
-            done = Signal(bool, str)   # success, wav_path_or_msg
-
-            def __init__(self, text, engine, model_t, voice, lang, out_path):
-                super().__init__()
-                self._text    = text
-                self._engine  = engine
-                self._model_t = model_t
-                self._voice   = voice
-                self._lang    = lang
-                self._out     = out_path
-
-            def run(self):
-                try:
-                    import engine as eng_mod
-                    import soundfile as _sf
-                    import numpy as _np
-
-                    # Garante que o engine correto está carregado
-                    if not eng_mod.switch_to_engine(self._engine, self._model_t):
-                        self.done.emit(False, f"Falha ao carregar engine {self._engine}")
-                        return
-
-                    e = self._engine.lower()
-                    if e in ("chatterbox", "turbo", "original", "multilingual"):
-                        wav, sr = eng_mod.synthesize(
-                            self._text,
-                            audio_prompt_path=self._voice,
-                            language=self._lang,
-                        )
-                    elif e == "kokoro":
-                        wav, sr = eng_mod.synthesize_kokoro(
-                            self._text, voice=self._voice or "af_heart", lang_code=self._lang
-                        )
-                    elif e in ("qwen", "qwen3"):
-                        wav, sr = eng_mod.synthesize_qwen(
-                            self._text, speaker=self._voice or "Ryan"
-                        )
-                    else:
-                        self.done.emit(False, f"Preview não suportado para {self._engine}")
-                        return
-
-                    if wav is None:
-                        self.done.emit(False, "Engine não gerou áudio")
-                        return
-
-                    import torch
-                    if isinstance(wav, torch.Tensor):
-                        wav = wav.squeeze().cpu().float().numpy()
-                    _sf.write(self._out, wav, sr)
-                    self.done.emit(True, self._out)
-                except Exception as ex:
-                    import traceback; traceback.print_exc()
-                    self.done.emit(False, str(ex))
-
-        self._test_tmp_wav = tmp_wav
-        self._test_thread = _PreviewWorker(text, engine, model_t, voice, lang, tmp_wav)
-        self._test_thread.setStackSize(16 * 1024 * 1024)
-        self._test_thread.done.connect(self._on_test_done)
-        self._test_thread.start()
-
-    @Slot(bool, str)
-    def _on_test_done(self, success: bool, path_or_msg: str):
-        self.btn_test_voice.setEnabled(True)
-        self.btn_test_stop.setEnabled(False)
-        if not success:
-            self.lbl_test_status.setText(f"❌ {path_or_msg}")
-            return
-        self.lbl_test_status.setText("✅ Preview gerado — reproduzindo…")
-        # Reproduz o WAV gerado
-        from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-        from PySide6.QtCore import QUrl
-        if self._test_player is None:
-            self._test_audio_out = QAudioOutput()
-            self._test_player = QMediaPlayer()
-            self._test_player.setAudioOutput(self._test_audio_out)
-            self._test_audio_out.setVolume(1.0)
-        self._test_player.stop()
-        self._test_player.setSource(QUrl.fromLocalFile(path_or_msg))
-        self._test_player.play()
-
-    def _stop_test_preview(self):
-        if self._test_player:
-            self._test_player.stop()
-        if self._test_thread and self._test_thread.isRunning():
-            self._test_thread.quit()
-            self._test_thread.wait(3000)
-        self.btn_test_voice.setEnabled(True)
-        self.btn_test_stop.setEnabled(False)
-        self.lbl_test_status.setText("Parado.")
-
-
-
-    def _on_q_engine_changed(self):
-        """Mostra o submodelo apenas quando Chatterbox está selecionado (igual ao TtsConfigTab)."""
-        eng = self.q_engine_combo.currentData()
-        is_chatterbox = (eng == "chatterbox" or eng is None)
-        self.q_model_combo.setVisible(is_chatterbox)
-
     def _on_mode_changed(self):
         m = self.mode_combo.currentData()
         is_alt = (m == "audio+video+alt")
@@ -3878,32 +3683,6 @@ class QueueTab(QWidget):
         )
         self._tasks.append(task)
         self._refresh_list()
-
-    def _refresh_list(self):
-        """Atualiza a UI da lista de tarefas e notifica o painel."""
-        # Remove todos os widgets atuais, exceto o stretch no final
-        while self._list_layout.count() > 1:
-            item = self._list_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        for i, t in enumerate(self._tasks):
-            status_map = {
-                "pending": "⏳ Pendente",
-                "running": "▶️ Executando...",
-                "done": "✅ Concluído",
-                "error": "❌ Erro"
-            }
-            lbl = QLabel(f"<b>{i+1}. {t.project_name}</b> — Engine: {t.engine_override or 'Atual'} — Status: {status_map.get(t.status, t.status)}")
-            if t.status == "running":
-                lbl.setStyleSheet("color:#60c060;")
-            elif t.status == "error":
-                lbl.setStyleSheet("color:#e05050;")
-                
-            self._list_layout.insertWidget(self._list_layout.count() - 1, lbl)
-            
-        self._notify_dashboard()
-
     def _notify_dashboard(self):
         w = self.window()
         if hasattr(w, "dashboard_tab"):
@@ -3928,8 +3707,8 @@ class QueueTab(QWidget):
             self._orchestrator.task_finished.connect(db.on_task_finished)
             self._orchestrator.queue_log.connect(db.on_queue_log)
 
-        # O engine auto-switch é tratado via audio_tab.engine_switch_requested → MainWindow._handle_audio_tab_engine_switch
-        # O QueueCoordinator (QueueOrchestrator) NÃO tem sinal engine_switch_needed — removido para evitar AttributeError.
+        # engine auto-switch
+        self._orchestrator.engine_switch_needed.connect(w._handle_audio_tab_engine_switch)
 
         self._orchestrator.task_started.connect(self._on_task_started)
         self._orchestrator.task_finished.connect(self._on_task_finished)
@@ -4037,12 +3816,8 @@ class MainWindow(QMainWindow):
             self.model_status_label.setStyleSheet("color:#e05555;font-size:11px;")
 
         # [AUDIO PIPELINE FIX] Liberar a QThread se estivermos rodando um batch de múltiplos idiomas
-        # BUG FIX: checar também se _switch_event existe, pois o pipeline pode ter sido deletado
-        if (hasattr(self, "audio_tab")
-                and hasattr(self.audio_tab, "_pipeline")
-                and self.audio_tab._pipeline is not None
-                and hasattr(self.audio_tab._pipeline, "_switch_event")):
-            self.audio_tab._pipeline.confirm_switch_done()
+        if hasattr(self, "audio_tab") and hasattr(self.audio_tab, "_pipeline") and self.audio_tab._pipeline is not None:
+             self.audio_tab._pipeline.confirm_switch_done()
 
     @Slot(str, str)
     def _handle_audio_tab_engine_switch(self, engine_str: str, model_type: str):

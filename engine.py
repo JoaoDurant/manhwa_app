@@ -1625,26 +1625,45 @@ def switch_to_engine(engine_name: str, model_type: Optional[str] = None) -> bool
         print("[ENGINE] Troca bloqueada (transicao ja em andamento)")
         return False
 
-    # FIX 3: Block switch if generation is active
+    # Bloquear se carregamento ou geração já estão ativos
     with _engine_lock:
         if _is_generating:
-            logger.error("[ENGINE] switch_to_engine bloqueado: geracao ativa. Aguarde o fim da geracao antes de trocar.")
+            logger.error("[ENGINE] switch_to_engine bloqueado: geracao ativa.")
+            return False
+        if _is_loading:
+            logger.error("[ENGINE] switch_to_engine bloqueado: carregamento ja em andamento.")
             return False
 
     with _switch_lock:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-            
+
         eng = engine_name.lower().replace("-", "_").replace(" ", "_")
         print(f"[DEBUG] Engine solicitado: {eng} (submodelo: {model_type})")
         logger.info(f"switch_to_engine: {eng} | submodelo: {model_type}")
 
         if eng in ("chatterbox", "turbo", "original", "multilingual"):
-            # Se chamou "turbo" diretamente, usamos isso como model_type
+            # Se chamou "turbo"/"original"/"multilingual" diretamente, usa como model_type
             if eng != "chatterbox":
                 model_type = eng
+
+            # BUG FIX 6: Descarregar submodelo anterior se for diferente do solicitado
+            # Sem isso, turbo→multilingual mantém dois modelos na VRAM → OOM
+            resolved_type = (model_type or "turbo").lower()
+            if MODEL_LOADED and chatterbox_model is not None and loaded_model_type != resolved_type:
+                logger.info(
+                    f"[ENGINE] Trocando submodelo Chatterbox: {loaded_model_type} → {resolved_type}. "
+                    "Descarregando modelo anterior..."
+                )
+                # unload_all_for_switch cuida de limpar chatterbox_model e VRAM
+                unload_all_for_switch()
+                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
             return load_model(model_type=model_type)
 
+        # Para engines não-Chatterbox: descarregar tudo primeiro
         unload_all_for_switch()
         torch.cuda.empty_cache()
         if torch.cuda.is_available(): torch.cuda.synchronize()
@@ -1662,6 +1681,7 @@ def switch_to_engine(engine_name: str, model_type: Optional[str] = None) -> bool
 
         logger.error(f"Engine desconhecido: '{engine_name}'.")
         return False
+
 
 
 def get_active_engine() -> str:

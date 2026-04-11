@@ -334,6 +334,12 @@ _engine_lock = threading.Lock()
 _is_loading = False
 _is_generating = False
 
+# Variáveis de Estado de Voice Cache (Performance)
+_last_voice_path = None
+_last_voice_eng_type = None
+_last_voice_lang = None
+_last_voice_exag = None
+
 # Variaveis de estado de device
 FORCE_CPU = os.environ.get("MANHWA_FORCE_CPU", "0") == "1"
 
@@ -880,17 +886,33 @@ def synthesize(
             print("[ENGINE] Gerando áudio...")
             start_time = time.time()
             with torch.inference_mode(), autocast_ctx:
-                # [VOICE VALIDATION] - Corrigindo erro 'Sem clonagem' e paths invalidos
+                # [VOICE VALIDATION E CACHE GLOBAL] - Otimização extrema para acelerar a geração contínua
+                final_prompt_path = audio_prompt_path
                 if not audio_prompt_path or not isinstance(audio_prompt_path, str) or not os.path.exists(audio_prompt_path):
                     logger.debug(f"[VOICE] Selecionado: {audio_prompt_path} -> Path inválido ou Base. Usando None.")
+                    final_prompt_path = None
                     audio_prompt_path = None
                 else:
-                    logger.debug(f"[VOICE] Path resolvido: {audio_prompt_path}")
+                    global _last_voice_path, _last_voice_eng_type, _last_voice_lang, _last_voice_exag
+                    
+                    if (_last_voice_path == audio_prompt_path and 
+                        _last_voice_eng_type == loaded_model_type and
+                        _last_voice_lang == language and
+                        _last_voice_exag == exaggeration):
+                        
+                        logger.debug(f"[VOICE] Cache HIT! Reutilizando embeddings na VRAM para {Path(audio_prompt_path).name}")
+                        final_prompt_path = None  # None força o Chatterbox a usar self.conds existente
+                    else:
+                        logger.info(f"[VOICE] Novo perfil de voz detectado, extraindo embeddings p/ VRAM...")
+                        _last_voice_path = audio_prompt_path
+                        _last_voice_eng_type = loaded_model_type
+                        _last_voice_lang = language
+                        _last_voice_exag = exaggeration
 
                 if loaded_model_type == "turbo":
                     wav_tensor = chatterbox_model.generate(
                         text=text,
-                        audio_prompt_path=audio_prompt_path,
+                        audio_prompt_path=final_prompt_path,
                         temperature=temperature,
                         min_p=min_p,
                         top_p=top_p,
@@ -904,7 +926,7 @@ def synthesize(
                     wav_tensor = chatterbox_model.generate(
                         text=text,
                         language_id=language,
-                        audio_prompt_path=audio_prompt_path,
+                        audio_prompt_path=final_prompt_path,
                         temperature=temperature,
                         exaggeration=exaggeration,
                         cfg_weight=cfg_weight,
@@ -916,7 +938,7 @@ def synthesize(
                     # ORIGINAL
                     wav_tensor = chatterbox_model.generate(
                         text=text,
-                        audio_prompt_path=audio_prompt_path,
+                        audio_prompt_path=final_prompt_path,
                         temperature=temperature,
                         exaggeration=exaggeration,
                         cfg_weight=cfg_weight,
@@ -1095,8 +1117,6 @@ def synthesize_kokoro(
 
     with _engine_lock:
         _is_generating = True
-
-    if torch.cuda.is_available(): torch.cuda.synchronize()
 
     with _synthesis_lock:
         try:
@@ -1666,7 +1686,6 @@ def switch_to_engine(engine_name: str, model_type: Optional[str] = None) -> bool
         # Para engines não-Chatterbox: descarregar tudo primeiro
         unload_all_for_switch()
         torch.cuda.empty_cache()
-        if torch.cuda.is_available(): torch.cuda.synchronize()
 
         if eng == "kokoro":
             return load_kokoro_engine()

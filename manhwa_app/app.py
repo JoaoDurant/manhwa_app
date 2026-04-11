@@ -3878,6 +3878,32 @@ class QueueTab(QWidget):
         )
         self._tasks.append(task)
         self._refresh_list()
+
+    def _refresh_list(self):
+        """Atualiza a UI da lista de tarefas e notifica o painel."""
+        # Remove todos os widgets atuais, exceto o stretch no final
+        while self._list_layout.count() > 1:
+            item = self._list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for i, t in enumerate(self._tasks):
+            status_map = {
+                "pending": "⏳ Pendente",
+                "running": "▶️ Executando...",
+                "done": "✅ Concluído",
+                "error": "❌ Erro"
+            }
+            lbl = QLabel(f"<b>{i+1}. {t.project_name}</b> — Engine: {t.engine_override or 'Atual'} — Status: {status_map.get(t.status, t.status)}")
+            if t.status == "running":
+                lbl.setStyleSheet("color:#60c060;")
+            elif t.status == "error":
+                lbl.setStyleSheet("color:#e05050;")
+                
+            self._list_layout.insertWidget(self._list_layout.count() - 1, lbl)
+            
+        self._notify_dashboard()
+
     def _notify_dashboard(self):
         w = self.window()
         if hasattr(w, "dashboard_tab"):

@@ -117,8 +117,6 @@ class ModelLoaderThread(QThread):
                     "turbo": "Chatterbox Turbo",
                     "multilingual": "Chatterbox Multilingual",
                     "original": "Chatterbox Original",
-                    "qwen": "Qwen3-TTS",
-                    "indextts": "IndexTTS",
                     "kokoro": "Kokoro TTS"
                 }
                 display_name = name_map.get(target, target.capitalize())
@@ -367,8 +365,6 @@ class TtsConfigTab(QWidget):
         self.engine_combo = QComboBox()
         self.engine_combo.addItem("Chatterbox TTS", "chatterbox")
         self.engine_combo.addItem("Kokoro TTS", "kokoro")
-        self.engine_combo.addItem("Qwen3-TTS (All)", "qwen")
-        self.engine_combo.addItem("IndexTTS (Zero-Shot)", "indextts")
         self.engine_combo.setToolTip("Qual motor gerador base usar.")
         self.engine_combo.setMinimumHeight(32)
         mg.addWidget(self.engine_combo, 0, 1)
@@ -867,6 +863,11 @@ class AudioTab(QWidget):
         btn_custom.clicked.connect(self._browse_custom_voice)
         vg.addWidget(btn_custom, 0, 2)
         
+        self.save_voice_project_chk = QCheckBox("Salvar Cópia no Projeto")
+        self.save_voice_project_chk.setChecked(True)
+        self.save_voice_project_chk.setToolTip("Garante que a voz clonada nunca seja perdida ao vinculá-la na pasta do projeto final.")
+        vg.addWidget(self.save_voice_project_chk, 0, 3)
+        
         vg.addWidget(QLabel("Idioma:"), 1, 0)
         self.preset_lang_combo = QComboBox()
         self.preset_lang_combo.addItems(["en", "pt", "es", "fr", "ja", "ko", "zh"])
@@ -1171,7 +1172,7 @@ class AudioTab(QWidget):
                     self.preset_voice_combo.addItem(f"🔊 {format_name_chatterbox(path)}", str(path))
                 for path in sorted(cloned, key=natural_sort_key):
                     self.preset_voice_combo.addItem(f"👤 {format_name_chatterbox(path)} (Clonada)", str(path))
-                    
+
         elif engine == "kokoro":
             # ── Vozes built-in do hexgrad/Kokoro-82M ──────────────────────────
             KOKORO_BUILTIN = [
@@ -1302,13 +1303,17 @@ class AudioTab(QWidget):
             idx = self.preset_voice_combo.findData(old_val)
             if idx >= 0:
                 self.preset_voice_combo.setCurrentIndex(idx)
+            else:
+                # Caso especial: se era um caminho customizado externo, re-adiciona para não "sumir"
+                if os.path.exists(old_val):
+                    name = Path(old_val).name
+                    self.preset_voice_combo.addItem(f"👤 {name} (Custom)", old_val)
+                    self.preset_voice_combo.setCurrentIndex(self.preset_voice_combo.count() - 1)
 
     def _update_engine_ui(self, engine_mode: str):
         # Oculta botões inuteis no Qwen
         self.qwen_group.setVisible(engine_mode == "qwen")
         self._on_qwen_task_change()
-        # Se for IndexTTS, garantir que o grupo de clonagem (se houver) esteja visível ou o modo correto
-        # (Neste app, IndexTTS usa o seletor comum de vozes que já populamos acima)
 
     def _on_qwen_task_change(self):
         task = self.qwen_task_combo.currentText()
@@ -1478,6 +1483,23 @@ class AudioTab(QWidget):
         voice_val = self.preset_voice_combo.currentData()
         lang_val = self.preset_lang_combo.currentText()
         
+        # --- LOCALIZAR VOZ NO PROJETO (ANTI-SUMIÇO) ---
+        if voice_val and os.path.exists(voice_val):
+            if hasattr(self, "save_voice_project_chk") and self.save_voice_project_chk.isChecked():
+                _pname = project_override or (self.project_edit.text().strip() or "projeto")
+                _outroot = self.output_root_edit.text().strip() or "output"
+                proj_dir = Path(_outroot) / _pname
+                proj_dir.mkdir(parents=True, exist_ok=True)
+                
+                local_voice_path = proj_dir / f"ref_voz_projeto{Path(voice_val).suffix}"
+                import shutil
+                try:
+                    if Path(voice_val).resolve() != local_voice_path.resolve():
+                        shutil.copy2(voice_val, local_voice_path)
+                    voice_val = str(local_voice_path)
+                except Exception as e:
+                    logger.warning(f"Erro ao salvar cópia de voz no projeto: {e}")
+
 
         base_speed = cfg.get("speed", 1.0)
         base_temp = cfg.get("temperature", 0.65)
@@ -1753,15 +1775,26 @@ class AudioTab(QWidget):
             if idx >= 0:
                 self.preset_voice_combo.setCurrentIndex(idx)
             else:
-                idx = self.preset_voice_combo.findText(data["preset_voice"])
-                if idx >= 0: self.preset_voice_combo.setCurrentIndex(idx)
+                # Se for um caminho customizado que não está na lista, adiciona ele
+                v_path = data["preset_voice"]
+                if v_path and os.path.exists(v_path):
+                    name = Path(v_path).name
+                    self.preset_voice_combo.addItem(f"👤 {name} (Carregada)", v_path)
+                    self.preset_voice_combo.setCurrentIndex(self.preset_voice_combo.count() - 1)
+                else:
+                    idx = self.preset_voice_combo.findText(data["preset_voice"])
+                    if idx >= 0: self.preset_voice_combo.setCurrentIndex(idx)
+        
+        if "save_voice_project" in data and hasattr(self, "save_voice_project_chk"):
+            self.save_voice_project_chk.setChecked(data["save_voice_project"])
 
     def get_session(self) -> dict:
         return {
             "project": self.project_edit.text().strip(),
             "output_root": self.output_root_edit.text().strip(),
             "preset_lang": self.preset_lang_combo.currentText(),
-            "preset_voice": self.preset_voice_combo.currentData() or self.preset_voice_combo.currentText()
+            "preset_voice": self.preset_voice_combo.currentData() or self.preset_voice_combo.currentText(),
+            "save_voice_project": self.save_voice_project_chk.isChecked() if hasattr(self, "save_voice_project_chk") else True
         }
 
     def reset_defaults(self):
@@ -3568,7 +3601,7 @@ class QueueTab(QWidget):
         fl.addWidget(QLabel("Engine Override:"), row, 0)
         self.q_engine_combo = QComboBox()
         self.q_engine_combo.addItem("— Usar Atual —", None)
-        for eng in ["chatterbox", "kokoro", "qwen", "indextts"]:
+        for eng in ["chatterbox", "kokoro"]:
             self.q_engine_combo.addItem(eng, eng)
         fl.addWidget(self.q_engine_combo, row, 1)
 

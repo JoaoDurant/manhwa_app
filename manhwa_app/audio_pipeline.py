@@ -44,11 +44,14 @@ from PySide6.QtCore import QObject, Signal
 
 # --- OTIMIZAÇÃO CUDA RTX (5070 Ti) ---
 if torch.cuda.is_available():
-    # torch.backends.cudnn.benchmark = True  # DESATIVADO: causa lentidão em TTS com tamanhos de frases variados
+    # torch.backends.cudnn.benchmark = True  # DESATIVADO no Kokoro, mas útil para Chatterbox
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     try:
         torch.set_float32_matmul_precision('high')
+        # [MAX PERFORMANCE] Forçar Flash Attention / SDPA (Hardware max util)
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
     except Exception:
         pass
 
@@ -66,8 +69,12 @@ if str(_REPO_ROOT) not in sys.path:
 try:
     import engine as _engine
     import utils as _utils
-    # Importar config do diretório raiz
+    # =============================================================================
+    # Imports de suporte
+    # =============================================================================
     from config import config_manager as _config_manager
+    from queue import Queue
+    from concurrent.futures import ThreadPoolExecutor
     from manhwa_app.text_processor import process_text_fluency, init_spacy
     from manhwa_app.advanced_text_processor import process_text, improve_pronunciation_for_tts
     from manhwa_app.audio_fx import apply_audio_post_processing
@@ -121,24 +128,23 @@ def split_into_paragraphs(text: str) -> List[str]:
     return result
 
 
-def _normalize_text_for_tts(text: str, lang: str = "en") -> str:
+def _normalize_text_for_tts(text: str, lang: str = "en", engine: str = "chatterbox") -> str:
     """
     Normaliza o texto antes de enviar para TTS.
-    Corrige o problema do align_stream_analyzer do Chatterbox multilingual
-    que detecta tokens de vírgula repetidos e força EOS prematuramente.
     """
+    if engine == "kokoro":
+        # BYPASS PARA KOKORO: O modelo v1.0 é extremamente sensível à pontuação original.
+        # Qualquer alteração (ex: mudar vírgula por ponto) mata a prosódia natural.
+        # Apenas limpamos espaços duplos e caracteres invisíveis.
+        text = text.replace('\ufeff', '')
+        text = re.sub(r' {2,}', ' ', text)
+        return text.strip()
+
     # 1) Normalizar espaços duplos
     text = re.sub(r' {2,}', ' ', text)
-
-    # 2) Evitar conversão agressiva de vírgulas se for Kokoro (Kokoro entende pontuação perfeitamente).
-    # O Chatterbox antigo forçava EOS, então mantemos a conversão de vírgulas APENAS para contornar problemas antigos.
-    # Mas como o app inteiro agora prioriza Kokoro, não vamos modificar a pontuação natural da escrita,
-    # caso contrário "Olá, tudo bem" vira "Olá. tudo bem", o que altera a entonação da IA.
     
-    # Limpeza básica em vez de alterar a pontuação:
-    # 3) Remover pontuação dupla/tripla (exceto reticências naturais ou !!!)
+    # ... Restante da lógica Chatterbox (limpeza agressiva) ...
     text = re.sub(r'\.{4,}', '...', text)
-    # 4) Remover espaço antes de pontuação
     text = re.sub(r' +([.!?,;:])', r'\1', text)
 
     return text.strip()
@@ -238,6 +244,8 @@ class AudioPipeline(QObject):
     log_message    = Signal(str)                  # linha de status
     paragraph_done = Signal(int, str, str)        # (índice 1-based, wav_path, texto)
     finished       = Signal(bool, str)            # (sucesso, mensagem)
+    # [EVENTO] Sinaliza que um parágrafo terminou o pós-processamento e está pronto
+    paragraph_ready = Signal(int, str, dict) # index, wav_path, metadata
     # [BUG FIX] Sinal para a thread principal sinalizando necessidade de troca de engine
     engine_switch_needed = Signal(str, str) # (engine_str, model_type)
 
@@ -314,6 +322,10 @@ class AudioPipeline(QObject):
         self.qwen_ref_text         = qwen_ref_text
         self._cancelled            = False
         
+        # [PIPELINE PARALLELISM] - 3-stage worker system (Pre-proc | Synthesis | Post-proc)
+        from concurrent.futures import ThreadPoolExecutor
+        self._executor = ThreadPoolExecutor(max_workers=3)
+        
         # [BUG FIX] Event lock for engine switching
         self._switch_event = threading.Event()
         self._switch_event.set() # Inicialmente liberado
@@ -324,6 +336,19 @@ class AudioPipeline(QObject):
         # Buffer de logs para evitar overhead de UI (emit agrupado a cada 0.5s)
         self._log_buffer: list = []
         self._log_last_flush: float = 0.0
+        # [ESTADO COMPARTILHADO - 3-STAGE PIPELINE]
+        self._state_lock = threading.Lock()
+        self.generated_map: Dict[int, str] = {}
+        self.paragrafos_map: Dict[int, dict] = {}
+        self.completed_indices: Set[int] = set()
+        
+        # Referências para Stage 3 (UI/ETA)
+        self._start_time_ref: float = 0.0
+        self._all_paragraphs_ref: List[Tuple[str, str, dict]] = []
+        
+        # [ESTABILIDADE] Pool de threads persistente durante a vida do worker
+        self._poster: Optional[ThreadPoolExecutor] = None
+        
         # Métrica de performance para detectar degradação progressiva
         self._baseline_avg: float = 0.0
 
@@ -369,6 +394,107 @@ class AudioPipeline(QObject):
         """[BUG FIX] Main thread chama isso para liberar a geração do pipeline."""
         if hasattr(self, "_switch_event"):
             self._switch_event.set()
+
+    def _get_kokoro_lang(self, lang):
+        _m = {"pt": "p", "pt-br": "p", "en": "a", "en-us": "a", "en-gb": "b", "es": "e", "fr": "f", "ja": "j", "zh": "z"}
+        return _m.get(lang.lower(), "a")
+
+    def _preprocess_paragraph_task(self, paragraph, lang):
+        """Tarefa executada em thread do pool para paralelizar o Stage 1 (CPU)."""
+        try:
+            from manhwa_app.text_processor import process_text_fluency
+            from manhwa_app.advanced_text_processor import process_text
+            
+            kokoro_lang = self._get_kokoro_lang(lang)
+            tts_text = paragraph
+            
+            if self.use_spacy:
+                tts_text = process_text_fluency(tts_text, lang=lang)
+            
+            adv_cfg = _config_manager.get("production.text_processing", {
+                "normalize_text": True, "clean_symbols": True, "improve_punctuation": True,
+                "add_natural_pauses": True, "convert_numbers": True
+            })
+            verification_text = process_text(tts_text, adv_cfg, lang=kokoro_lang)
+            
+            # _normalize_text_for_tts é uma função local deste módulo (audio_pipeline.py)
+            tts_text = _normalize_text_for_tts(verification_text, lang=lang, engine=self.tts_engine)
+            
+            return (tts_text, verification_text, kokoro_lang)
+        except Exception as e:
+            logger.error(f"Erro no Stage 1 (Pre-proc): {e}")
+            return (paragraph, paragraph, lang)
+
+    def _post_process_task(self, idx, wav_tmp, silence_out, wav_final, p_cfg, paragraph, source_file, sample_rate, fixed_sim=0.0):
+        """
+        [STAGE 3 - INDUSTRIAL] Pós-processamento e I/O Assíncrono.
+        A validação Whisper ocorreu sincronamente no Stage 2 para permitir retentativas.
+        """
+        best_sim = fixed_sim
+        try:
+            # 1. Remoção de silêncio (CPU em background)
+            final_path_no_fx = _remove_silence_from_file(str(wav_tmp), str(silence_out), sample_rate)
+            
+            # 3. Aplicação de FX
+            # [QUALIDADE KOKORO] Por padrão, desativamos filtros agressivos para Kokoro 
+            # para preservar o brilho original dos 24kHz.
+            is_kokoro = (self.tts_engine == "kokoro")
+            
+            f_hp = p_cfg.get("fx_highpass", self.fx_highpass if not is_kokoro else False)
+            f_de = p_cfg.get("fx_deesser", self.fx_deesser if not is_kokoro else False)
+            f_cp = p_cfg.get("fx_compressor", self.fx_compressor)
+            f_sl = p_cfg.get("fx_silence", self.fx_silence)
+            f_rv = p_cfg.get("fx_reverb", self.fx_reverb)
+            f_ln = p_cfg.get("fx_loudnorm", self.fx_loudnorm)
+
+            _any_fx = f_hp or f_de or f_cp or f_sl or f_rv or f_ln
+            if _any_fx:
+                fx_config = {"production": {"audio": {"highpass": f_hp, "deesser": f_de, "compressor": f_cp, "reverb": f_rv, "remove_silence": f_sl, "normalize": f_ln}}}
+                try:
+                    from manhwa_app.audio_fx import apply_audio_post_processing
+                    apply_audio_post_processing(final_path_no_fx, str(wav_final), fx_config)
+                except Exception as fx_err:
+                    logger.warning(f"FX falhou parágrafo {idx}: {fx_err}. Usando áudio sem FX.")
+                    shutil.copy2(final_path_no_fx, str(wav_final))
+            else:
+                shutil.copy2(final_path_no_fx, str(wav_final))
+
+            # 4. Notificação e Mapas (Thread-Safe)
+            with self._state_lock:
+                self.generated_map[idx] = str(wav_final)
+                self.paragrafos_map[idx] = {
+                    "index": idx,
+                    "audio": f"audio_{idx}.wav",
+                    "texto": paragraph,
+                    "arquivo_origem": source_file,
+                    "similaridade": round(best_sim, 3),
+                }
+                self.completed_indices.add(idx)
+                current_completed = len(self.completed_indices)
+            
+            # 5. UI Updates
+            self.paragraph_done.emit(idx, str(wav_final), paragraph)
+            self.paragraph_ready.emit(idx, str(wav_final), self.paragrafos_map[idx])
+            
+            # Calcular progresso/ETA
+            elapsed = time.time() - self._start_time_ref
+            total = len(self._all_paragraphs_ref)
+            avg = elapsed / current_completed if current_completed > 0 else 0
+            eta = int(avg * (total - current_completed))
+            eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
+            
+            self.progress.emit(current_completed, total)
+            self.log_message.emit(f"  ✓ [#{idx}/{total}] Áudio finalizado (Sim: {best_sim:.2f}). ETA: {eta_s}")
+            
+        except Exception as e:
+            logger.error(f"Erro Crítico no Stage 3 [#{idx}]: {e}", exc_info=True)
+            self.log_message.emit(f"  ✗ Erro ao processar áudio [#{idx}]: {str(e)[:150]}")
+        finally:
+            # LIMPEZA ATÔMICA
+            _cleanup(wav_tmp)
+            _cleanup(silence_out)
+            if best_wav_path: _cleanup(best_wav_path)
+            
 
     def run(self):
         start_time = time.time()
@@ -500,582 +626,267 @@ class AudioPipeline(QObject):
         all_paragraphs: List[Tuple[str, str, dict]] = []
         for fcfg in self.file_configs:
             txt_path = fcfg["path"]
-            
             try:
                 text = Path(txt_path).read_text(encoding="utf-8-sig", errors="replace")
+                paragraphs = split_into_paragraphs(text)
             except Exception as e:
                 self.log_message.emit(f"⚠ Não foi possível ler '{txt_path}': {e}")
                 continue
 
-            paragraphs = split_into_paragraphs(text)
             self.log_message.emit(
                 f"✓ {len(paragraphs)} parágrafo(s) em '{Path(txt_path).name}' "
-                f"(Idioma: {fcfg.get('lang','en')}, Engine: {fcfg.get('engine','chatterbox')})."
+                f"(Idioma: {fcfg.get('lang','en')}, Engine: {fcfg.get('engine', self.tts_engine)})."
             )
             for p in paragraphs:
                 all_paragraphs.append((p, Path(txt_path).name, fcfg))
 
+        self._all_paragraphs_ref = all_paragraphs
+        self._start_time_ref = start_time
+
         if not all_paragraphs:
-            self.finished.emit(False, "Nenhum parágrafo encontrado nos arquivos (separe com linhas em branco).")
+            self.finished.emit(False, "Nenhum parágrafo encontrado para processar.")
             return
 
-        # -------- Prepara diretório de saída --------
-        out_dir = Path(self.output_root) / self.project_name
-        audios_dir = out_dir / "audios"
-        audios_dir.mkdir(parents=True, exist_ok=True)
-        self.log_message.emit(f"Pasta de saída: {out_dir.resolve()}")
+        # [ESTABILIDADE] Pool persistente gerenciado via self._poster (Stage 3 + Whisper GPU)
+        from concurrent.futures import ThreadPoolExecutor
+        self._poster = ThreadPoolExecutor(max_workers=12)
 
-        # -------- Garante que o modelo TTS está carregado --------
-        # O manager do dispatcher vai carregar sob demanda, mas logamos aqui para claridade
-        if self.tts_engine == "chatterbox":
-            self.log_message.emit("Verificando/Carregando modelo Chatterbox TTS...")
-            if not engine.load_model(model_type=self.model_type):
-                self.finished.emit(False, "Falha ao carregar modelo Chatterbox. Verifique os logs.")
-                return
-            device_str = (engine.model_device or "cpu").upper()
-            model_type_log = engine.loaded_model_type or "original"
-            self.log_message.emit(f"✓ Modelo Chatterbox pronto em {device_str} (tipo: {model_type_log}).")
+        try:
+            out_dir = Path(self.output_root) / self.project_name
+            audios_dir = out_dir / "audios"
+            audios_dir.mkdir(parents=True, exist_ok=True)
             
-        elif self.tts_engine == "kokoro":
-            self.log_message.emit("Verificando/Carregando motor Kokoro TTS...")
-            if not engine.load_kokoro_engine():
-                self.finished.emit(False, "Falha ao carregar modelo Kokoro. Verifique os logs.")
-                return
-            self.log_message.emit("✓ Módulo Kokoro pronto.")
+            total = len(all_paragraphs)
+            use_whisper_verification = (self.similarity_threshold > 0.0)
+            if self.tts_engine == "qwen":
+                use_whisper_verification = False
+            elif use_whisper_verification:
+                self.log_message.emit(f"🔌 Carregando Whisper [{self.whisper_model}] em CUDA para validação...")
+                from manhwa_app.models import get_whisper_model
+                get_whisper_model(self.whisper_model, device_override=None) # Força CUDA
+
+            if self.tts_engine == "kokoro":
+                if engine.get_active_engine() != "kokoro":
+                    self.log_message.emit("Carregando motor Kokoro-TTS...")
+                    engine.switch_to_engine("kokoro")
+            elif self.tts_engine == "chatterbox":
+                if engine.get_active_engine() != "chatterbox":
+                    self.log_message.emit("Carregando motor Chatterbox...")
+                    engine.switch_to_engine("chatterbox")
+
+            self.log_message.emit(f"🚀 Iniciando Geração de {total} parágrafo(s)...")
+
+
+            # -------- Detecção de Lacunas (Smart Fill) --------
+            missing_indices = self._get_missing_indices(audios_dir, all_paragraphs)
+            total = len(all_paragraphs)
+            existing_count = total - len(missing_indices)
             
-        elif self.tts_engine == "qwen":
-            self.log_message.emit("Verificando/Carregando motor Qwen TTS...")
-            if not engine.load_qwen_model():
-                self.finished.emit(False, "Falha ao carregar modelo Qwen. Verifique os logs.")
-                return
-            self.log_message.emit("✓ Módulo Qwen pronto.")
+            # Popula completados com o que já existe para o progresso da UI
+            for idx_ext in range(1, total + 1):
+                if idx_ext not in missing_indices:
+                    with self._state_lock:
+                        self.completed_indices.add(idx_ext)
 
-        # -------- Processa parágrafos SEQUENCIALMENTE (o engine.synthesize usa Lock global) --------
-        # NOTA IMPORTANTE: o engine.synthesize() usa _synthesis_lock (threading.Lock global),
-        # o que torna qualquer paralelismo ineficaz. Um loop sequencial é mais limpo,
-        # elimina overhead de ThreadPoolExecutor, e evita corridas de VRAM.
-        total = len(all_paragraphs)
-        completed = 0
-        generated_map: Dict[int, str] = {}
-        paragrafos_map: Dict[int, dict] = {}
+            if existing_count > 0:
+                if len(missing_indices) == 0:
+                    self.log_message.emit("✅ Todos os áudios já existem. Geração concluída!")
+                    self.progress.emit(total, total)
+                    return
+                self.log_message.emit(f"🔄 [SMART-FILL] {existing_count} áudios encontrados. Gerando apenas os {len(missing_indices)} faltantes.")
+                self.progress.emit(existing_count, total)
 
-        # Pre-loading de modelos pesados ANTES do loop principal
-        use_whisper_verification = (self.similarity_threshold > 0.0)
-        
-        if self.use_spacy:
-            self.log_message.emit("Pre-carregando SpaCy (NLP)…")
-            # Inicializa SpaCy para cada idioma único presente
-            langs_in_use = set(p[2].get("lang", "en") for p in all_paragraphs)
-            for lng in langs_in_use:
-                init_spacy(lng)
+            # -------- Loop Principal (Stage 2 - GPU) --------
+            # [LOOKAHEAD] Inicializa o pre-processamento para o primeiro item da lista de faltantes
+            next_preprocess_future = None
+            if missing_indices:
+                first_missing_idx = missing_indices[0]
+                p_next_p0, _, p_next_cfg0 = all_paragraphs[first_missing_idx - 1]
+                next_preprocess_future = self._executor.submit(self._preprocess_paragraph_task, p_next_p0, p_next_cfg0.get("lang", "en"))
 
-        # ---- Desativa verificações e recargas desnecessárias se for Qwen ----
-        if self.tts_engine == "qwen":
-            use_whisper_verification = False
-            self.log_message.emit("⚡ Otimização: Whisper desativado para o Qwen.")
-        else:
-            if use_whisper_verification:
-                self.log_message.emit(f"Carregando faster-whisper ({self.whisper_model}) para verificação de qualidade…")
-                get_whisper_model(self.whisper_model)  # síncrono — garante disponibilidade no loop
-
-        # Definir seed globalmente UMA VEZ antes do loop (não a cada parágrafo)
-        # CORRIGIDO: envolvido em try/except — se GPU estiver em estado de erro
-        # de um pipeline anterior (ex: cudaErrorLaunchTimeout), manual_seed_all()
-        # lança exceção FORA do try/except de síntese, quebrando _run_internal desde
-        # o início sem mensagem de erro útil.
-        if self.seed != 0 and self.tts_engine == "chatterbox":
-            try:
-                import engine as _eng_ref
-                _eng_ref.set_seed(self.seed)
-                self.log_message.emit(f"Seed global definida: {self.seed}")
-            except Exception as _seed_err:
-                self.log_message.emit(f"  ⚠ set_seed falhou (GPU pode estar em estado de erro): {str(_seed_err)[:80]}")
-                # Não abortar — a síntese pode ainda funcionar sem seed global
-
-        self.log_message.emit(f"🚀 Iniciando Geração de {total} parágrafo(s) (sequencial, GPU otimizada)...")
-
-        kokoro_models_cache = {}
-
-
-        # --- Engine Switch (Worker / Kokoro) if needed ---
-        if self.tts_engine in ("qwen", "indextts"):
-            self.log_message.emit(f"⚡ [Worker] Geração delegada ao worker isolado ({self.tts_engine}).")
-        elif self.tts_engine == "kokoro":
-            import engine as _eng
-            if _eng.get_active_engine() != "kokoro":
-                self.log_message.emit("Carregando motor Kokoro-TTS (Local)...")
-                _eng.switch_to_engine("kokoro")
-
-        # -------- Sistema de Recovery / Continuação Automática --------
-        start_index = 0
-        existing_audios = list(audios_dir.glob("audio_*.wav"))
-        if existing_audios:
-            start_index = self._find_resume_index(audios_dir, all_paragraphs)
-            if start_index > 0:
-                self.log_message.emit(f"🔄 Retomando geração a partir do parágrafo {start_index + 1}...")
+            for i, idx in enumerate(missing_indices): # idx é 1-based
+                # paragraph indexing is idx - 1
+                paragraph, source_file, p_cfg = all_paragraphs[idx - 1]
                 
-                # Reconstrói os mapas prévios para não perder o log do que já foi feito na UI
-                for num, _ in [(int(f.stem.split('_')[1]), f) for f in existing_audios if f.stem.split('_')[1].isdigit()]:
-                    if num <= start_index:
-                        generated_map[num] = str(audios_dir / f"audio_{num}.wav")
-                        paragrafos_map[num] = {"index": num, "audio": f"audio_{num}.wav"}
-                        
-                completed = start_index
-                self.progress.emit(completed, total)
-
-        pending_paragraphs = all_paragraphs[start_index:]
-
-        for idx, (paragraph, source_file, p_cfg) in enumerate(pending_paragraphs, start=start_index + 1):
-            lang = p_cfg.get("lang", "en")
-            
-            # Mapeamento específico para Kokoro (1 letra: a=AmEn, p=PT-BR, etc)
-            _k_map = {"pt": "p", "pt-br": "p", "en": "a", "en-us": "a", "en-gb": "b", "es": "e", "fr": "f", "ja": "j", "zh": "z"}
-            kokoro_lang = _k_map.get(lang.lower(), "a")
-            
-            # Mapeamento para Chatterbox (Exige 2 letras: pt, es, en, etc)
-            chatter_lang = lang.lower().split("-")[0]
-
-            voice_path = p_cfg.get("voice")
-            engine_str = p_cfg.get("engine", self.tts_engine)
-            p_speed = p_cfg.get("speed", self.speed)
-            p_temp = p_cfg.get("temperature", self.temperature)
-            if self._cancelled or self.thread().isInterruptionRequested():
-                break
-
-            wav_final = audios_dir / f"audio_{idx}.wav"
-            wav_tmp   = audios_dir / f"audio_{idx}_tmp.wav"
-            
-            # CORRIGIDO: Removida a limpeza de cache por parágrafo para evitar quebras de pipeline na GPU.
-            # No Windows/WDDM, sincronizar a GPU constantemente causa latência de agendamento severa.
-            # A manutenção agora é feita apenas se detectado erro ou preventivamente a cada 50 parágrafo.
-            if torch.cuda.is_available() and idx > 0 and idx % 50 == 0:
-                try:
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                    self.log_message.emit("♻️ Manutenção preventiva VRAM concluída.")
-                except Exception as _sync_err:
-                    self.log_message.emit(f"  ⚠ GPU maintenance falhou (ignorado): {str(_sync_err)[:100]}")
-
-            success  = False
-            best_sim = -1.0
-            best_wav_path = None
-
-            # Medição de tempo exato por parágrafo para detectar memory leak (ex: acúmulo de KV cache)
-            paragraph_start_time = time.time()
-
-            # Forçar pelo menos 5 tentativas se o usuário estiver reclamando de qualidade (conforme solicitado)
-            # Mas respeitamos o valor da UI se ele for maior.
-            actual_max_retries = max(self.max_retries, 5)
-
-            for attempt in range(1, actual_max_retries + 1):
-                if self._cancelled:
+                if self._cancelled or self.thread().isInterruptionRequested():
                     break
 
-                # ---- Pre-processamento de texto ----
-                tts_text_input = paragraph
-                if self.use_spacy:
-                    tts_text_input = process_text_fluency(tts_text_input, lang=lang)
+                wav_final = audios_dir / f"audio_{idx}.wav"
+                wav_tmp   = audios_dir / f"audio_{idx}_tmp.wav"
                 
-                # Integrando o advanced_text_processor guiado por config
-                if _config_manager:
-                    advanced_text_config = _config_manager.get("production.text_processing", {
-                        "normalize_text": True,
-                        "remove_accents": False,
-                        "clean_symbols": True,
-                        "improve_punctuation": True,
-                        "add_natural_pauses": True,
-                        "lowercase": False,
-                        "use_phonetic": False,
-                        "convert_numbers": True
-                    })
-                    
-                    # 1. Base clean text para o Whisper (Com números por extenso, mas SEM conversão fonética exótica)
-                    advanced_text_config["use_phonetic"] = False
-                    verification_text = process_text(tts_text_input, advanced_text_config, lang=kokoro_lang)
-                    
-                    # 2. Texto final para o TTS (COM conversão fonética, se o usuário ativou na UI)
-                    tts_text_input = verification_text
-                    
-                    # [NOVO] Alteração agressiva de texto para melhorar pronúncia nas últimas tentativas
-                    if attempt >= 4:
-                        self.log_message.emit(f"  ⚡ [#{idx}] Tentativa {attempt}: Aplicando reforço de pronúncia no texto...")
-                        # Passamos o kokoro_lang (1 char) ou o lang original
-                        tts_text_input = improve_pronunciation_for_tts(tts_text_input, lang=kokoro_lang)
-
-                    if getattr(self, "use_phonetic", False):
-                        from manhwa_app.advanced_text_processor import apply_phonetic
-                        tts_text_input = apply_phonetic(tts_text_input)
-                else:
-                    verification_text = tts_text_input
-
-                # CORRIGIDO: normalização TTS específica para idiomas latinos
-                # Ex: espanhol com vírgulas causa EOS prematuro no alinhador Chatterbox.
-                # _normalize_text_for_tts já existia no módulo, mas não era chamada!
-                tts_text_input = _normalize_text_for_tts(tts_text_input, lang=lang)
-
-                # LOG DE DIAGNÓSTICO: mostra o texto que será enviado ao TTS (primeiros 120 chars)
-                if attempt == 1:
-                    preview = tts_text_input[:120].replace('\n', ' ')
-                    self.log_message.emit(f"  ℹ [#{idx}] Texto TTS (tentativa 1): '{preview}{'...' if len(tts_text_input) > 120 else ''}'")
-
-                # Pular parágrafos muito curtos (<10 chars) que disparam EOS imediato
-                if len(tts_text_input.strip()) < 10:
-                    self.log_message.emit(f"  ⚠ [#{idx}] Parágrafo muito curto ignorado: '{tts_text_input[:40]}'")
-                    break  # CORRIGIDO: break para sair das tentativas, não 'continue' que reiniciava o loop
-
-                # ---- Síntese TTS ----
-                wav_tensor = None
-                sample_rate = 24000
-
+                lang = p_cfg.get("lang", "en")
+                kokoro_lang = self._get_kokoro_lang(lang)
+                chatter_lang = lang.lower().split("-")[0]
+                voice_path = p_cfg.get("voice")
+                engine_str = p_cfg.get("engine", self.tts_engine)
+                p_temp = p_cfg.get("temperature", self.temperature)
+                
                 try:
-                    # 1. Estratégia de Síntese
-                    wav_tensor = None
-                    sample_rate = 24000
-                    
-                    import time
-                    t0_gen = time.time()
-                    logger.info(f"[PIPELINE] Iniciando geração de áudio (Parágrafo {idx}) | Texto len: {len(tts_text_input)} chars | Engine: {engine_str}")
-                    
-                    # --- NOVO DISPATCHER UNIFICADO (engine.py + utils.py) ---
-                    # Substitui os blocos If/Else fragmentados por um ponto único de entrada
-                    
-                    active_eng = getattr(_engine, "get_active_engine")() if hasattr(_engine, "get_active_engine") else "none"
-                    current_model = getattr(_engine, "loaded_model_type", "none")
-
-                    # [BUG 2 FIX] _needs_engine_switch: mapeia nomes de engine para sistemas
-                    # 'kokoro' é um sistema separado de 'chatterbox' (turbo/original/multilingual).
-                    # A comparação antiga (active_eng vs engine_str) misturava namespaces.
-                    KOKORO_ENGINES = {'kokoro'}
-                    CHATTERBOX_SUBTYPES = {'turbo', 'original', 'multilingual'}
-
-                    def _needs_engine_switch(active, requested, loaded_subtype, requested_model_type):
-                        active_is_kokoro = active in KOKORO_ENGINES
-                        req_is_kokoro = requested in KOKORO_ENGINES
-                        # Sistemas diferentes → sempre trocar
-                        if active_is_kokoro != req_is_kokoro:
-                            return True
-                        # Chatterbox: checar submodelo
-                        if not req_is_kokoro:
-                            if loaded_subtype != requested_model_type:
-                                return True
-                        return False
-
-                    needs_switch = _needs_engine_switch(
-                        active_eng, engine_str, current_model,
-                        self.model_type if self.model_type else "turbo"
-                    )
-
-                    if needs_switch:
-                        target = engine_str
-                        if engine_str == "chatterbox":
-                            target = self.model_type if self.model_type else "turbo"
-
-                        logger.info(f"[PIPELINE] Pausando geração para troca de engine: {active_eng} → {target}")
-                        self.log_message.emit(f"🔄 Solicitando motor TTS: {target.upper()}...")
-                        
-                        # Bloqueia a execução desta thread e sinaliza a thread principal
-                        self._switch_event.clear()
-                        self.engine_switch_needed.emit(engine_str, self.model_type)
-                        
-                        # Aguarda a main thread baixar/carregar e setar self._switch_event.set()
-                        swapped = self._switch_event.wait(timeout=120)
-                        if not swapped:
-                            raise Exception("Tempo esgotado aguardando troca de engine.")
-                        
-                        # Re-valida para garantir que a memória foi preenchida
-                        import engine as eng_local
-                        active_eng = getattr(eng_local, "get_active_engine")() if hasattr(eng_local, "get_active_engine") else "none"
-                        logger.info(f"[PIPELINE] Troca de engine confirmada: {active_eng}")
-
-
-                    success = _utils.generate_paragraph_audio(
-                        text=tts_text_input,
-                        output_path=str(wav_tmp),
-                        engine_name=engine_str,
-                        audio_prompt_path=voice_path,
-                        kokoro_voice=voice_path,  # [FIX] Kokoro expects 'kokoro_voice' in kwargs
-                        kokoro_lang=kokoro_lang,   # [FIX] Idioma de 1 letra para Kokoro
-                        language=chatter_lang,      # [FIX] Idioma de 2 letras para Chatterbox (Multilingual)
-                        qwen_speaker=self.qwen_speaker if hasattr(self, 'qwen_speaker') else "Ryan",
-                        qwen_language="Auto",
-                        indextts_speed=p_speed,
-                        temperature=p_temp,
-                        exaggeration=p_cfg.get("exaggeration", self.exaggeration),
-                        cfg_weight=p_cfg.get("cfg_weight", self.cfg_weight),
-                        # [NOVO] Semente dinâmica para garantir regeneração real a cada tentativa
-                        seed=p_cfg.get("seed", self.seed) + (attempt - 1) if self.seed != 0 else 0,
-                        sample_rate=self.sample_rate
-                    )
-
-                    if not success:
-                        print(f"[PIPELINE] Fim da geração (Parágrafo {idx}) | Sucesso: False | Tempo: {time.time() - t0_gen:.2f}s")
-                        self.log_message.emit(f"  ✗ Falha na síntese do parágrafo via {self.tts_engine}")
-                        _cleanup(wav_tmp)
-                        continue
-                        
-                    print(f"[PIPELINE] Fim da geração (Parágrafo {idx}) | Sucesso: True | Tempo: {time.time() - t0_gen:.2f}s")
-                    
-                    # Carregar para verificação (se necessário) ou apenas para marcar sucesso
-                    # Como generate_paragraph_audio já salvou o arquivo, não precisamos re-salvar.
-                    # Mas o código abaixo espera wav_tensor != None para continuar.
-                    wav_tensor = True # Flag para o loop continuar
-
-                    if wav_tensor is not None:
-                        # Geração bem-sucedida! (O arquivo já foi salvo pelo dispatcher em wav_tmp)
-                        paragraph_end_time = time.time()
-                        self.log_message.emit(f"  ⏱ ↳ Geração do parágrafo durou {paragraph_end_time - paragraph_start_time:.1f}s")
-
-                        # ---- Verificação via Whisper ----
-                        # Como o Kokoro é rápido, podemos habilitar whisper a cada geração (se habilitado na aba)
-                        if use_whisper_verification and attempt >= 1:
-                            transcription = transcribe_audio(str(wav_tmp), self.whisper_model)
-                            if transcription:
-                                sim = _text_similarity(verification_text, transcription)
-                                
-                                # [NOVO] Rastreamento da melhor versão
-                                if sim > best_sim:
-                                    best_sim = sim
-                                    # Salva este como o melhor até agora
-                                    best_path = audios_dir / f"audio_{idx}_best.wav"
-                                    shutil.copy2(str(wav_tmp), str(best_path))
-                                    best_wav_path = best_path
-                                    self.log_message.emit(f"  ⭐ [#{idx}] Nova melhor similaridade: {sim:.2f}")
-
-                                if sim < self.similarity_threshold and attempt < actual_max_retries:
-                                    self.log_message.emit(f"  ↻ [#{idx}] Sim={sim:.2f} < {self.similarity_threshold} (Tentativa {attempt}/{actual_max_retries}) → retentando...")
-                                    _cleanup(wav_tmp)
-                                    continue  # re-tenta
-                            
-                            # Limpeza Pós Whisper
-                            if torch.cuda.is_available():
-                                # Sem synchronize() extra aqui — já foi feito após a síntese
-                                torch.cuda.empty_cache()
-                                gc.collect()
-                                self._log_vram(f"Pós-Whisper #{idx}")
-
-                        # ---- Remoção de silêncio ----
-                        # CORRIGIDO: str.replace("_tmp", "_silence") era frágil: se o CAMINHO
-                        # da pasta de saída contivesse "_tmp" (ex: pasta "tmp_test"),
-                        # o path de saída ficava corrompido. Usando stem/suffix agora.
-                        _wav_tmp_path = Path(str(wav_tmp))
-                        silence_out = str(_wav_tmp_path.with_name(_wav_tmp_path.stem.replace("_tmp", "_silence") + _wav_tmp_path.suffix))
-                        final_path_no_fx = _remove_silence_from_file(str(wav_tmp), silence_out, sample_rate)
-
-                        # ---- FX de áudio (opcionais) ----
-                        # CORRIGIDO: usa parâmetros de p_cfg se existirem, senão fallback global
-                        f_hp = p_cfg.get("fx_highpass", self.fx_highpass)
-                        f_de = p_cfg.get("fx_deesser", self.fx_deesser)
-                        f_cp = p_cfg.get("fx_compressor", self.fx_compressor)
-                        f_sl = p_cfg.get("fx_silence", self.fx_silence)
-                        f_rv = p_cfg.get("fx_reverb", self.fx_reverb)
-                        f_ln = p_cfg.get("fx_loudnorm", self.fx_loudnorm)
-
-                        _any_fx = f_hp or f_de or f_cp or f_sl or f_rv or f_ln
-                        if _any_fx:
-                            fx_config = {
-                                "production": {
-                                    "audio": {
-                                        "highpass":       f_hp,
-                                        "deesser":        f_de,
-                                        "compressor":     f_cp,
-                                        "reverb":         f_rv,
-                                        "remove_silence": f_sl,
-                                        "normalize":      f_ln,
-                                    }
-                                },
-                                # Legacy fallbacks for audio_fx.py
-                                "fx_highpass":   f_hp,
-                                "fx_deesser":    f_de,
-                                "fx_compressor": f_cp,
-                                "fx_reverb":     f_rv,
-                                "fx_silence":    f_sl,
-                                "fx_loudnorm":   f_ln
-                            }
-                            apply_audio_post_processing(final_path_no_fx, str(wav_final), fx_config)
-                        else:
-                            shutil.copy2(final_path_no_fx, str(wav_final))
-
-                        _cleanup(wav_tmp)
-                        _cleanup(silence_out)
-                        success = True
-                        break
-
+                    tts_text_base, verification_text, kokoro_lang = next_preprocess_future.result(timeout=60)
                 except Exception as e:
-                    err_msg = str(e)
-                    self.log_message.emit(f"  ✗ [#{idx}] Erro na síntese (tentativa {attempt}): {err_msg[:200]}")
-                    # CORRIGIDO: erros CUDA são assíncronos no Windows — a exceção aparece
-                    # na próxima operação de sync DEPOIS do kernel falhar. Reseta o estado
-                    # da GPU aqui para evitar que o erro se propague para o cleanup.
-                    if "cuda" in err_msg.lower() or "cudaer" in err_msg.lower() or "accelerator" in err_msg.lower():
-                        self.log_message.emit(f"  ⚠ Erro CUDA detectado. Resetando modelo e VRAM...")
-                        # CORRIGIDO: força descarga do modelo Chatterbox da VRAM
-                        # Sem isso, os ~11GB do modelo ficam "presos" após falha,
-                        # causando 'VRAM 0.0GB livre' em execuções subsequentes.
-                        try:
-                            import engine as _eng_reset
-                            _eng_reset.chatterbox_model = None
-                            _eng_reset.MODEL_LOADED = False
-                            logger.info("Engine Chatterbox resetado após erro CUDA.")
-                        except Exception:
-                            pass
-                        try:
-                            if torch.cuda.is_available():
-                                gc.collect()
-                                torch.cuda.empty_cache()
-                        except Exception:
-                            pass
-                    _cleanup(wav_tmp)
+                    logger.warning(f"Erro no lookahead #{idx}: {e}")
+                    tts_text_base, verification_text = (paragraph, paragraph)
 
-            # [NOVO] Se após todas as tentativas não atingiu o threshold, mas temos uma "melhor" versão salva
-            if not success and best_wav_path and best_wav_path.exists():
-                self.log_message.emit(f"  ⚠ [#{idx}] Threshold não atingido ({best_sim:.2f} < {self.similarity_threshold}). Usando a melhor versão encontrada.")
-                # O loop de efeitos/silêncio abaixo espera que wav_tmp seja o arquivo a processar
-                shutil.copy2(str(best_wav_path), str(wav_tmp))
-                _cleanup(best_wav_path)
-                # Forçamos sucesso para prosseguir com o processamento do "melhor disponível"
-                # (O usuário pediu para "ficar com a melhor pronúncia")
+                # Dispara lookahead para o próximo item da lista de faltantes
+                if i + 1 < len(missing_indices):
+                    next_idx = missing_indices[i + 1]
+                    p_next, _, cfg_next = all_paragraphs[next_idx - 1]
+                    next_preprocess_future = self._executor.submit(self._preprocess_paragraph_task, p_next, cfg_next.get("lang", "en"))
+
+                tts_text_input = _normalize_text_for_tts(tts_text_base, lang=lang, engine=engine_str)
+
+                # Geração com Loop de Retentativa (Aceleração CUDA + Whisper Sync + Best Effort)
+                success = False
+                best_sim_so_far = -1.0
+                best_wav_path = audios_dir / f"audio_{idx}_best_effort.wav"
+                current_temp = p_temp
                 
-                # --- Reaplica o bloco de processamento final (silêncio + FX) ---
-                try:
-                    # ---- Verificação final de sample_rate ----
-                    # No Kokoro costuma ser 24000, mas vamos garantir
-                    _s_rate = sample_rate if 'sample_rate' in locals() else 24000
+                from manhwa_app.models import transcribe_audio
+                
+                for attempt in range(1, 4): # Max 3 tentativas
+                    if self._cancelled: break
                     
-                    _wav_tmp_path = Path(str(wav_tmp))
-                    silence_out = str(_wav_tmp_path.with_name(_wav_tmp_path.stem.replace("_tmp", "_silence") + _wav_tmp_path.suffix))
-                    final_path_no_fx = _remove_silence_from_file(str(wav_tmp), silence_out, _s_rate)
-
-                    f_hp = p_cfg.get("fx_highpass", self.fx_highpass)
-                    f_de = p_cfg.get("fx_deesser", self.fx_deesser)
-                    f_cp = p_cfg.get("fx_compressor", self.fx_compressor)
-                    f_sl = p_cfg.get("fx_silence", self.fx_silence)
-                    f_rv = p_cfg.get("fx_reverb", self.fx_reverb)
-                    f_ln = p_cfg.get("fx_loudnorm", self.fx_loudnorm)
-
-                    _any_fx = f_hp or f_de or f_cp or f_sl or f_rv or f_ln
-                    if _any_fx:
-                        fx_config = {"production": {"audio": {"highpass": f_hp, "deesser": f_de, "compressor": f_cp, "reverb": f_rv, "remove_silence": f_sl, "normalize": f_ln}}}
-                        apply_audio_post_processing(final_path_no_fx, str(wav_final), fx_config)
-                    else:
-                        shutil.copy2(final_path_no_fx, str(wav_final))
-
-                    _cleanup(wav_tmp)
-                    _cleanup(silence_out)
-                    success = True
-                except Exception as _final_err:
-                    self.log_message.emit(f"  ✗ [#{idx}] Erro ao processar melhor versão: {_final_err}")
-
-            if success:
-                # [NOVO] Limpa o lixo temporário do fallback na pasta
-                if best_wav_path and best_wav_path.exists():
-                    _cleanup(best_wav_path)
+                    # Log de tentativa se for retry
+                    if attempt > 1:
+                        self.log_message.emit(f"  ⚠️ [RETRY] #{idx} (Tentativa {attempt}/3) | Temp: {current_temp:.2f}...")
                     
-                # CORRIGIDO: verificar que o arquivo realmente existe antes de emitir
-                # Evita preencher a lista de áudios com paths inválidos
-                if wav_final.exists():
-                    generated_map[idx] = str(wav_final)
-                    paragrafos_map[idx] = {
-                        "index": idx,
-                        "audio": f"audio_{idx}.wav",
-                        "texto": paragraph,
-                        "arquivo_origem": source_file,
-                        "similaridade": round(best_sim, 3),
-                    }
-                    completed += 1
-                    elapsed = time.time() - start_time
-                    
-                    # Usa o tempo exato do gerador deste parágrafo (sem a lentidão acumulada da média geral)
-                    paragraph_time = time.time() - paragraph_start_time
-                    
-                    avg = elapsed / completed if completed > 0 else 0
-                    eta = int(avg * (total - completed))
-                    eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
-                    self.progress.emit(completed, total)
+                    success = utils.generate_paragraph_audio(
+                        text=tts_text_input, output_path=str(wav_tmp),
+                        engine_name=engine_str, 
+                        audio_prompt_path=voice_path, # Para Chatterbox/Turbo
+                        kokoro_voice=voice_path,     # Para Kokoro
+                        kokoro_lang=kokoro_lang, language=chatter_lang,
+                        temperature=current_temp, sample_rate=self.sample_rate
+                    )
 
-                    # Auto-detecção de degradação de performance (Cache Leak / Fragmentação)
-                    is_degraded = (self._baseline_avg > 0 and paragraph_time > self._baseline_avg * 2.0)
-                    is_scheduled_reset = (completed > 0 and completed % 50 == 0)
-
-                    if self._baseline_avg == 0.0 and completed >= 2:
-                        self._baseline_avg = paragraph_time
-
-                    if is_degraded or is_scheduled_reset:
-                        reason = f"Parágrafo levou {paragraph_time:.1f}s vs Original {self._baseline_avg:.1f}s" if is_degraded else "Reset programado a cada 50 iterações"
-                        self.log_message.emit(f"♻️ Manutenção Preventiva VRAM ({reason}). Recarregando modelo...")
-                        
-                        # Limpa memória alocada do PyTorch
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                            gc.collect()
+                    if success:
+                        # Validação Imediata (GPU Whisper é ultra-rápido)
+                        similarity = 1.0
+                        if use_whisper_verification and verification_text:
+                            transcription = transcribe_audio(str(wav_tmp), self.whisper_model, device_override=None)
+                            similarity = _text_similarity(verification_text, transcription)
                             
-                        # Reseta a engine TTS para matar memory leaks do Transformer (KV cache preso)
-                        if self.tts_engine == "chatterbox":
-                            try:
-                                import engine as _eng_reset
-                                _eng_reset.reload_model()
-                            except Exception as e:
-                                self.log_message.emit(f"  ⚠ Falha ao recarregar engine: {str(e)[:100]}")
+                            msg_val = f"  [VALIDAÇÃO] #{idx} Sim: {similarity:.2f}"
+                            logger.info(msg_val)
+                            print(msg_val)
+                            
+                            # Rastrear a melhor tentativa para o modo de segurança (best effort)
+                            if similarity > best_sim_so_far:
+                                best_sim_so_far = similarity
+                                # Salva esta tentativa caso todas as outras falhem
+                                try:
+                                    if best_wav_path.exists(): best_wav_path.unlink()
+                                    shutil.copy2(str(wav_tmp), str(best_wav_path))
+                                except: pass
+
+                            if similarity < self.similarity_threshold:
+                                if attempt < 3:
+                                    self.log_message.emit(f"  ⚠️ [REGEN] #{idx}: Similaridade baixa ({similarity:.2f} < {self.similarity_threshold}). Regerando...")
+                                    current_temp += 0.05
+                                    _cleanup(wav_tmp)
+                                    continue # Tenta de novo
+                                else:
+                                    # Falhou após 3 tentativas - Modo Best Effort
+                                    self.log_message.emit(f"  ⚖️ [BEST-EFFORT] #{idx}: Nenhuma tentativa atingiu o limite. Usando melhor versão (Sim: {best_sim_so_far:.2f}).")
+                                    shutil.copy2(str(best_wav_path), str(wav_tmp))
+                                    similarity = best_sim_so_far
                         
-                        # Reseta o baseline para forçar uma nova aferição na próxima rodada limpa
-                        self._baseline_avg = 0.0
-
-                    self.log_message.emit(f"  ✓ [#{idx}/{total}] Concluído em {elapsed:.1f}s total. ETA: {eta_s}")
-                    self.paragraph_done.emit(idx, str(wav_final), paragraph)
-                else:
-                    self.log_message.emit(f"  ✗ [#{idx}] Síntese reportou sucesso mas arquivo não encontrado: {wav_final}")
-            else:
-                self.log_message.emit(f"  ✗ [#{idx}] Falha após {self.max_retries} tentativa(s).")
-
-        self._flush_log_buffer()  # Garante que logs pendentes são enviados
-
-        # CORRIGIDO: liberar cache Kokoro após pipeline (modelos ficam em VRAM entre re-execuções)
-        # CORRIGIDO: envolvido em try/except global — se GPU estiver em estado de erro (ex:
-        # após cudaErrorLaunchTimeout), operacoes CUDA podem relançar a exceção aqui
-        try:
-            for _k_model in kokoro_models_cache.values():
-                try:
-                    del _k_model
-                except Exception:
-                    pass
-            kokoro_models_cache.clear()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception as _gpu_cleanup_err:
-            logger.warning(f"GPU cleanup após pipeline falhou (ignorado): {_gpu_cleanup_err}")
-
-        # Monta resultados finais ordenados
-        generated = [generated_map[k] for k in sorted(generated_map.keys())]
-        paragrafos_json = [paragrafos_map[k] for k in sorted(paragrafos_map.keys())]
-
-        # Liberar cache CUDA final
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                        # Se chegou aqui, passou na validação ou estamos no modo best effort
+                        best_sim = similarity
+                        _wav_tmp_path = Path(str(wav_tmp))
+                        silence_out = _wav_tmp_path.with_name(_wav_tmp_path.stem.replace("_tmp", "_silence") + _wav_tmp_path.suffix)
+                        
+                        self._poster.submit(
+                            self._post_process_task, 
+                            idx, Path(str(wav_tmp)), silence_out, wav_final, 
+                            p_cfg, paragraph, source_file, self.sample_rate,
+                            best_sim
+                        )
+                        break
+                    else:
+                        _cleanup(wav_tmp)
+                
+                # Limpeza final do arquivo de best effort
+                _cleanup(best_wav_path)
+                
+                # --- ANTI-FRAGMENTAÇÃO VRAM (Solução para degradação do Chatterbox) ---
+                # Quando rodamos Transformers generate() 1000+ vezes, a VRAM se fragmenta
+                # porque o alocador do PyTorch não devolve a memória solta ao SO.
+                # Forçamos a limpeza das referências da iteração anterior para manter a velocidade 100%.
+                import gc
                 gc.collect()
-        except Exception:
-            pass
+                if torch.cuda.is_available():
+                    # Vazio leve: executa rápido e garante blocos grandes livres
+                    torch.cuda.empty_cache()
 
-        # -------- Salvar paragrafos.json --------
+            self.log_message.emit("⌛ Aguardando finalização dos áudios em segundo plano...")
+            
+        except Exception as e:
+            logger.error(f"Erro no loop _run_internal: {e}", exc_info=True)
+            self.log_message.emit(f"❌ Erro fatal: {e}")
+        finally:
+            if self._poster:
+                self._poster.shutdown(wait=True)
+                self._poster = None
+
+        with self._state_lock:
+            paragrafos_json = [self.paragrafos_map[k] for k in sorted(self.paragrafos_map.keys())]
+            generated_count = len(self.completed_indices)
+
         json_path = out_dir / "paragrafos.json"
         try:
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(paragrafos_json, f, ensure_ascii=False, indent=2)
-            self.log_message.emit(f"✓ paragrafos.json salvo em: {json_path}")
-        except Exception as e:
-            self.log_message.emit(f"⚠ Não foi possível salvar paragrafos.json: {e}")
+            self.log_message.emit(f"✓ Metadados salvos em: {json_path}")
+        except: pass
 
         total_time = time.time() - start_time
         mins, secs = divmod(int(total_time), 60)
         time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
 
-        msg = f"Geração concluída! {len(generated)}/{total} áudios em '{audios_dir}'."
-        self.log_message.emit(f"\n✓ {msg} (Tempo demorado: {time_str})")
-        self.finished.emit(len(generated) > 0, f"{msg} (Tempo: {time_str})")
+        msg = f"Geração concluída! {generated_count}/{total} áudios gerados."
+        self.log_message.emit(f"\n✓ {msg} (Tempo Total: {time_str})")
+        self.finished.emit(generated_count > 0, msg)
 
+    def _get_missing_indices(self, audios_dir: Path, all_paragraphs: list) -> List[int]:
+        """
+        Retorna a lista de índices (1-based) que não possuem o arquivo audio_N.wav correspondente.
+        Isto permite o modo 'Smart Fill' (preencher buracos na sequência).
+        """
+        missing = []
+        for i in range(1, len(all_paragraphs) + 1):
+            wav_path = audios_dir / f"audio_{i}.wav"
+            if not wav_path.exists():
+                missing.append(i)
+        return missing
 
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
+    def _find_resume_index(self, audios_dir: Path, all_paragraphs: list) -> int:
+        """Encontra o ponto de retomada baseado nos arquivos existentes."""
+        wav_files = list(audios_dir.glob("audio_*.wav"))
+        if not wav_files: return 0
+        
+        valid_indices = []
+        for f in wav_files:
+            try:
+                num = int(f.stem.split('_')[1])
+                valid_indices.append(num)
+            except: pass
+        if not valid_indices: return 0
+        
+        max_idx = max(valid_indices)
+        return min(max_idx, len(all_paragraphs))
+
+    def _get_kokoro_lang(self, lang: str) -> str:
+        _k_map = {"pt": "p", "pt-br": "p", "en": "a", "en-us": "a", "en-gb": "b", "es": "e", "fr": "f", "ja": "j", "zh": "z"}
+        return _k_map.get(lang.lower(), "a")
+
+    def run(self):
+        start_time = time.time()
+        try:
+            self._run_internal(start_time)
+        except Exception as e:
+            logger.error(f"Crash no AudioWorker: {e}", exc_info=True)
+            self.finished.emit(False, str(e))
 
 def _cleanup(path):
     """Deleta arquivo temporário se existir."""

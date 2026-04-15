@@ -1,0 +1,1 @@
+'init__(self, tts_engine: str, model_type: str, parent=None):\n        super().__init__(parent)\n        self.tts_engine = tts_engine\n        self.model_type = model_type\n\n    def run(self):\n        try:\n            from manhwa_app.a'

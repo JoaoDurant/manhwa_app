@@ -2,21 +2,21 @@
   "theme": "🧛 Dracula",
   "bg_overlay_alpha": 80,
   "audio_tab": {
-    "project": "sumonner_eng new",
+    "project": "god level esp true",
     "output_root": "output",
-    "preset_lang": "en",
-    "preset_voice": "E:\\backup\\v6\\voices\\cloned\\ElevenLabs_2026-04-02T02_03_27_Aidan - Social Media Influencer_pvc_sp114_s50_sb75_se15_b_m2.mp3"
+    "preset_lang": "es",
+    "preset_voice": "Sem clonagem (Voz do Modelo)"
   },
   "tts_tab": {
     "tts_engine": "chatterbox",
-    "model_type": "turbo",
+    "model_type": "multilingual",
     "temperature": 0.7,
     "speed": 1.05,
     "exaggeration": 0.5,
     "cfg_weight": 0.5,
     "seed": 3000,
     "output_format": "wav",
-    "sample_rate": 24000,
+    "sample_rate": 44100,
     "min_p": 0.05,
     "top_p": 1.0,
     "top_k": 1000,

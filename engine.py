@@ -15,14 +15,23 @@ import threading
 import sys
 import numpy as np
 import torch
+import torch._dynamo
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any, Dict
+
+# [HARDWARE EXTRACTOR] - Extrair potência máxima da RTX 5070 Ti e CPU 14th Gen
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.cache_size_limit = 128  # Para max-autotune caching agressivo
+try:
+    torch.set_num_threads(8)
+except: pass
 
 logger = logging.getLogger(__name__)
 
-# [DTYPE HARDENING] - Forçando float32 global para evitar mismatch no voice_encoder
-torch.set_default_dtype(torch.float32)
+# [DTYPE SETUP] - Usando precisão adaptativa para maximizar performance na RTX 5000/4000
+DEFAULT_DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
+logger.info(f"[ENGINE] Precisão padrão detectada: {DEFAULT_DTYPE}")
 
 # [LIBROSA MONKEYPATCH] - Chatterbox usa librosa.load internamente. 
 # Precisamos garantir que ele retorne float32 para as LSTMs do voice_encoder.
@@ -250,69 +259,6 @@ _kokoro_lock = threading.Lock()
 _kokoro_voice_cache = {}
 
 # =============================================================================
-# QWEN3 TTS — import defensivo (padrao TTS-Story)
-# NUNCA usar sdpa — causa lentidao severa
-# =============================================================================
-try:
-    from qwen_tts import Qwen3TTSModel
-    QWEN3_AVAILABLE = True
-except ImportError:
-    try:
-        from qwen_tts.core.models.modeling_qwen3_tts import (
-            Qwen3TTSForConditionalGeneration as Qwen3TTSModel,
-        )
-        QWEN3_AVAILABLE = True
-    except ImportError:
-        Qwen3TTSModel   = None
-        QWEN3_AVAILABLE = False
-        logger.warning("qwen_tts nao instalado. Execute: pip install --upgrade qwen-tts")
-
-# Globals Qwen
-qwen_model        = None
-QWEN_LOADED: bool = False
-qwen_device       = None
-_qwen_lock        = threading.Lock()
-
-_QWEN_SPEAKER_MAP = {
-    "aiden":    "Aiden",  "dylan":    "Dylan",
-    "eric":     "Eric",   "ono_anna": "Ono_Anna",
-    "ryan":     "Ryan",   "serena":   "Serena",
-    "sohee":    "Sohee",  "uncle_fu": "Uncle_Fu",
-    "vivian":   "Vivian",
-}
-
-# =============================================================================
-# INDEXTTS — subprocess via uv (padrao TTS-Story)
-# Requer: engines/index-tts/ clonado + uv sync + checkpoints/
-# =============================================================================
-INDEX_TTS_ENGINE_DIR = (_REPO_ROOT / "engines" / "index-tts").resolve()
-INDEX_TTS_WORKER     = (INDEX_TTS_ENGINE_DIR / "tts_worker.py").resolve()
-INDEX_TTS_VENV_DIR   = (INDEX_TTS_ENGINE_DIR / ".venv").resolve()
-INDEX_TTS_AVAILABLE  = (
-    INDEX_TTS_ENGINE_DIR.exists()
-    and INDEX_TTS_WORKER.exists()
-    and INDEX_TTS_VENV_DIR.exists()
-)
-
-if not INDEX_TTS_AVAILABLE:
-    reason_parts = []
-    if not INDEX_TTS_ENGINE_DIR.exists():
-        reason_parts.append("engines/index-tts/ nao encontrado")
-    elif not INDEX_TTS_VENV_DIR.exists():
-        reason_parts.append(".venv nao encontrado — execute setup.bat")
-    elif not INDEX_TTS_WORKER.exists():
-        reason_parts.append("tts_worker.py nao encontrado em engines/index-tts/")
-    if reason_parts:
-        logger.warning(
-            f"IndexTTS indisponivel: {', '.join(reason_parts)}\n"
-            "Para configurar: execute setup.bat"
-        )
-
-_indextts_proc       = None
-_indextts_proc_lock  = threading.Lock()
-INDEX_TTS_LOADED: bool = False
-
-# =============================================================================
 # Imports de suporte
 # =============================================================================
 from config import config_manager
@@ -325,6 +271,11 @@ MODEL_LOADED:     bool = False
 model_device:     Optional[str] = None
 loaded_model_type: Optional[str] = None       # "original" | "turbo" | "multilingual"
 loaded_model_class_name: Optional[str] = None
+
+# Cache de voice embedding — evita recalcular VoiceEncoder para o mesmo arquivo de referência.
+# Chave: caminho absoluto do audio_prompt_path. Valor: tensor de embedding na CPU (float32).
+# Limpo automaticamente quando o modelo é trocado (unload_all_for_switch).
+_voice_embedding_cache: dict = {}
 
 # Lock compartilhado GPU — garante que apenas 1 modelo usa GPU por vez
 _synthesis_lock = threading.Lock()
@@ -390,7 +341,8 @@ def _test_mps_functionality() -> bool:
 
 def _optimize_for_device(device_str: str):
     if device_str == "cuda":
-        torch.backends.cudnn.benchmark = False  # TTS: comprimentos variáveis
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         try: torch.set_float32_matmul_precision("high")
@@ -413,42 +365,7 @@ def set_seed(seed_value: int):
     np.random.seed(seed_value)
 
 def _resolve_qwen_attn() -> str:
-    """PADRAO TTS-STORY: flash_attention_2 > eager. Nunca sdpa."""
-    try:
-        import flash_attn  # noqa
-        logger.info("Qwen: flash_attention_2 disponivel.")
-        return "flash_attention_2"
-    except ImportError:
-        logger.warning(
-            "Qwen: flash-attn ausente, usando 'eager'.\n"
-            "Para melhor performance: pip install flash-attn --no-build-isolation"
-        )
-        return "eager"
-
-def _get_uv_path() -> str:
-    """Retorna o caminho do uv, tentando locais comuns no Windows."""
-    # 1. Tentar no PATH
-    if shutil.which("uv"):
-        return "uv"
-    
-    # 2. Tentar caminhos comuns no Windows
-    user_home = Path.home()
-    common_paths = [
-        user_home / ".local" / "bin" / "uv.exe",
-        user_home / ".cargo" / "bin" / "uv.exe",
-        Path(os.environ.get("APPDATA", "")) / "uv" / "bin" / "uv.exe"
-    ]
-    for p in common_paths:
-        if p.exists():
-            return str(p)
-            
-    return "uv" # Fallback para o PATH
-
-def _check_uv_installed() -> bool:
-    uv_path = _get_uv_path()
-    try:
-        return subprocess.run([uv_path, "--version"], capture_output=True, timeout=5).returncode == 0
-    except: return False
+    return "eager"
 
 
 # =============================================================================
@@ -550,6 +467,80 @@ def load_turbo() -> bool:
             _Turbo = _ChatterboxTurbo
 
         chatterbox_model = _Turbo.from_pretrained(device=model_device)
+
+        # [OTIMIZAÇÃO] BFloat16 (mesma precision que o Multilingual já usava)
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            try:
+                chatterbox_model = chatterbox_model.bfloat16()
+                logger.info("[TURBO] Convertido para bfloat16.")
+            except AttributeError:
+                pass
+        elif torch.cuda.is_available():
+            try:
+                chatterbox_model = chatterbox_model.half()
+                logger.info("[TURBO] Convertido para float16.")
+            except AttributeError:
+                pass
+
+        # [OTIMIZAÇÃO] SDPA — evita overhead do attention spy (mesmo fix do Original/Multilingual)
+        if hasattr(chatterbox_model, "t3") and hasattr(chatterbox_model.t3, "model"):
+            if hasattr(chatterbox_model.t3.model, "config"):
+                try:
+                    chatterbox_model.t3.model.config.attn_implementation = "sdpa"
+                    chatterbox_model.t3.model.config.output_attentions = False
+                except Exception: pass
+        if hasattr(chatterbox_model, "set_attn_implementation"):
+            try: chatterbox_model.set_attn_implementation("sdpa")
+            except Exception: pass
+
+        # [OTIMIZAÇÃO] Patch do forward para remover output_attentions (mesmo fix do Multilingual)
+        try:
+            if hasattr(chatterbox_model.t3, "model"):
+                _real_t3_model = chatterbox_model.t3.model
+            else:
+                _real_t3_model = chatterbox_model.t3
+                
+            _original_call_t = _real_t3_model.__class__.forward
+            def _patched_forward_turbo(self_m, *fargs, **fkwargs):
+                fkwargs.pop("output_attentions", None)
+                fkwargs.pop("head_mask", None)
+                return _original_call_t(self_m, *fargs, **fkwargs)
+            import types as _types
+            _real_t3_model.forward = _types.MethodType(_patched_forward_turbo, _real_t3_model)
+            logger.info("[TURBO] Instance-level forward patch aplicado (output_attentions interceptado).")
+        except Exception as _fp_t:
+            logger.warning(f"[TURBO] Instance forward patch falhou (nao critico): {_fp_t}")
+
+        # [OTIMIZAÇÃO] Re-patch AlignmentStreamAnalyzer com eos_idx real
+        try:
+            real_eos_idx = chatterbox_model.t3.hp.stop_speech_token
+            class _DummyTurboEos(_DummyAlignmentAnalyzer):
+                def __init__(self_inner, *iargs, **ikwargs):
+                    super().__init__(*iargs, **ikwargs)
+                    self_inner.eos_idx = real_eos_idx
+            import sys as _sys_t
+            for _mp_t in ("chatterbox.models.t3.inference.alignment_stream_analyzer",
+                          "chatterbox.models.t3.t3", "chatterbox.mtl_tts"):
+                _m_t = _sys_t.modules.get(_mp_t)
+                if _m_t is not None and hasattr(_m_t, "AlignmentStreamAnalyzer"):
+                    setattr(_m_t, "AlignmentStreamAnalyzer", _DummyTurboEos)
+                    logger.info(f"[PATCH][TURBO] AlignmentStreamAnalyzer re-patched (eos_idx={real_eos_idx}) em {_mp_t}")
+        except Exception as _ep_t:
+            logger.warning(f"[PATCH][TURBO] Re-patch com eos_idx falhou (nao critico): {_ep_t}")
+
+        # [OTIMIZAÇÃO] torch.compile para acelerar inferência subsequente
+        if model_device == "cuda":
+            for attr in ("t3", "s3gen"):
+                if hasattr(chatterbox_model, attr):
+                    try:
+                        setattr(chatterbox_model, attr, torch.compile(
+                            getattr(chatterbox_model, attr),
+                            mode="max-autotune", fullgraph=False,
+                        ))
+                        logger.info(f"[TURBO] torch.compile aplicado ao {attr} (max-autotune).")
+                    except Exception as _ce:
+                        logger.warning(f"[TURBO] torch.compile em {attr} falhou (nao critico): {_ce}")
+
         loaded_model_type = "turbo"
         loaded_model_class_name = "ChatterboxTurboTTS"
         MODEL_LOADED = True
@@ -743,6 +734,19 @@ def load_multilingual() -> bool:
                     logger.info(f"[PATCH] Re-patched AlignmentStreamAnalyzer (eos_idx={real_eos_idx}) em {_mp}")
         except Exception as _ep:
             logger.warning(f"[PATCH] Re-patch com eos_idx falhou (nao critico): {_ep}")
+
+        # [OTIMIZAÇÃO] torch.compile para acelerar inferência subsequente
+        if model_device == "cuda":
+            for attr in ("t3", "s3gen"):
+                if hasattr(chatterbox_model, attr):
+                    try:
+                        setattr(chatterbox_model, attr, torch.compile(
+                            getattr(chatterbox_model, attr),
+                            mode="max-autotune", fullgraph=False,
+                        ))
+                        logger.info(f"[MULTILINGUAL] torch.compile aplicado ao {attr} (max-autotune).")
+                    except Exception as _ce_m:
+                        logger.warning(f"[MULTILINGUAL] torch.compile em {attr} falhou (nao critico): {_ce_m}")
         
         return True
     except Exception as e:
@@ -766,26 +770,19 @@ def load_model(model_type: Optional[str] = None) -> bool:
     return load_turbo()
 
 
-def warmup_model():
-    """Warmup completo — aplicar torch.compile ANTES do forward dummy."""
-    global chatterbox_model, MODEL_LOADED, model_device
-    if not MODEL_LOADED or chatterbox_model is None: return
-
-    if model_device == "cuda" and hasattr(torch, "compile"):
-        for attr in ("t3", "s3gen"):
-            if hasattr(chatterbox_model, attr):
-                try:
-                    setattr(chatterbox_model, attr, torch.compile(
-                        getattr(chatterbox_model, attr),
-                        mode="reduce-overhead", fullgraph=False,
-                    ))
-                    logger.info(f"torch.compile aplicado ao {attr}.")
-                except Exception as e:
-                    logger.warning(f"torch.compile em {attr} falhou (nao critico): {e}")
+    # [OTIMIZAÇÃO INDUSTRIAL] Removido torch.compile duplicado aqui para evitar conflito com max-autotune do load.
+    
+    # Contexto de autocast para garantir que o warmup gere os mesmos kernels da geração real
+    if model_device == "cuda" and torch.cuda.is_bf16_supported():
+        autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    elif model_device == "cuda":
+        autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16)
+    else:
+        autocast_ctx = contextlib.nullcontext()
 
     # Warmup 1 — sem audio de referencia
     try:
-        with _synthesis_lock, torch.inference_mode():
+        with _synthesis_lock, torch.inference_mode(), autocast_ctx:
             if hasattr(chatterbox_model, "generate"):
                 chatterbox_model.generate("Hello.")
         if torch.cuda.is_available(): torch.cuda.synchronize()
@@ -797,13 +794,14 @@ def warmup_model():
     try:
         import soundfile as sf
         dummy_sr = chatterbox_model.sr if hasattr(chatterbox_model, "sr") else 24000
-        dummy_audio = np.zeros(dummy_sr * 3, dtype=np.float32)
+        dummy_audio = np.zeros(dummy_sr * 6, dtype=np.float32) # 6s para passar no assert > 5s
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
         sf.write(tmp_path, dummy_audio, dummy_sr)
         try:
-            with _synthesis_lock, torch.inference_mode():
+            with _synthesis_lock, torch.inference_mode(), autocast_ctx:
                 if hasattr(chatterbox_model, "generate"):
+                    # Use a call that triggers prepare_conditionals
                     chatterbox_model.generate("Hello.", audio_prompt_path=tmp_path)
             if torch.cuda.is_available(): torch.cuda.synchronize()
             logger.info("Warmup (com ref simulada) concluido.")
@@ -832,15 +830,15 @@ def check_audio_validity(audio):
 def synthesize(
     text: str,
     audio_prompt_path: str = None,
-    temperature: float = 0.8,
+    temperature: float = 0.65,
     exaggeration: float = 0.5,
     cfg_weight: float = 0.5,
     seed: int = 0,
     language: str = "en",
     min_p: float = 0.05,
-    top_p: float = 0.95,
+    top_p: float = 0.85,
     top_k: int = 1000,
-    repetition_penalty: float = 1.2,
+    repetition_penalty: float = 1.15,
     norm_loudness: bool = True,
     **kwargs,
 ) -> Tuple[Optional[torch.Tensor], Optional[int]]:
@@ -877,65 +875,62 @@ def synthesize(
 
     with _synthesis_lock:
         try:
+            # [DETERMINISMO] Seed forçada logo no início do lock para consistência total
+            set_seed(seed if seed != 0 else 42)
+            
             print("[ENGINE] Gerando áudio...")
             start_time = time.time()
             with torch.inference_mode(), autocast_ctx:
-                # [VOICE VALIDATION] - Corrigindo erro 'Sem clonagem' e paths invalidos
+                # [VOICE VALIDATION]
                 if not audio_prompt_path or not isinstance(audio_prompt_path, str) or not os.path.exists(audio_prompt_path):
-                    logger.debug(f"[VOICE] Selecionado: {audio_prompt_path} -> Path inválido ou Base. Usando None.")
                     audio_prompt_path = None
+                    _abs_path = None
                 else:
-                    logger.debug(f"[VOICE] Path resolvido: {audio_prompt_path}")
+                    _abs_path = os.path.abspath(audio_prompt_path)
 
+                # [MAESTRIA DO CACHE DE VOICE EMBEDDING]
+                # Implementação robusta para garantir que o VoiceEncoder NUNCA seja
+                # recalculado para o mesmo arquivo de referência.
+                _using_cache = False
+                if _abs_path and _abs_path in _voice_embedding_cache:
+                    # Aplicamos o objeto 'conds' completo do Chatterbox (Turbo/MTL)
+                    chatterbox_model.conds = _voice_embedding_cache[_abs_path]
+                    _using_cache = True
+                    logger.debug(f"[VOICE CACHE] Mastery Hit: {_abs_path}")
+
+                gen_kwargs = {
+                    "text": text,
+                    "audio_prompt_path": None if _using_cache else audio_prompt_path,
+                    "temperature": temperature,
+                    "min_p": min_p,
+                    "top_p": top_p,
+                    "repetition_penalty": repetition_penalty,
+                }
+                
                 if loaded_model_type == "turbo":
-                    wav_tensor = chatterbox_model.generate(
-                        text=text,
-                        audio_prompt_path=audio_prompt_path,
-                        temperature=temperature,
-                        min_p=min_p,
-                        top_p=top_p,
-                        top_k=top_k,
-                        repetition_penalty=repetition_penalty,
-                        norm_loudness=norm_loudness,
-                    )
+                    gen_kwargs["top_k"] = top_k
+                    gen_kwargs["norm_loudness"] = norm_loudness
+                    wav_tensor = chatterbox_model.generate(**gen_kwargs)
                 elif loaded_model_type == "multilingual":
-                    # AlignmentStreamAnalyzer is globally monkey-patched at import time
-                    # (_DummyAlignmentAnalyzer in engine.py) so no per-call workaround needed.
-                    wav_tensor = chatterbox_model.generate(
-                        text=text,
-                        language_id=language,
-                        audio_prompt_path=audio_prompt_path,
-                        temperature=temperature,
-                        exaggeration=exaggeration,
-                        cfg_weight=cfg_weight,
-                        min_p=min_p,
-                        top_p=top_p,
-                        repetition_penalty=repetition_penalty,
-                    )
+                    gen_kwargs["language_id"] = language
+                    gen_kwargs["exaggeration"] = exaggeration
+                    gen_kwargs["cfg_weight"] = cfg_weight
+                    wav_tensor = chatterbox_model.generate(**gen_kwargs)
                 else:
-                    # ORIGINAL
-                    wav_tensor = chatterbox_model.generate(
-                        text=text,
-                        audio_prompt_path=audio_prompt_path,
-                        temperature=temperature,
-                        exaggeration=exaggeration,
-                        cfg_weight=cfg_weight,
-                        min_p=min_p,
-                        top_p=top_p,
-                        repetition_penalty=repetition_penalty,
-                    )
+                    gen_kwargs["exaggeration"] = exaggeration
+                    gen_kwargs["cfg_weight"] = cfg_weight
+                    wav_tensor = chatterbox_model.generate(**gen_kwargs)
+
+                # Se foi "Miss" (1ª geração do áudio), salvamos o Conditionals resultante.
+                if _abs_path and not _using_cache and hasattr(chatterbox_model, "conds"):
+                    if chatterbox_model.conds is not None:
+                        _voice_embedding_cache[_abs_path] = chatterbox_model.conds
+                        logger.info(f"[VOICE CACHE] Miss: Condicionais capturadas e imortalizadas para {_abs_path}")
             
             elapsed = time.time() - start_time
             if elapsed > 30:
                 logger.warning(f"Sintese demorada: {elapsed:.2f}s")
             
-            print(f"[DEBUG] Tipo retorno: {type(wav_tensor)}")
-            if wav_tensor is None:
-                raise ValueError("Modelo retornou None na geracao")
-
-            if hasattr(wav_tensor, "shape"):
-                print(f"[DEBUG] Shape retorno: {wav_tensor.shape}")
-
             check_audio_validity(wav_tensor)
             
             wav_tensor = wav_tensor.to(torch.float32)
@@ -1027,6 +1022,7 @@ def load_kokoro_engine(
             print(f"[ENGINE] [Kokoro] Iniciando carregamento | param_device: {device} | resolved_device: {resolved} | lang: {lang_code}")
             logger.info(f"Carregando Kokoro | lang={lang_code} | device={resolved}")
             kokoro_pipeline = KPipeline(lang_code=lang_code, device=resolved)
+            
             KOKORO_LOADED   = True
             kokoro_loaded_lang = lang_code
             print(f"[ENGINE] [Kokoro] Carregado com sucesso em {resolved} | lang: {lang_code} | Tempo: {time.time() - t0_kload:.2f}s")
@@ -1184,489 +1180,92 @@ def unload_kokoro_engine():
 # QWEN3 TTS — (padrao TTS-Story src/engines/qwen3_custom_voice_engine.py)
 # =============================================================================
 
-def load_qwen_model(device: str = "auto") -> bool:
-    global qwen_model, QWEN_LOADED, qwen_device
-    global _is_loading, _is_generating
-
-    if _is_generating:
-        print("IGNORADO: geração já em andamento (qwen)")
-        return False
-
-    if QWEN_LOADED: return True
-
-    with _engine_lock:
-        if _is_loading:
-            return False
-        _is_loading = True
-
-    try:
-        with _qwen_lock:
-            if QWEN_LOADED: return True
-            if not QWEN3_AVAILABLE:
-                logger.error("qwen_tts nao instalado. Execute: pip install --upgrade qwen-tts")
-                return False
-
-        if device == "auto":
-            if _test_cuda_functionality():   resolved = "cuda"
-            elif _test_mps_functionality():  resolved = "mps"
-            else:                            resolved = "cpu"
-        else:
-            resolved = device
-
-        qwen_device = resolved
-        _optimize_for_device(str(resolved))
-
-        if resolved == "cuda" and torch.cuda.is_bf16_supported():
-            dtype = torch.bfloat16
-        else:
-            dtype = torch.float32
-
-        attn = _resolve_qwen_attn()
-
-        try:
-            logger.info(
-                f"Carregando Qwen3-TTS | device={resolved} | dtype={dtype} | attn={attn}"
-            )
-            qwen_model = Qwen3TTSModel.from_pretrained(
-                "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-                device_map=resolved,
-                dtype=dtype,
-                attn_implementation=attn,
-            )
-            QWEN_LOADED = True
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            _warmup_qwen()
-            return True
-        except Exception as e:
-            logger.error(f"Falha critica ao carregar Qwen: {e}", exc_info=True)
-            qwen_model  = None
-            QWEN_LOADED = False
-            return False
-    finally:
-        with _engine_lock:
-            _is_loading = False
-
-
-def _warmup_qwen():
-    global qwen_model, QWEN_LOADED
-    if not QWEN_LOADED or qwen_model is None: return
-    try:
-        logger.info("Warmup Qwen...")
-        ctx = (
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-            if qwen_device == "cuda" and torch.cuda.is_bf16_supported()
-            else contextlib.nullcontext()
-        )
-        with torch.inference_mode(), ctx:
-            qwen_model.generate_custom_voice(
-                text="Hello.", language="Auto",
-                speaker=_QWEN_SPEAKER_MAP["ryan"],
-            )
-        if torch.cuda.is_available(): torch.cuda.synchronize()
-        logger.info("Warmup Qwen concluido.")
-    except Exception as e:
-        logger.warning(f"Warmup Qwen falhou (nao critico): {e}")
-
-
-def synthesize_qwen(
-    text: str,
-    speaker: str = "Ryan",
-    language: str = "Auto",
-) -> Tuple[Optional[np.ndarray], Optional[int]]:
-    """
-    PADRAO TTS-STORY src/engines/qwen3_custom_voice_engine.py:
-      - generate_custom_voice() com speaker normalizado
-      - autocast bfloat16 no CUDA
-      - retorna numpy float32
-    """
-    global qwen_model, QWEN_LOADED
-    global _is_loading, _is_generating
-
-    if _is_loading:
-        raise RuntimeError("Modelo Qwen ainda está carregando")
-
-    if not QWEN_LOADED or qwen_model is None:
-        logger.error("Qwen nao carregado. Chame load_qwen_model() primeiro.")
-        return None, None
-
-    speaker_final = _QWEN_SPEAKER_MAP.get(
-        speaker.strip().lower().replace(" ", "_"), "Ryan"
-    )
-
-    with _engine_lock:
-        _is_generating = True
-
-    if torch.cuda.is_available(): torch.cuda.synchronize()
-
-    with _synthesis_lock:
-        try:
-            ctx = (
-                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                if qwen_device == "cuda" and torch.cuda.is_bf16_supported()
-                else contextlib.nullcontext()
-            )
-            with torch.inference_mode(), ctx:
-                res_wavs, sr = qwen_model.generate_custom_voice(
-                    text=text, speaker=speaker_final, language=language,
-                )
-
-            if not res_wavs:
-                logger.error("Qwen retornou lista vazia.")
-                return None, None
-
-            wav = res_wavs[0]
-            wav_np = (
-                wav.cpu().float().numpy()
-                if isinstance(wav, torch.Tensor)
-                else np.array(wav, dtype=np.float32)
-            )
-            check_audio_validity(wav_np)
-            return wav_np, int(sr)
-
-        except Exception as e:
-            print("ERRO NA GERAÇÃO QWEN:", e)
-            import traceback
-            traceback.print_exc()
-            logger.error(f"Erro na sintese Qwen: {e}", exc_info=True)
-            return None, None
-        finally:
-            with _engine_lock:
-                _is_generating = False
-
-
-def unload_qwen_model():
-    global qwen_model, QWEN_LOADED
-    with _qwen_lock:
-        if qwen_model is not None:
-            del qwen_model
-            qwen_model = None
-        QWEN_LOADED = False
-    gc.collect()
-    if torch.cuda.is_available(): torch.cuda.empty_cache()
-    logger.info("Qwen descarregado.")
-
+# ENGINE SWITCHER
 
 # =============================================================================
-# INDEXTTS — subprocess via uv (padrao TTS-Story)
-# =============================================================================
-
-def _start_indextts_worker() -> bool:
-    global _indextts_proc
-    global _is_loading, _is_generating
-
-    if _is_generating:
-        print("IGNORADO: geração já em andamento (indextts)")
-        return False
-
-    if _indextts_proc and _indextts_proc.poll() is None:
-        return True  # ja rodando
-
-    with _engine_lock:
-        if _is_loading:
-            return False
-        _is_loading = True
-
-    if not INDEX_TTS_AVAILABLE:
-        logger.error("IndexTTS nao configurado. Execute setup.bat.")
-        with _engine_lock:
-            _is_loading = False
-        return False
-
-    # Garantir que o uv esta no PATH de forma robusta
-    uv_path = _get_uv_path()
-    if uv_path != "uv":
-        uv_dir = str(Path(uv_path).parent)
-        env_path = os.environ.get("PATH", "")
-        if uv_dir not in env_path:
-            os.environ["PATH"] = uv_dir + os.pathsep + env_path
-
-    if not _check_uv_installed():
-        logger.error(f"uv nao instalado ou nao encontrado em {uv_path}. Instale via: powershell -c 'irm https://astral.sh/uv/install.ps1 | iex'")
-        with _engine_lock:
-            _is_loading = False
-        return False
-
-    try:
-        env = dict(os.environ)
-        # Removido PYTHONPATH para evitar shadowing — venv cuida disso
-        if "PYTHONPATH" in env: del env["PYTHONPATH"]
-        
-        # O IndexTTS usa o python do proprio venv para garantir isolamento
-        venv_python = str(INDEX_TTS_ENGINE_DIR / ".venv" / "Scripts" / "python.exe")
-        
-        # O script deve ser passado apenas pelo nome se o cwd for a pasta do engine
-        # para evitar caminhos duplicados como engines/index-tts/engines/index-tts/tts_worker.py
-        worker_script = "tts_worker.py"
-        
-        # Fallback para uv se o venv nao existir (improvavel se uv sync rodou)
-        if not os.path.exists(venv_python):
-            args = [uv_path, "run", "python", worker_script]
-        else:
-            args = [venv_python, worker_script]
-            
-        print(f"DEBUG IndexTTS CMD: {args}")
-        logger.info(f"Iniciando IndexTTS via: {' '.join(args)}")
-
-        _indextts_proc = subprocess.Popen(
-            args,
-            cwd=str(INDEX_TTS_ENGINE_DIR),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True, bufsize=1, env=env,
-        )
-
-        def _fwd():
-            for line in _indextts_proc.stderr:
-                if line.strip():
-                    logger.debug(f"[IndexTTS] {line.rstrip()}")
-        threading.Thread(target=_fwd, daemon=True).start()
-
-        import time
-        deadline = time.monotonic() + 120
-        logger.info("Aguardando IndexTTS carregar (~30-60s)...")
-        while time.monotonic() < deadline:
-            if _indextts_proc.poll() is not None:
-                logger.error("Worker IndexTTS encerrou inesperadamente.")
-                return False
-            line = _indextts_proc.stdout.readline()
-            if not line:
-                time.sleep(0.1)
-                continue
-            try:
-                msg = json.loads(line.strip())
-                if msg.get("status") == "ready":
-                    logger.info("[ENGINE] IndexTTS carregado com sucesso.")
-                    INDEX_TTS_LOADED = True
-                    return True
-            except json.JSONDecodeError:
-                continue
-
-        logger.error("Timeout aguardando IndexTTS.")
-        _stop_indextts_worker()
-        return False
-
-    except Exception as e:
-        logger.error(f"Falha ao iniciar IndexTTS: {e}", exc_info=True)
-        return False
-    finally:
-        with _engine_lock:
-            _is_loading = False
-
-
-def _stop_indextts_worker():
-    global _indextts_proc
-    if _indextts_proc and _indextts_proc.poll() is None:
-        try:
-            _indextts_proc.stdin.write(json.dumps({"cmd": "exit"}) + "\n")
-            _indextts_proc.stdin.flush()
-            _indextts_proc.wait(timeout=10)
-        except Exception:
-            try: _indextts_proc.kill()
-            except: pass
-    _indextts_proc = None
-    logger.info("Worker IndexTTS encerrado.")
-
-
-def synthesize_indextts(
-    text: str,
-    audio_prompt_path: str,
-    output_path: str = None,
-) -> Tuple[Optional[np.ndarray], Optional[int]]:
-    """
-    Sintetiza com IndexTTS via subprocess uv (padrao TTS-Story).
-    O worker e iniciado sob demanda e mantido vivo durante o batch.
-    """
-    global _indextts_proc
-    global _is_loading, _is_generating
-
-    if _is_loading:
-        raise RuntimeError("Worker IndexTTS ainda está inicializando")
-
-    with _indextts_proc_lock:
-        if not _indextts_proc or _indextts_proc.poll() is not None:
-            if not _start_indextts_worker():
-                return None, None
-
-    with _engine_lock:
-        _is_generating = True
-
-    own_tmp = False
-    if not output_path:
-        fd, output_path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        own_tmp = True
-
-    try:
-        req = json.dumps({
-            "text":   text,
-            "prompt": str(Path(audio_prompt_path).resolve()),
-            "output": str(Path(output_path).resolve()),
-        })
-
-        with _indextts_proc_lock:
-            _indextts_proc.stdin.write(req + "\n")
-            _indextts_proc.stdin.flush()
-
-            import time
-            deadline = time.monotonic() + 120
-            while time.monotonic() < deadline:
-                if _indextts_proc.poll() is not None:
-                    logger.error("Worker IndexTTS encerrou durante sintese.")
-                    return None, None
-                line = _indextts_proc.stdout.readline()
-                if not line:
-                    time.sleep(0.05)
-                    continue
-                try:
-                    resp = json.loads(line.strip())
-                    if resp.get("status") == "ok":
-                        import soundfile as sf
-                        audio_np, sr = sf.read(output_path, dtype="float32")
-                        if audio_np.ndim == 2:
-                            audio_np = audio_np.mean(axis=1)
-                        check_audio_validity(audio_np)
-                        return audio_np, int(sr)
-                    elif resp.get("status") == "error":
-                        logger.error(f"IndexTTS erro: {resp.get('message')}")
-                        return None, None
-                except json.JSONDecodeError:
-                    continue
-
-        logger.error("Timeout aguardando resposta IndexTTS.")
-        return None, None
-
-    except Exception as e:
-        logger.error(f"Erro na comunicacao com IndexTTS: {e}", exc_info=True)
-        return None, None
-    finally:
-        with _engine_lock:
-            _is_generating = False
-        if own_tmp and Path(output_path).exists():
-            try: Path(output_path).unlink()
-            except: pass
-
-
-def unload_indextts():
-    global INDEX_TTS_LOADED
-    _stop_indextts_worker()
-    INDEX_TTS_LOADED = False
-    logger.info("IndexTTS descarregado.")
-
-
-# =============================================================================
-# VRAM SWITCH — descarregar todos os engines
+# UNLOADER / SWITCHER
 # =============================================================================
 
 def unload_all_for_switch():
     """
-    PADRAO TTS-STORY: limpa VRAM antes de carregar novo engine.
+    Descarrega Chatterbox e Kokoro para liberar VRAM.
+    Vital para evitar OOM na RTX 5070 Ti ao alternar modelos pesados.
     """
     global chatterbox_model, MODEL_LOADED, loaded_model_type, loaded_model_class_name
-    global qwen_model, QWEN_LOADED
     global kokoro_pipeline, KOKORO_LOADED
-    global INDEX_TTS_LOADED
-    global _is_generating
+    global _voice_embedding_cache
 
-    with _engine_lock:
-        if _is_generating:
-            print("IGNORADO: modelo em uso")
-            return
-
+    print("[ENGINE] Descarregando modelos para troca...")
+    
+    # 1. Chatterbox
     if chatterbox_model is not None:
-        logger.info("Descarregando Chatterbox...")
-        del chatterbox_model
-        chatterbox_model        = None
-        MODEL_LOADED            = False
-        loaded_model_type       = None
-        loaded_model_class_name = None
-
-    if qwen_model is not None:
-        logger.info("Descarregando Qwen...")
-        del qwen_model
-        qwen_model  = None
-        QWEN_LOADED = False
-
-    if kokoro_pipeline is not None:
-        logger.info("Descarregando Kokoro...")
-        del kokoro_pipeline
-        kokoro_pipeline = None
-        KOKORO_LOADED   = False
-
-    _stop_indextts_worker()
-    INDEX_TTS_LOADED = False
-
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
         try:
-            vram_free = torch.cuda.mem_get_info()[0] / 1e9
-            logger.info(f"VRAM livre apos descarga: {vram_free:.2f} GB")
+            del chatterbox_model
         except: pass
-    gc.collect()  # Second pass to clean any lingering refs freed after CUDA sync
-    if torch.backends.mps.is_available():
-        try: torch.mps.empty_cache()
+        chatterbox_model = None
+        MODEL_LOADED = False
+        loaded_model_type = None
+        loaded_model_class_name = None
+    
+    _voice_embedding_cache.clear()
+
+    # 2. Kokoro
+    if kokoro_pipeline is not None:
+        try:
+            del kokoro_pipeline
         except: pass
+        kokoro_pipeline = None
+        KOKORO_LOADED = False
 
-
-# =============================================================================
-# ENGINE SWITCHER
-# =============================================================================
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            v_free = torch.cuda.mem_get_info()[0] / 1e9
+            print(f"[ENGINE] VRAM Livre: {v_free:.2f} GB")
+    except: pass
 
 _switch_lock = threading.Lock()
 
 def switch_to_engine(engine_name: str, model_type: Optional[str] = None) -> bool:
     """
-    Muda para o engine especificado, descarregando o anterior primeiro.
-    Engines: chatterbox | original | turbo | multilingual | kokoro | qwen | indextts
+    Muda para o engine especificado (chatterbox | kokoro).
     """
     if _switch_lock.locked():
         print("[ENGINE] Troca bloqueada (transicao ja em andamento)")
         return False
 
-    # FIX 3: Block switch if generation is active
     with _engine_lock:
         if _is_generating:
-            logger.error("[ENGINE] switch_to_engine bloqueado: geracao ativa. Aguarde o fim da geracao antes de trocar.")
+            print("[ENGINE] switch_to_engine bloqueado: geracao ativa.")
             return False
 
     with _switch_lock:
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        try:
+            import torch
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+        except: pass
             
         eng = engine_name.lower().replace("-", "_").replace(" ", "_")
-        print(f"[DEBUG] Engine solicitado: {eng} (submodelo: {model_type})")
-        logger.info(f"switch_to_engine: {eng} | submodelo: {model_type}")
+        print(f"[ENGINE] Switch to: {eng} (sub: {model_type})")
 
         if eng in ("chatterbox", "turbo", "original", "multilingual"):
-            # Se chamou "turbo" diretamente, usamos isso como model_type
             if eng != "chatterbox":
                 model_type = eng
             return load_model(model_type=model_type)
 
         unload_all_for_switch()
-        torch.cuda.empty_cache()
-        if torch.cuda.is_available(): torch.cuda.synchronize()
-
+        
         if eng == "kokoro":
             return load_kokoro_engine()
 
-        if eng in ("qwen", "qwen3"):
-            return load_qwen_model()
-
-        if eng == "indextts":
-            global INDEX_TTS_LOADED
-            INDEX_TTS_LOADED = _start_indextts_worker()
-            return INDEX_TTS_LOADED
-
-        logger.error(f"Engine desconhecido: '{engine_name}'.")
+        print(f"[ENGINE] Desconhecido: {engine_name}")
         return False
 
-
 def get_active_engine() -> str:
-    if QWEN_LOADED:    return "qwen"
     if KOKORO_LOADED:  return "kokoro"
-    if INDEX_TTS_LOADED or (_indextts_proc and _indextts_proc.poll() is None): return "indextts"
     if MODEL_LOADED:   return "chatterbox"
     return "none"

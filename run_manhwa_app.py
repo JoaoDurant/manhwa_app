@@ -20,6 +20,9 @@ from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# [MAX PERFORMANCE] Otimização de Alocador CUDA para Windows / RTX 5000 (Substitui expandable_segments)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "garbage_collection_threshold:0.8,max_split_size_mb:512"
+
 def get_venv_python():
     """Retorna o caminho do python.exe no venv_main relativo a este script."""
     return Path(__file__).resolve().parent / "venv_main" / "Scripts" / "python.exe"
@@ -36,6 +39,16 @@ def check_and_restart_venv():
 check_and_restart_venv()
 
 # Se chegou aqui, já está no venv correto (ou o venv não existe e será avisado).
+
+# [MAX PERFORMANCE] Elevação de prioridade do Processo (Windows)
+try:
+    import psutil
+    p = psutil.Process(os.getpid())
+    p.nice(psutil.HIGH_PRIORITY_CLASS)
+    print("\n[PERFORMANCE] Processo elevado para PRIORIDADE MÁXIMA (HIGH_PRIORITY).")
+except Exception as e:
+    pass
+
 # Verificacao de integridade de dependencias criticas
 try:
     import torch
@@ -136,19 +149,6 @@ def check_dependencies():
 
 if __name__ == "__main__":
     check_dependencies()
-
-    # --- VERIFICAÇÃO DE AMBIENTE (WORKERS) ---
-    root = Path(__file__).resolve().parent
-    missing_venvs = []
-    if not (root / "venv_qwen").exists(): missing_venvs.append("venv_qwen")
-    if not (root / "venv_indextts").exists(): missing_venvs.append("venv_indextts")
-    
-    if missing_venvs:
-        print("\n" + "!"*60)
-        print(" AVISO: WORKERS NÃO INSTALADOS")
-        print(" O Qwen e o IndexTTS não vão funcionar até você resolver isso.")
-        print(" Ação: Feche este terminal e execute: setup_workers.bat")
-        print("!"*60 + "\n")
 
     # --- VERIFICAÇÃO DE COMPATIBILIDADE GPU (RTX 50-SERIES) ---
     try:

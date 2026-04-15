@@ -1442,8 +1442,6 @@ def generate_paragraph_audio(
     from engine import (
         synthesize,       MODEL_LOADED,       load_model,
         synthesize_kokoro, KOKORO_LOADED,     load_kokoro_engine,
-        synthesize_qwen,   QWEN_LOADED,       load_qwen_model,
-        synthesize_indextts, INDEX_TTS_AVAILABLE,
         logger
     )
     import numpy as np
@@ -1465,8 +1463,6 @@ def generate_paragraph_audio(
     kokoro_v    = kwargs.get("kokoro_voice", "af_heart")
     kokoro_s    = kwargs.get("kokoro_speed", 1.0)
     kokoro_lang = kwargs.get("kokoro_lang", "a")
-    qwen_spk    = kwargs.get("qwen_speaker", kwargs.get("qwen_speaker_alias", "Ryan"))
-    qwen_lang   = kwargs.get("qwen_language", kwargs.get("qwen_language_alias", "Auto"))
     chatter_t   = kwargs.get("temperature", 0.8)
     chatter_e   = kwargs.get("exaggeration", 0.5)
     chatter_c   = kwargs.get("cfg_weight", 0.5)
@@ -1494,51 +1490,10 @@ def generate_paragraph_audio(
             audio_array = normalize_audio_output(raw_output)
             sample_rate = 24000 # Kokoro KPipeline default sr
 
-        # =========================================================
-        # QWEN TTS
-        # =========================================================
-        elif e in ("qwen", "qwen_custom", "qwen3"):
-            if not QWEN_LOADED:
-                if not load_qwen_model():
-                    logger.error("[DISPATCHER] Abortado: Falha no carregamento do Qwen.")
-                    return False
-            logger.info(f"[DISPATCHER] Iniciando geracao Qwen | Speaker: {qwen_spk}")
-            chunks = chunk_text_for_qwen(text)
-            parts = []
-            for idx, chunk in enumerate(chunks):
-                if not chunk.strip(): continue
-                raw = synthesize_qwen(chunk, speaker=qwen_spk, language=qwen_lang)
-                logger.debug(f"[DISPATCHER] Qwen chunk {idx} retorno bruto: {type(raw)}")
-                w = normalize_audio_output(raw)
-                parts.append(w)
-            if parts:
-                audio_array = np.concatenate(parts) if len(parts) > 1 else parts[0]
-                sample_rate = 24000
-
-        # =========================================================
+# =========================================================
         # INDEXTTS
         # =========================================================
-        # =========================================================
-        # INDEXTTS
-        # =========================================================
-        elif e in ("indextts", "indextts2", "index_tts"):
-            if not audio_prompt_path:
-                logger.error("[DISPATCHER] Abortado: IndexTTS exige 'audio_prompt_path'.")
-                return False
-            logger.info(f"[DISPATCHER] Iniciando geracao IndexTTS")
-            chunks = chunk_text_for_indextts(text)
-            parts = []
-            for idx, chunk in enumerate(chunks):
-                if not chunk.strip(): continue
-                raw = synthesize_indextts(chunk, audio_prompt_path)
-                logger.debug(f"[DISPATCHER] IndexTTS chunk {idx} retorno bruto: {type(raw)}")
-                w = normalize_audio_output(raw)
-                parts.append(w)
-            if parts:
-                audio_array = np.concatenate(parts) if len(parts) > 1 else parts[0]
-                sample_rate = 24000
-
-        # =========================================================
+# =========================================================
         # CHATTERBOX / TURBO
         # =========================================================
         # =========================================================

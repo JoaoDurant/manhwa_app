@@ -1,0 +1,134 @@
+﻿venv_main\Scripts\python.ex
+e : E:\backup\v6\venv_main\
+lib\site-packages\transform
+ers\modeling_utils.py:1985:
+ FutureWarning: torch._dyna
+mo.allow_in_graph is 
+deprecated and will be 
+removed in a future 
+version. Use torch._dynamo.
+nonstrict_trace instead.
+No linha:1 caractere:1
++ venv_main\Scripts\python.
+exe -c "from 
+manhwa_app.app import 
+QueueCoor ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~
+    + CategoryInfo         
+     : NotSpecified: (E:\  
+  backup\v6\ve..._trace    
+ instead.:String) [], R    
+emoteException
+    + FullyQualifiedErrorI 
+   d : NativeCommandError
+ 
+  def 
+can_record_outputs(self) 
+-> dict[str, 
+OutputRecorder]:
+E:\backup\v6\venv_main\lib\
+site-packages\diffusers\mod
+els\attention_processor.py:
+43: FutureWarning: torch._d
+ynamo.allow_in_graph is 
+deprecated and will be 
+removed in a future 
+version. Use torch._dynamo.
+nonstrict_trace instead.
+  class 
+Attention(nn.Module):
+E:\backup\v6\venv_main\lib\
+site-packages\diffusers\mod
+els\attention.py:47: 
+FutureWarning: torch._dynam
+o.allow_in_graph is 
+deprecated and will be 
+removed in a future 
+version. Use torch._dynamo.
+nonstrict_trace instead.
+  class GatedSelfAttentionD
+ense(nn.Module):
+E:\backup\v6\venv_main\lib\
+site-packages\diffusers\mod
+els\attention.py:89: 
+FutureWarning: torch._dynam
+o.allow_in_graph is 
+deprecated and will be 
+removed in a future 
+version. Use torch._dynamo.
+nonstrict_trace instead.
+  class JointTransformerBlo
+ck(nn.Module):
+E:\backup\v6\venv_main\lib\
+site-packages\diffusers\mod
+els\attention.py:213: 
+FutureWarning: torch._dynam
+o.allow_in_graph is 
+deprecated and will be 
+removed in a future 
+version. Use torch._dynamo.
+nonstrict_trace instead.
+  class BasicTransformerBlo
+ck(nn.Module):
+E:\backup\v6\venv_main\lib\
+site-packages\diffusers\mod
+els\attention.py:531: 
+FutureWarning: torch._dynam
+o.allow_in_graph is 
+deprecated and will be 
+removed in a future 
+version. Use torch._dynamo.
+nonstrict_trace instead.
+  class TemporalBasicTransf
+ormerBlock(nn.Module):
+E:\backup\v6\venv_main\lib\
+site-packages\chatterbox\mo
+dels\s3gen\matcha\transform
+er.py:138: FutureWarning: t
+orch._dynamo.allow_in_graph
+ is deprecated and will be 
+removed in a future 
+version. Use torch._dynamo.
+nonstrict_trace instead.
+  class BasicTransformerBlo
+ck(nn.Module):
+'sox' não é reconhecido 
+como um comando interno
+ou externo, um programa 
+operável ou um arquivo em 
+lotes.
+SoX could not be found!
+
+    If you do not have 
+SoX, proceed here:
+     - - - http://sox.sourc
+eforge.net/ - - -
+
+    If you do (or think 
+that you should) have SoX, 
+double-check your
+    path variables.
+    
+Parselmouth library not 
+found. Unvoiced segment 
+removal feature will be 
+disabled.
+faster-whisper n�o 
+instalado. Tentaremos 
+fallback.
+Traceback (most recent 
+call last):
+  File "<string>", line 1, 
+in <module>
+ImportError: cannot import 
+name 'QueueCoordinator' 
+from 'manhwa_app.app' (E:\b
+ackup\v6\manhwa_app\app.py)
+
+********
+Warning: flash-attn is not installed. Will only run the manual PyTorch version. Please install flash-attn for faster inference.
+********
+ 
+[ENGINE] Turbo dispon�vel: True

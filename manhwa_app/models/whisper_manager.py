@@ -29,27 +29,23 @@ _whisper_model_name_loaded: Optional[str] = None
 _whisper_device: Optional[str] = None
 _WHISPER_LOCK = threading.Lock()
 
-def get_whisper_model(model_name: str = "base"):
+def get_whisper_model(model_name: str = "base", device_override: str = None):
     """
     Carrega o modelo faster-whisper de forma lazy e thread-safe.
-    Isso evita dupla inicialização caso haja multiprocessamento ou múltiplas
-    threads requisitando o validador de Whisper.
     """
     global _whisper_model, _whisper_device, _whisper_model_name_loaded
     with _WHISPER_LOCK:
-        # Verifica novamente dentro do lock (double-checked locking)
         if _whisper_model is not None and _whisper_model_name_loaded == model_name:
-            return _whisper_model, _whisper_device
+            if device_override is None or _whisper_device == device_override:
+                return _whisper_model, _whisper_device
 
-        # Descarregar modelo anterior se trocar de tamanho
+        # Descarregar se trocar de tamanho ou se dispositivo mudou drasticamente
         if _whisper_model is not None:
             del _whisper_model
             _whisper_model = None
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = device_override if device_override else ("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Carregando faster-whisper '{model_name}' em {device}…")
 
         try:
@@ -59,7 +55,6 @@ def get_whisper_model(model_name: str = "base"):
                 _whisper_model = model
                 _whisper_device = device
                 _whisper_model_name_loaded = model_name
-                logger.info(f"faster-whisper '{model_name}' pronto em {device} (compute: {compute_type}).")
                 return _whisper_model, _whisper_device
             elif _OPENAI_WHISPER_AVAILABLE:
                 logger.warning("Usando fallback para openai-whisper.")
@@ -113,12 +108,12 @@ def unload_whisper():
             logger.info("Modelo Whisper descarregado.")
 
 
-def transcribe_audio(wav_path: str, whisper_model_name: str = "base") -> str:
+def transcribe_audio(wav_path: str, whisper_model_name: str = "base", device_override: str = None) -> str:
     """
     Transcreve um WAV preexistente utilizando o motor Whisper instanciado.
     Emprega uma amostragem nos primeiros 10s para verificação ultrarrápida (útil para TTS check).
     """
-    model, device = get_whisper_model(whisper_model_name)
+    model, device = get_whisper_model(whisper_model_name, device_override=device_override)
     if model is None:
         return ""
     try:

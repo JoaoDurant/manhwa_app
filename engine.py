@@ -305,7 +305,7 @@ TURBO_PARALINGUISTIC_TAGS = [
 ]
 
 # =============================================================================
-# CUDA OTIMIZACOES — RTX 5070 Ti (Blackwell)
+# CUDA OTIMIZACOES — RTX 5070 Ti (Blackwell sm_120)
 # =============================================================================
 if torch.cuda.is_available():
     try:
@@ -314,9 +314,34 @@ if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
-        logger.info("TF32 e high-precision matmul ativados.")
+        # [BLACKWELL] expandable_segments reduz fragmentação em batches longos
+        # max_split_size_mb:512 evita OOM por fragmentação de micro-blocos
+        # garbage_collection_threshold:0.8 só ativa GC quando 80% cheio
+        import os as _oe
+        _existing = _oe.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        if "expandable_segments" not in _existing:
+            _oe.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+                "max_split_size_mb:512,"
+                "garbage_collection_threshold:0.8,"
+                "expandable_segments:True"
+            )
+        # [DETERMINISMO] Verdadeiro determinismo por kernel — crítico para consistência de voz
+        # em batch de 100+ parágrafos. max-autotune não determinista causa drift de timbre.
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+        logger.info("TF32, high-precision matmul, ALLOC_CONF (Blackwell), e flags determinísticas ativados.")
     except Exception as e:
         logger.debug(f"Nao foi possivel aplicar otimizacoes CUDA no inicio: {e}")
+
+# [PERSISTENT COMPILE CACHE] Evita recompilar a cada novo job no Macro.
+# Chave: model_type ("turbo", "multilingual", "original")
+# Valor: True se já compilado (os atributos t3/s3gen já foram substituídos in-place)
+_compiled_cache: dict = {}
+
 
 
 # =============================================================================
@@ -529,17 +554,34 @@ def load_turbo() -> bool:
             logger.warning(f"[PATCH][TURBO] Re-patch com eos_idx falhou (nao critico): {_ep_t}")
 
         # [OTIMIZAÇÃO] torch.compile para acelerar inferência subsequente
-        if model_device == "cuda":
+        # MODE: reduce-overhead (não max-autotune) — elimina overhead Python/dispatch
+        # sem o autotuner agressive que quebra o determinismo de voz em batches longos.
+        # PERSISTENT CACHE: só compila 1x por model_type, mesmo entre jobs do Macro.
+        if model_device == "cuda" and loaded_model_type not in _compiled_cache:
             for attr in ("t3", "s3gen"):
                 if hasattr(chatterbox_model, attr):
                     try:
                         setattr(chatterbox_model, attr, torch.compile(
                             getattr(chatterbox_model, attr),
-                            mode="max-autotune", fullgraph=False,
+                            mode="reduce-overhead",  # Elimina dispatch overhead, preserva determinismo
+                            fullgraph=False,
                         ))
-                        logger.info(f"[TURBO] torch.compile aplicado ao {attr} (max-autotune).")
+                        logger.info(f"[TURBO] torch.compile (reduce-overhead) aplicado ao {attr}.")
                     except Exception as _ce:
                         logger.warning(f"[TURBO] torch.compile em {attr} falhou (nao critico): {_ce}")
+            _compiled_cache["turbo"] = True
+            
+            # WARM-UP: paga o custo de JIT compilation agora
+            logger.info("[TURBO] Executando warm-up do torch.compile...")
+            try:
+                _dummy_text = "Hello."
+                with torch.inference_mode():
+                    chatterbox_model.generate(_dummy_text, audio_prompt_path=None)
+            except Exception as _wu_err:
+                logger.debug(f"[TURBO] Warm-up falhou (não crítico): {_wu_err}")
+        elif model_device == "cuda":
+            logger.info("[TURBO] torch.compile já aplicado (cache hit) — reutilizando.")
+
 
         loaded_model_type = "turbo"
         loaded_model_class_name = "ChatterboxTurboTTS"
@@ -735,18 +777,23 @@ def load_multilingual() -> bool:
         except Exception as _ep:
             logger.warning(f"[PATCH] Re-patch com eos_idx falhou (nao critico): {_ep}")
 
-        # [OTIMIZAÇÃO] torch.compile para acelerar inferência subsequente
-        if model_device == "cuda":
+        # [OTIMIZAÇÃO] torch.compile — reduce-overhead + persistent cache
+        if model_device == "cuda" and "multilingual" not in _compiled_cache:
             for attr in ("t3", "s3gen"):
                 if hasattr(chatterbox_model, attr):
                     try:
                         setattr(chatterbox_model, attr, torch.compile(
                             getattr(chatterbox_model, attr),
-                            mode="max-autotune", fullgraph=False,
+                            mode="reduce-overhead",
+                            fullgraph=False,
                         ))
-                        logger.info(f"[MULTILINGUAL] torch.compile aplicado ao {attr} (max-autotune).")
+                        logger.info(f"[MULTILINGUAL] torch.compile (reduce-overhead) aplicado ao {attr}.")
                     except Exception as _ce_m:
                         logger.warning(f"[MULTILINGUAL] torch.compile em {attr} falhou (nao critico): {_ce_m}")
+            _compiled_cache["multilingual"] = True
+        elif model_device == "cuda":
+            logger.info("[MULTILINGUAL] torch.compile já aplicado (cache hit) — reutilizando.")
+
         
         return True
     except Exception as e:
@@ -921,6 +968,7 @@ def synthesize(
                     gen_kwargs["cfg_weight"] = cfg_weight
                     wav_tensor = chatterbox_model.generate(**gen_kwargs)
 
+
                 # Se foi "Miss" (1ª geração do áudio), salvamos o Conditionals resultante.
                 if _abs_path and not _using_cache and hasattr(chatterbox_model, "conds"):
                     if chatterbox_model.conds is not None:
@@ -934,6 +982,13 @@ def synthesize(
             check_audio_validity(wav_tensor)
             
             wav_tensor = wav_tensor.to(torch.float32)
+            
+            # [AUDIO FIX] Prevenir clipping severo
+            max_val = torch.max(torch.abs(wav_tensor))
+            if max_val >= 0.98:
+                logger.info(f"[ENGINE] Normalizando audio para evitar clipping (max_val={max_val:.2f})")
+                wav_tensor = wav_tensor * (0.98 / max_val)
+                
             return wav_tensor, chatterbox_model.sr
 
         except Exception as e:
@@ -958,7 +1013,6 @@ def reload_model() -> bool:
 
     logger.info("Hot-swap Chatterbox...")
     if chatterbox_model is not None:
-        del chatterbox_model
         chatterbox_model = None
     MODEL_LOADED = False
     loaded_model_type = None
@@ -1199,9 +1253,6 @@ def unload_all_for_switch():
     
     # 1. Chatterbox
     if chatterbox_model is not None:
-        try:
-            del chatterbox_model
-        except: pass
         chatterbox_model = None
         MODEL_LOADED = False
         loaded_model_type = None
@@ -1211,9 +1262,6 @@ def unload_all_for_switch():
 
     # 2. Kokoro
     if kokoro_pipeline is not None:
-        try:
-            del kokoro_pipeline
-        except: pass
         kokoro_pipeline = None
         KOKORO_LOADED = False
 

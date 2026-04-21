@@ -23,6 +23,7 @@ import time
 import shutil
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
+from manhwa_app.utils import get_safe_path
 
 try:
     from PySide6.QtCore import QObject, Signal, QThread
@@ -433,8 +434,12 @@ def _python_render_clip(
 
 class VideoPipeline(QObject):
     progress    = Signal(int, int)      # (atual, total)
+    video_progress = Signal(int, int)   # Dashboard compatibility
     log_message = Signal(str)
     finished    = Signal(bool, str)     # (sucesso, caminho_resultado_ou_erro)
+
+    video_scene_done = Signal(int, int)
+    video_complete = Signal(str, float, float)
 
     def __init__(
         self,
@@ -486,8 +491,8 @@ class VideoPipeline(QObject):
 
         start_time = time.time()
 
-        out_root = Path(self.output_path)
-        scenes_dir = out_root.parent / f"{out_root.stem}_cenas_individuais"
+        out_root = get_safe_path(self.output_path)
+        scenes_dir = get_safe_path(out_root.parent / f"{out_root.stem}_cenas_individuais")
         scenes_dir.mkdir(parents=True, exist_ok=True)
 
         clip_tasks = []
@@ -590,6 +595,10 @@ class VideoPipeline(QObject):
 
                 try:
                     success = fut.result()
+                    if success:
+                        single_clip_count += 1
+                        self.progress.emit(single_clip_count, n_pairs)
+                        self.video_scene_done.emit(single_clip_count, n_pairs)
                 except Exception as e:
                     success = False
                     e_str = str(e)
@@ -713,8 +722,10 @@ class VideoPipeline(QObject):
                 total_time = time.time() - start_time
                 mins, secs = divmod(int(total_time), 60)
                 time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+                total_duration = sum(t[4] for t in clip_tasks)
 
                 self.log_message.emit(f"\n✓ Vídeo final salvo em: {out_path} (Tempo demorado: {time_str})")
+                self.video_complete.emit(str(out_path), total_duration, total_time)
                 self.finished.emit(True, str(out_path))
             else:
                 err = result.stderr.decode("utf-8", errors="replace")[-500:]

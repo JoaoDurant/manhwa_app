@@ -1,0 +1,1 @@
+from manhwa_app.new_macro_tab_class import MacroTab

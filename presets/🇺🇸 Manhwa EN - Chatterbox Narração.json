@@ -1,0 +1,47 @@
+{
+    "_comment": "=== MANHWA EN — Chatterbox Turbo ===",
+    "_notas": [
+        "Modelo: Turbo (treinado em inglês, máxima qualidade para EN)",
+        "cfg_weight 0.35: acompanha referência sem travar prosódia",
+        "exaggeration 0.72: expressividade narrativa sem teatral",
+        "temperature 0.78: variação prosódica natural entre parágrafos",
+        "repetition_penalty 1.08: prosódia fluida, sem rigidez",
+        "top_k 500 / top_p 0.92: filtra tokens ruins, preserva naturalidade",
+        "FX: compressor suave (ratio 2.5), loudnorm -14 LUFS (YouTube ideal)",
+        "Reverb desativado: frases curtas de manhwa soam artificiais com eco"
+    ],
+
+    "tts_engine": "chatterbox",
+    "model_type": "turbo",
+    "lang": "en",
+
+    "temperature": 0.78,
+    "exaggeration": 0.72,
+    "cfg_weight": 0.35,
+    "seed": 3000,
+    "speed": 1.0,
+
+    "min_p": 0.04,
+    "top_p": 0.92,
+    "top_k": 500,
+    "repetition_penalty": 1.08,
+    "norm_loudness": true,
+
+    "whisper_model": "base",
+    "similarity_threshold": 0.70,
+    "max_retries": 3,
+
+    "fx_highpass": true,
+    "fx_deesser": true,
+    "fx_compressor": true,
+    "fx_silence": false,
+    "fx_reverb": false,
+    "fx_loudnorm": true,
+
+    "use_spacy": false,
+    "use_phonetic": false,
+    "ref_vad_trimming": false,
+
+    "output_format": "wav",
+    "sample_rate": 24000
+}

@@ -108,3 +108,35 @@ def process_text_fluency(text: str, max_sentence_len: int = 250, lang: str = "pt
     final_text = " ".join(processed_sentences)
     final_text = final_text.replace(" ,", ",")
     return final_text
+
+def detect_language(text: str) -> str:
+    """
+    Detecta o idioma do texto baseado em heurísticas (sem dependências externas).
+    Retorna: 'pt', 'es', 'en', 'ja', 'zh', 'ko' ou 'en' (fallback).
+    """
+    if not text:
+        return "pt"
+    
+    import re
+    sample = text[:2000].lower() # Amostra para performance
+
+    # 1. Scripts Orientais (prioridade por blocos unicode)
+    if re.search(r'[\u3040-\u309f\u30a0-\u30ff]', sample): return "ja" # Hiragana / Katakana
+    if re.search(r'[\u4e00-\u9fff]', sample): return "zh"            # Kanji / Hanzi
+    if re.search(r'[\uac00-\ud7af]', sample): return "ko"            # Hangul
+
+    # 2. Espanhol (Marcas exclusivas)
+    if re.search(r'[¿¡ñ]', sample) or re.search(r'\b(pero|muito|lo|los|las|el|con)\b', sample):
+        # Nota: 'pero' e 'muito' (es/pt overlap mas 'pero' é forte es)
+        if "pero" in sample or "¿" in sample or "¡" in sample:
+            return "es"
+
+    # 3. Português (Marcas exclusivas)
+    if re.search(r'[ãõç]', sample) or re.search(r'\b(você|com|uma|esta|este|são)\b', sample):
+        return "pt"
+
+    # 4. Inglês (Palavras comuns)
+    if re.search(r'\b(the|and|that|this|it|of|to|is|for|was)\b', sample):
+        return "en"
+
+    return "pt" # Fallback para o idioma principal do usuário

@@ -11,11 +11,9 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
-from manhwa_app.models.qwen_manager import get_qwen_model
 from manhwa_app.models.whisper_manager import get_whisper_model, unload_whisper, transcribe_audio
 
 __all__ = [
-    "get_qwen_model",
     "get_whisper_model",
     "unload_whisper",
     "transcribe_audio"

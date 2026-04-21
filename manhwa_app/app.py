@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QSizePolicy, QStatusBar, QTabWidget, QTextEdit,
     QVBoxLayout, QWidget, QSlider as _QSlider, QComboBox as _QComboBox, QDoubleSpinBox as _QDoubleSpinBox, QSpinBox as _QSpinBox,
     QCheckBox, QInputDialog, QDialog, QTableWidget, QHeaderView,
-    QDialogButtonBox, QTableWidgetItem,
+    QDialogButtonBox, QTableWidgetItem, QSplitter, QFormLayout,
 )
 
 class QComboBox(_QComboBox):
@@ -80,12 +80,8 @@ KOKORO_LANG_MAP = {
     "hi": ["hf_", "hm_"]
 }
 
-def _append_log(widget: QTextEdit, message: str):
-    """Helper to append timestamped logs to a QTextEdit."""
-    from datetime import datetime
-    time_str = datetime.now().strftime("%H:%M:%S")
-    widget.append(f"[{time_str}] {message}")
-    widget.verticalScrollBar().setValue(widget.verticalScrollBar().maximum())
+from manhwa_app.dashboard_timing import DashboardTiming
+from manhwa_app.utils import _append_log, natural_sort_key
 
 # ---------------------------------------------------------------------------
 # Thread para carregamento de modelos em background
@@ -516,6 +512,7 @@ class TtsConfigTab(QWidget):
         self.fx_silence_chk = QCheckBox("Remove Silêncio (> 0.5s)")
         self.fx_reverb_chk = QCheckBox("Reverb Leve (Sala)")
         self.fx_loudnorm_chk = QCheckBox("Loudnorm (-16 LUFS, Padrão Youtube)")
+        self.fx_natural_chk = QCheckBox("Modo Natural (Somente Limiter, preserva identidade)")
         self.phonetic_chk = QCheckBox("Alfabeto Fonético Int. (Tradução para Kokoro TTS)")
         
         self.fx_highpass_chk.setChecked(True)
@@ -523,6 +520,7 @@ class TtsConfigTab(QWidget):
         self.fx_comp_chk.setChecked(True)
         self.fx_silence_chk.setChecked(True)
         self.fx_loudnorm_chk.setChecked(True)
+        self.fx_natural_chk.setChecked(False)
         self.phonetic_chk.setChecked(False)
 
         fxg.addWidget(self.spacy_chk, 0, 0, 1, 2)
@@ -532,7 +530,8 @@ class TtsConfigTab(QWidget):
         fxg.addWidget(self.fx_silence_chk, 2, 1)
         fxg.addWidget(self.fx_reverb_chk, 3, 0)
         fxg.addWidget(self.fx_loudnorm_chk, 3, 1)
-        fxg.addWidget(self.phonetic_chk, 4, 0, 1, 2)
+        fxg.addWidget(self.fx_natural_chk, 4, 0, 1, 2)
+        fxg.addWidget(self.phonetic_chk, 5, 0, 1, 2)
         
         root.addWidget(fx_group)
 
@@ -686,19 +685,10 @@ class TtsConfigTab(QWidget):
             "fx_silence":    self.fx_silence_chk.isChecked(),
             "fx_reverb":     self.fx_reverb_chk.isChecked(),
             "fx_loudnorm":   self.fx_loudnorm_chk.isChecked(),
+            "fx_natural_mode": self.fx_natural_chk.isChecked(),
             "use_phonetic":  self.phonetic_chk.isChecked(),
         }
         
-        # Get Qwen params explicitly (since they belong to AudioTab but are vital for pipeline)
-        main_win = self.window()
-        if hasattr(main_win, "audio_tab"):
-            data["qwen_task"] = main_win.audio_tab.qwen_task_combo.currentText()
-            data["qwen_instruct"] = main_win.audio_tab.qwen_instruct.text().strip()
-            data["qwen_ref_text"] = main_win.audio_tab.qwen_ref_text.text().strip()
-        else:
-            data["qwen_task"] = "CustomVoice"
-            data["qwen_instruct"] = ""
-            data["qwen_ref_text"] = ""
         return data
 
     def load_session(self, data):
@@ -736,6 +726,7 @@ class TtsConfigTab(QWidget):
         if "fx_silence" in data: self.fx_silence_chk.setChecked(data["fx_silence"])
         if "fx_reverb" in data: self.fx_reverb_chk.setChecked(data["fx_reverb"])
         if "fx_loudnorm" in data: self.fx_loudnorm_chk.setChecked(data["fx_loudnorm"])
+        if "fx_natural_mode" in data: self.fx_natural_chk.setChecked(data["fx_natural_mode"])
         # Mapeamento retrocompatível com sessões salvas antes da correção
         if "fx_compressor" not in data and "fx_noise_reduction" in data:
             self.fx_comp_chk.setChecked(data.get("fx_compressor", False))
@@ -768,6 +759,7 @@ class TtsConfigTab(QWidget):
         self.fx_silence_chk.setChecked(True)
         self.fx_reverb_chk.setChecked(False)
         self.fx_loudnorm_chk.setChecked(True)
+        self.fx_natural_chk.setChecked(False)
 
 
 
@@ -878,34 +870,17 @@ class AudioTab(QWidget):
         lv.addWidget(vox_group)
         self._custom_voice_path = None
         
-        # --- Configurações Específicas do Qwen3 ---
-        self.qwen_group = QGroupBox("🧠 Instruções Qwen3")
-        qg = QGridLayout(self.qwen_group)
-        
-        qg.addWidget(QLabel("Módulo:"), 0, 0)
-        self.qwen_task_combo = QComboBox()
-        self.qwen_task_combo.addItems(["CustomVoice", "VoiceDesign", "VoiceClone"])
-        self.qwen_task_combo.setToolTip("CustomVoice=Presets; VoiceDesign=Criar do Zero; VoiceClone=Usar Referência")
-        qg.addWidget(self.qwen_task_combo, 0, 1)
-
-        qg.addWidget(QLabel("Prompt de Interpretação:"), 1, 0)
-        self.qwen_instruct = QLineEdit()
-        self.qwen_instruct.setPlaceholderText("Ex: Fale de forma assustada e ofegante...")
-        qg.addWidget(self.qwen_instruct, 1, 1)
-
-        self.lbl_qwen_ref_text = QLabel("Texto Referência:")
-        qg.addWidget(self.lbl_qwen_ref_text, 2, 0)
-        self.qwen_ref_text = QLineEdit()
-        self.qwen_ref_text.setPlaceholderText("Texto exato do áudio clonado (Para VoiceClone)")
-        qg.addWidget(self.qwen_ref_text, 2, 1)
-
-        self.btn_save_qwen = QPushButton("💾 Salvar Voz Atual (Prompt)")
-        self.btn_save_qwen.clicked.connect(self._save_qwen_voice)
-        qg.addWidget(self.btn_save_qwen, 3, 0, 1, 2)
-
-        lv.addWidget(self.qwen_group)
-        self.qwen_group.setVisible(False)
-        self.qwen_task_combo.currentIndexChanged.connect(self._on_qwen_task_change)
+        # Preview de Voz
+        preview_group = QGroupBox("Teste Rápido de Voz")
+        p_layout = QHBoxLayout(preview_group)
+        self.preview_text = QLineEdit("Um teste rápido para escutar e validar a voz.")
+        self.preview_text.setPlaceholderText("Escreva algo para testar a voz...")
+        self.btn_preview = QPushButton("▶ Testar Voz")
+        self.btn_preview.setFixedWidth(120)
+        self.btn_preview.clicked.connect(self._start_preview)
+        p_layout.addWidget(self.preview_text)
+        p_layout.addWidget(self.btn_preview)
+        lv.addWidget(preview_group)
 
         # --- Preview de Voz ---
         preview_group = QGroupBox("Teste Rápido de Voz")
@@ -1252,148 +1227,31 @@ class AudioTab(QWidget):
                     self.preset_voice_combo.addItem(f"🎤 {label}", voice_id)
 
             # ── Vozes .pt customizadas (pasta local) ──────────────────────────
+        elif engine == "kokoro":
+            # Kokoro nativo (pt_br)
+            self.preset_voice_combo.addItem("💖 af_heart (Padrão)", "af_heart")
+            self.preset_voice_combo.addItem("💎 af_sky", "af_sky")
+            self.preset_voice_combo.addItem("🌟 am_adam", "am_adam")
+            
             base_dir = Path(__file__).parent.parent / "Kokoro-TTS-Local-master" / "voices"
             if base_dir.exists():
                 for path in sorted(base_dir.glob("*.pt"), key=natural_sort_key):
-                    # Filtra vozes customizadas pelos mesmos prefixos das built-in
                     if not prefixes or any(path.stem.startswith(p) for p in prefixes):
                         self.preset_voice_combo.addItem(f"💾 {path.stem} (Custom)", str(path))
-                    
-        elif engine == "qwen":
-            # Vozes Qwen filtradas por idioma
-            lang = self.preset_lang_combo.currentText().lower()
-            qwen_presets = {
-                "zh": ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric"],
-                "en": ["Ryan", "Aiden"],
-                "ja": ["Ono_Anna"],
-                "ko": ["Sohee"]
-            }
-            
-            relevant = qwen_presets.get(lang, [])
-            if not relevant: # Fallback: mostra tudo se o idioma for desconhecido
-                 self.preset_voice_combo.addItem("Vivian (Female, Chinese, Lively)", "Vivian")
-                 self.preset_voice_combo.addItem("Serena (Female, Chinese, Gentle)", "Serena")
-                 self.preset_voice_combo.addItem("Uncle_Fu (Male, Chinese, Mellow)", "Uncle_Fu")
-                 self.preset_voice_combo.addItem("Dylan (Male, Beijing Dialect, Clear)", "Dylan")
-                 self.preset_voice_combo.addItem("Eric (Male, Sichuan Dialect, Bright)", "Eric")
-                 self.preset_voice_combo.addItem("Ryan (Male, English, Dynamic)", "Ryan")
-                 self.preset_voice_combo.addItem("Aiden (Male, English, Clear)", "Aiden")
-                 self.preset_voice_combo.addItem("Ono_Anna (Female, Japanese, Playful)", "Ono_Anna")
-                 self.preset_voice_combo.addItem("Sohee (Female, Korean, Warm)", "Sohee")
-            else:
-                for v in relevant:
-                    # Labels simplificados para o filtro
-                    self.preset_voice_combo.addItem(v, v)
-                    
-            qwen_dir = Path(__file__).parent / "qwen_voices"
-            if qwen_dir.exists():
-                for pt_file in sorted(qwen_dir.glob("*.pt"), key=natural_sort_key):
-                    self.preset_voice_combo.addItem(f"💾 {pt_file.stem} (Voz Salva)", str(pt_file))
-        
-        elif engine == "indextts":
-            # IndexTTS usa .wav como prompt para zero-shot
-            presets_dir = Path("presets")
-            if presets_dir.exists():
-                for wav_file in sorted(presets_dir.glob("*.wav"), key=natural_sort_key):
-                    self.preset_voice_combo.addItem(f"👤 {wav_file.stem} (Clone WAV)", str(wav_file))
-            else:
-                self.preset_voice_combo.addItem("Nenhuma voz (.wav) em presets/", "")
-                    
+
         if old_val:
             idx = self.preset_voice_combo.findData(old_val)
             if idx >= 0:
                 self.preset_voice_combo.setCurrentIndex(idx)
             else:
-                # Caso especial: se era um caminho customizado externo, re-adiciona para não "sumir"
                 if os.path.exists(old_val):
                     name = Path(old_val).name
                     self.preset_voice_combo.addItem(f"👤 {name} (Custom)", old_val)
                     self.preset_voice_combo.setCurrentIndex(self.preset_voice_combo.count() - 1)
 
     def _update_engine_ui(self, engine_mode: str):
-        # Oculta botões inuteis no Qwen
-        self.qwen_group.setVisible(engine_mode == "qwen")
-        self._on_qwen_task_change()
-
-    def _on_qwen_task_change(self):
-        task = self.qwen_task_combo.currentText()
-        is_clone = task == "VoiceClone"
-        self.lbl_qwen_ref_text.setVisible(is_clone)
-        self.qwen_ref_text.setVisible(is_clone)
-
-    def _save_qwen_voice(self):
-        task = self.qwen_task_combo.currentText()
-        if task == "CustomVoice":
-            QMessageBox.information(self, "Aviso", "CustomVoice usa presets nativos. Selecione VoiceDesign ou VoiceClone para salvar uma nova voz.")
-            return
-            
-        name, ok = QInputDialog.getText(self, "Salvar Voz", "Nome da voz (sem espaços curtos, ex: meu_narrador):")
-        if not ok or not name.strip():
-            return
-            
-        import re
-        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', name.strip())
-        save_path = Path(__file__).parent / "qwen_voices" / f"{safe_name}.pt"
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        ref_t = self.qwen_ref_text.text().strip()
-        ref_a = self._custom_voice_path
-        inst = self.qwen_instruct.text().strip()
-        
-        if task == "VoiceClone" and (not ref_a or not ref_t):
-            QMessageBox.warning(self, "Aviso", "Para salvar um VoiceClone, você precisa carregar um arquivo de áudio de referência e digitar o texto exato falado nele.")
-            return
-            
-        QMessageBox.information(self, "Salvando...", "A extração da assinatura vocal começará no fundo. Aguarde a mensagem de sucesso!")
-        
-        class SaveThread(QThread):
-            finished_ok = Signal(bool, str)
-            def __init__(self, s_path, tsk, r_t, r_a, ins):
-                super().__init__()
-                self.s_path = s_path
-                self.tsk = tsk
-                self.r_t = r_t
-                self.r_a = r_a
-                self.ins = ins
-            def run(self):
-                try:
-                    import torch
-                    from manhwa_app.audio_pipeline import _get_qwen_model
-                    if self.tsk == "VoiceClone":
-                        q_model = _get_qwen_model("VoiceClone")
-                        if not q_model:
-                            self.finished_ok.emit(False, "Falha ao carregar Base Model")
-                            return
-                        prompt = q_model.create_voice_clone_prompt(ref_audio=str(self.r_a), ref_text=self.r_t)
-                    else:
-                        design_model = _get_qwen_model("VoiceDesign")
-                        q_model = _get_qwen_model("VoiceClone")
-                        if not design_model or not q_model:
-                            self.finished_ok.emit(False, "Falha ao carregar Modelos Qwen")
-                            return
-                        with torch.inference_mode():
-                            ref_wavs, sr = design_model.generate_voice_design(
-                                text="Esta é a assinatura vocal primária estabelecida.",
-                                language="Auto",
-                                instruct=self.ins or "Uma voz padrão."
-                            )
-                        prompt = q_model.create_voice_clone_prompt(ref_audio=(ref_wavs[0], sr), ref_text="Esta é a assinatura vocal primária estabelecida.")
-                    
-                    torch.save(prompt, str(self.s_path))
-                    self.finished_ok.emit(True, f"Voz salva em: {self.s_path.name}")
-                except Exception as e:
-                    self.finished_ok.emit(False, str(e))
-                    
-        self._qwen_save_thread = SaveThread(save_path, task, ref_t, ref_a, inst)
-        self._qwen_save_thread.setStackSize(16 * 1024 * 1024)
-        def _on_save_done(ok, msg):
-            if ok:
-                QMessageBox.information(self, "Sucesso", msg)
-                self._populate_voices()
-            else:
-                QMessageBox.critical(self, "Erro", msg)
-        self._qwen_save_thread.finished_ok.connect(_on_save_done)
-        self._qwen_save_thread.start()
+        # Qwen removido — mantido apenas placeholder se necessário
+        pass
 
     def _add_files(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Selecionar Textos", "", "Textos (*.txt)")
@@ -1527,16 +1385,96 @@ class AudioTab(QWidget):
                 "fx_deesser": cfg.get("fx_deesser", True),
                 "fx_reverb": cfg.get("fx_reverb", False),
                 "fx_silence": cfg.get("fx_silence", True),
-                "fx_loudnorm": cfg.get("fx_loudnorm", True)
+                "fx_loudnorm": cfg.get("fx_loudnorm", True),
+                "fx_natural_mode": cfg.get("fx_natural_mode", False)
             }
             
             new_configs.append(c_cfg)
         
         from manhwa_app.audio_pipeline import AudioPipeline
-        self._pipeline = AudioPipeline(
-            file_configs=new_configs,
-            project_name=project_override or (self.project_edit.text().strip() or "projeto"),
-            output_root=self.output_root_edit.text().strip() or "output",
+        
+        # Consolida parâmetros básicos para possibilitar uso via Macro sem depender da UI
+        final_configs = []
+        for c in new_configs:
+            # Garante que c_cfg tenha o formato esperado pelo AudioPipeline
+            final_configs.append(c)
+
+        self._pipeline = self.create_macro_pipeline({
+            "file_configs": final_configs,
+            "project_name": project_override or (self.project_edit.text().strip() or "projeto"),
+            "output_root": self.output_root_edit.text().strip() or "output",
+            "tts_engine": cfg.get("tts_engine", "chatterbox"),
+            "model_type": cfg.get("model_type", "turbo"),
+            "whisper_model": cfg.get("whisper_model", "base"),
+            "temperature": cfg.get("temperature", 0.65),
+            "speed": cfg.get("speed", 1.0),
+            "top_p": cfg.get("top_p", 1.0),
+            "repetition_penalty": cfg.get("repetition_penalty", 1.2),
+            # FX defaults da UI
+            "fx_highpass": cfg.get("fx_highpass", False),
+            "fx_compressor": cfg.get("fx_compressor", False),
+            "fx_deesser": cfg.get("fx_deesser", False),
+            "fx_reverb": cfg.get("fx_reverb", False),
+            "fx_silence": cfg.get("fx_silence", False),
+            "fx_loudnorm": cfg.get("fx_loudnorm", False),
+            "fx_natural_mode": cfg.get("fx_natural_mode", False),
+            "use_spacy": cfg.get("use_spacy", False),
+            "use_phonetic": cfg.get("use_phonetic", False),
+        })
+
+        self._worker_thread = QThread(self)
+        self._worker_thread.setStackSize(16 * 1024 * 1024)
+        self._pipeline.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._pipeline.run)
+        
+        # Conexões de feedback local da aba
+        self._pipeline.log_message.connect(self._on_log)
+        self._pipeline.progress.connect(self._on_progress)
+        self._pipeline.paragraph_done.connect(self._on_pdone)
+        self._pipeline.finished.connect(self._on_done)
+        
+        # Sinais passthrough para MainWindow / Dashboard
+        self._pipeline.engine_switch_needed.connect(self.engine_switch_requested.emit)
+        self._pipeline.progress.connect(self.pipeline_progress.emit)
+        self._pipeline.log_message.connect(self.pipeline_log.emit)
+        self._pipeline.finished.connect(self.pipeline_finished.emit)
+        
+        self._worker_thread.start()
+
+    def create_macro_pipeline(self, cfg: dict) -> "AudioPipeline":
+        """
+        Cria uma instância de AudioPipeline configurada via dicionário.
+        Usado pelo MacroCoordinator para execução 'headless'.
+        """
+        from manhwa_app.audio_pipeline import AudioPipeline
+        
+        # [PARIDADE TOTAL] Se houver audio_params (snapshot da UI), elevamos para a raiz do cfg
+        # Isso garante que fx_highpass, fx_deesser etc. sejam passados corretamente.
+        if "audio_params" in cfg and isinstance(cfg["audio_params"], dict):
+            # [REGRA DE OURO] Parâmetros da UI (snapshot) SEMPRE sobrescrevem os defaults do Job
+            for k, v in cfg["audio_params"].items():
+                cfg[k] = v
+
+        # Se vier de um MacroJob individual, pode não ter file_configs mas sim txt_path
+        if "file_configs" not in cfg and "txt_path" in cfg:
+            cfg["file_configs"] = [{
+                "path": cfg["txt_path"],
+                "voice": cfg.get("voice", ""),
+                "lang": cfg.get("lang", "auto"),
+                "engine": cfg.get("tts_engine", "chatterbox"),
+                # Repassa FX individuais para cada arquivo
+                "fx_highpass": cfg.get("fx_highpass", False),
+                "fx_compressor": cfg.get("fx_compressor", False),
+                "fx_deesser": cfg.get("fx_deesser", False),
+                "fx_reverb": cfg.get("fx_reverb", False),
+                "fx_silence": cfg.get("fx_silence", False),
+                "fx_loudnorm": cfg.get("fx_loudnorm", False),
+            }]
+
+        return AudioPipeline(
+            file_configs=cfg.get("file_configs", []),
+            project_name=cfg.get("project_name", "macro_proj"),
+            output_root=cfg.get("output_root", "output"),
             tts_engine=cfg.get("tts_engine", "chatterbox"),
             model_type=cfg.get("model_type", "turbo"),
             whisper_model=cfg.get("whisper_model", "base"),
@@ -1554,31 +1492,18 @@ class AudioTab(QWidget):
             repetition_penalty=cfg.get("repetition_penalty", 1.2),
             norm_loudness=cfg.get("norm_loudness", True),
             ref_vad_trimming=cfg.get("ref_vad_trimming", False),
-            # CORRIGIDO: Nomes de FX agora coincidem com o construtor do AudioPipeline
+            sample_rate=cfg.get("sample_rate", 24000),
             fx_highpass=cfg.get("fx_highpass", False),
             fx_compressor=cfg.get("fx_compressor", False),
             fx_deesser=cfg.get("fx_deesser", False),
             fx_reverb=cfg.get("fx_reverb", False),
             fx_silence=cfg.get("fx_silence", False),
             fx_loudnorm=cfg.get("fx_loudnorm", False),
+            fx_natural_mode=cfg.get("fx_natural_mode", False),
             use_spacy=cfg.get("use_spacy", False),
             use_phonetic=cfg.get("use_phonetic", False),
+            lang=cfg.get("lang", "auto"),
         )
-        self._worker_thread = QThread(self)
-        self._worker_thread.setStackSize(16 * 1024 * 1024)
-        self._pipeline.moveToThread(self._worker_thread)
-        self._worker_thread.started.connect(self._pipeline.run)
-        self._pipeline.log_message.connect(self._on_log)
-        self._pipeline.progress.connect(self._on_progress)
-        self._pipeline.paragraph_done.connect(self._on_pdone)
-        self._pipeline.finished.connect(self._on_done)
-        # Passa o sinal do pipeline (thread) pra cima para a MainWindow (UI)
-        self._pipeline.engine_switch_needed.connect(self.engine_switch_requested.emit)
-        # Sinais passthrough para o Dashboard
-        self._pipeline.progress.connect(self.pipeline_progress.emit)
-        self._pipeline.log_message.connect(self.pipeline_log.emit)
-        self._pipeline.finished.connect(self.pipeline_finished.emit)
-        self._worker_thread.start()
 
     @Slot(str)
     def _on_log(self, msg: str):
@@ -1711,7 +1636,8 @@ class AudioTab(QWidget):
             exaggeration=cfg.get("exaggeration", 0.5),
             cfg_weight=cfg.get("cfg_weight", 0.5),
             seed=cfg.get("seed", 0),
-            use_phonetic=cfg.get("use_phonetic", False)
+            use_phonetic=cfg.get("use_phonetic", False),
+            fx_natural_mode=cfg.get("fx_natural_mode", False)
         )
         self._regen_thread = QThread(self)
         self._regen_pipeline = pipeline
@@ -1794,7 +1720,10 @@ class AudioTab(QWidget):
             "output_root": self.output_root_edit.text().strip(),
             "preset_lang": self.preset_lang_combo.currentText(),
             "preset_voice": self.preset_voice_combo.currentData() or self.preset_voice_combo.currentText(),
-            "save_voice_project": self.save_voice_project_chk.isChecked() if hasattr(self, "save_voice_project_chk") else True
+            "save_voice_project": self.save_voice_project_chk.isChecked() if hasattr(self, "save_voice_project_chk") else True,
+            # Herdado para o pipeline
+            "tts_engine": self.combo_engine.currentData() if hasattr(self, "combo_engine") else "chatterbox",
+            "model_type": self.combo_model_type.currentData() if hasattr(self, "combo_model_type") else "turbo",
         }
 
     def reset_defaults(self):
@@ -3514,274 +3443,717 @@ class DashboardTab(QWidget):
             self.tasks_layout.addWidget(row_w)
             self._task_rows.append((lbl_s, bar, lbl_pct))
 
-        self._update_queue_card(tasks)
-
-    def _update_queue_card(self, tasks):
-        pending = sum(1 for t in tasks if t.status == "pending")
-        running = sum(1 for t in tasks if t.status == "running")
-        done    = sum(1 for t in tasks if t.status in ("done", "error"))
-        self.lbl_queue_status.setText(f"⏳{pending}  ⚡{running}")
-        self.lbl_done.setText(str(done))
-
-    @Slot(int)
-    def on_task_started(self, idx: int):
-        if idx < len(self._task_rows):
-            lbl_s, bar, lbl_pct = self._task_rows[idx]
-            lbl_s.setText("⚡")
-            bar.setValue(0)
-            lbl_pct.setText("0%")
-
-    @Slot(int, int, int)
-    def on_task_progress(self, idx: int, current: int, total: int):
-        if idx < len(self._task_rows):
-            _, bar, lbl_pct = self._task_rows[idx]
-            pct = int(current * 100 / total) if total > 0 else 0
-            bar.setValue(pct)
-            lbl_pct.setText(f"{pct}%")
-
-    @Slot(int, str)
-    def on_task_log(self, idx: int, msg: str):
-        _append_log(self.log_text, msg)
-
-    @Slot(int, bool)
-    def on_task_finished(self, idx: int, success: bool):
-        if idx < len(self._task_rows):
-            lbl_s, bar, lbl_pct = self._task_rows[idx]
-            lbl_s.setText("✅" if success else "❌")
-            bar.setValue(100 if success else bar.value())
-
-    @Slot(str)
-    def on_queue_log(self, msg: str):
-        _append_log(self.log_text, msg)
-
-
 # ---------------------------------------------------------------------------
-# Queue Tab
+# Macro Engine Tab (Rewrite)
 # ---------------------------------------------------------------------------
-class QueueTab(QWidget):
-    """Aba de controle da fila de geração."""
+from manhwa_app.macro_core import MacroJob, MacroCoordinator
 
-    def __init__(self, parent=None):
+class MacroTab(QWidget):
+    """Aba de Macro Geral para automação total do fluxo de trabalho."""
+    
+    macro_log = Signal(str)
+    
+    def __init__(self, main_window, parent=None):
         super().__init__(parent)
-        self._tasks: list = []
-        self._orchestrator = None
-        self._current_txt: str = ""
-        self._alt_img_path: str = ""
+        self.main_window = main_window
+        self.coordinator = MacroCoordinator(main_window, parent=self)
+        self._current_txt = ""
+        self._img_dir = ""
+        self._audio_dir = ""
+        self._job_widgets = {} # job_id -> dict
+        
+        # Dashboard Analytics State
+        self.timing = DashboardTiming(self)
+        self._total_paras_done = 0
+        self._total_retries = 0
+        self._sim_sum = 0.0
+        self._rms_sum = 0.0
+        self._fastest_para = 9999.0
+        self._slowest_para = 0.0
+
         self._setup_ui()
+        self._setup_connections()
 
     def _setup_ui(self):
-        lv = QVBoxLayout(self)
-        lv.setContentsMargins(15, 15, 15, 15)
-        lv.setSpacing(12)
+        main_v = QVBoxLayout(self)
+        main_v.setContentsMargins(15, 15, 15, 15)
+        main_v.setSpacing(15)
 
-        add_group = QGroupBox("➕ Adicionar Tarefa")
-        fl = QGridLayout(add_group)
+        # Barra Superior: Controles e Bulk
+        top_bar = QHBoxLayout()
+        btn_bulk = QPushButton("📂 Importar Pasta de Roteiros (Auto)")
+        btn_bulk.clicked.connect(self._bulk_import)
+        
+        btn_clear = QPushButton("🗑 Limpar Tudo")
+        btn_clear.clicked.connect(self._clear_all)
+        
+        btn_save_q = QPushButton("💾 Salvar Fila")
+        btn_save_q.clicked.connect(self._export_queue)
+        
+        btn_load_q = QPushButton("📂 Carregar Fila")
+        btn_load_q.clicked.connect(self._import_queue)
+        
+        top_bar.addWidget(btn_bulk)
+        top_bar.addStretch()
+        top_bar.addWidget(btn_save_q)
+        top_bar.addWidget(btn_load_q)
+        top_bar.addWidget(btn_clear)
+        main_v.addLayout(top_bar)
+
+        # Splitter central: Adição vs Dashboard
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # --- LADO ESQUERDO: Formulário de Adição (Intacto) ---
+        add_scroll = QScrollArea()
+        add_scroll.setWidgetResizable(True)
+        add_scroll.setMinimumWidth(350)
+        form_w = QWidget()
+        form_v = QVBoxLayout(form_w)
+        
+        group_add = QGroupBox("➕ Nova Tarefa Macro")
+        fl = QFormLayout(group_add)
         fl.setSpacing(10)
+        
+        self.edit_proj = QLineEdit("projeto_batch")
+        fl.addRow("Nome/Pasta:", self.edit_proj)
+        
+        self.combo_workflow = QComboBox()
+        self.combo_workflow.addItem("🔊 Apenas Áudio (TTS)", "audio")
+        self.combo_workflow.addItem("🎬 Áudio + Vídeo (Full)", "audio_video")
+        self.combo_workflow.addItem("🛠️ Apenas Vídeo (Edit Mode)", "video_edit")
+        fl.addRow("Workflow:", self.combo_workflow)
+        
+        self.tts_container = QWidget()
+        self.tts_fl = QFormLayout(self.tts_container)
+        self.tts_fl.setContentsMargins(0, 0, 0, 0)
+        
+        self.btn_pick_txt = QPushButton("📄 Selecionar Script (.txt)")
+        self.btn_pick_txt.clicked.connect(self._pick_txt)
+        self.lbl_txt_val = QLabel("(nenhum)")
+        self.lbl_txt_val.setStyleSheet("color:#666; font-size:11px;")
+        self.tts_fl.addRow("Fonte (Script):", self.btn_pick_txt)
+        self.tts_fl.addRow("", self.lbl_txt_val)
 
-        row = 0
-        fl.addWidget(QLabel("Nome do Projeto:"), row, 0)
-        self.proj_edit = QLineEdit("projeto_fila")
-        fl.addWidget(self.proj_edit, row, 1, 1, 2); row += 1
+        self.combo_engine = QComboBox()
+        self.combo_engine.addItem("Chatterbox", "chatterbox")
+        self.combo_engine.addItem("Kokoro", "kokoro")
+        self.combo_engine.currentTextChanged.connect(self._on_engine_changed)
+        self.tts_fl.addRow("TTS Engine:", self.combo_engine)
+        
+        self.combo_model_type = QComboBox()
+        self.tts_fl.addRow("Modelo/Tipo:", self.combo_model_type)
+        
+        self.combo_voice = QComboBox()
+        self.combo_voice.setEditable(False)
+        self.combo_voice.setPlaceholderText("Selecione a voz...")
+        self.combo_voice.setMinimumHeight(32)
+        
+        self.btn_pick_voice = QPushButton("📁")
+        self.btn_pick_voice.setFixedWidth(30)
+        self.btn_pick_voice.clicked.connect(self._pick_voice)
+        
+        self.btn_refresh_v = QPushButton("🔄")
+        self.btn_refresh_v.setFixedWidth(30)
+        self.btn_refresh_v.clicked.connect(self._refresh_voices)
+        
+        voice_h = QHBoxLayout()
+        voice_h.addWidget(self.combo_voice, 1)
+        voice_h.addWidget(self.btn_refresh_v)
+        voice_h.addWidget(self.btn_pick_voice)
+        self.tts_fl.addRow("Voz / Clone:", voice_h)
+        
+        self.combo_lang = QComboBox()
+        self.combo_lang.addItem("✨ Auto Detectar", "auto")
+        for l in ["pt", "en", "es", "ja", "ko"]: self.combo_lang.addItem(l, l)
+        self.tts_fl.addRow("Idioma:", self.combo_lang)
+        
+        fl.addRow(self.tts_container)
 
-        fl.addWidget(QLabel("Arquivo .txt:"), row, 0)
-        self.btn_txt = QPushButton("📄 Selecionar…")
-        self.btn_txt.clicked.connect(self._pick_txt)
-        fl.addWidget(self.btn_txt, row, 1, 1, 2); row += 1
-        self.lbl_txt = QLabel("(nenhum)")
-        self.lbl_txt.setStyleSheet("color:#888; font-size:10px;")
-        fl.addWidget(self.lbl_txt, row, 0, 1, 3); row += 1
+        self.video_container = QWidget()
+        self.video_fl = QFormLayout(self.video_container)
+        self.video_fl.setContentsMargins(0, 0, 0, 0)
+        
+        self.btn_pick_aud = QPushButton("🎵 Selecionar Pasta de Áudios")
+        self.btn_pick_aud.clicked.connect(self._pick_aud_dir)
+        self.lbl_aud_val = QLabel("(usar padrão do projeto)")
+        self.lbl_aud_val.setStyleSheet("color:#666; font-size:11px;")
+        self.video_fl.addRow("Áudio:", self.btn_pick_aud)
+        self.video_fl.addRow("", self.lbl_aud_val)
 
-        fl.addWidget(QLabel("Modo:"), row, 0)
-        self.mode_combo = QComboBox()
-        for k, v in QueueTask.MODES.items():
-            self.mode_combo.addItem(v, k)
-        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        fl.addWidget(self.mode_combo, row, 1, 1, 2); row += 1
-
-        fl.addWidget(QLabel("Engine Override:"), row, 0)
-        self.q_engine_combo = QComboBox()
-        self.q_engine_combo.addItem("— Usar Atual —", None)
-        for eng in ["chatterbox", "kokoro"]:
-            self.q_engine_combo.addItem(eng, eng)
-        fl.addWidget(self.q_engine_combo, row, 1)
-
-        self.q_model_combo = QComboBox()
-        self.q_model_combo.addItem("— Submodelo Atual —", None)
-        self.q_model_combo.addItem("turbo", "turbo")
-        self.q_model_combo.addItem("fast", "fast")
-        fl.addWidget(self.q_model_combo, row, 2); row += 1
-
-        fl.addWidget(QLabel("Voz (ID ou Caminho):"), row, 0)
-        self.q_voice_edit = QLineEdit()
-        self.q_voice_edit.setPlaceholderText("ex: pf_dora / voice.pt")
-        fl.addWidget(self.q_voice_edit, row, 1)
-        btn_v_browse = QPushButton("📁")
-        btn_v_browse.setFixedWidth(35)
-        btn_v_browse.clicked.connect(self._pick_voice_file)
-        fl.addWidget(btn_v_browse, row, 2); row += 1
-
-        fl.addWidget(QLabel("Idioma:"), row, 0)
-        self.q_lang_combo = QComboBox()
-        self.q_lang_combo.addItem("— Usar Atual —", None)
-        for lg in ["pt", "en", "es", "fr", "ja", "ko", "zh"]:
-            self.q_lang_combo.addItem(lg, lg)
-        fl.addWidget(self.q_lang_combo, row, 1, 1, 2); row += 1
-
-        self.lbl_img = QLabel("Pasta de Imagens:")
-        fl.addWidget(self.lbl_img, row, 0)
-        self.img_row = QWidget()
-        ir = QHBoxLayout(self.img_row)
-        ir.setContentsMargins(0, 0, 0, 0)
-        self.btn_imgs = QPushButton("🖼 Selecionar…")
-        self.btn_imgs.clicked.connect(self._pick_imgs)
-        ir.addWidget(self.btn_imgs)
-        fl.addWidget(self.img_row, row, 1, 1, 2); row += 1
-        self.lbl_imgs = QLabel("(aba Imagens)")
-        self.lbl_imgs.setStyleSheet("color:#888; font-size:10px;")
-        fl.addWidget(self.lbl_imgs, row, 0, 1, 3); row += 1
-
-        btn_add = QPushButton("➕ Adicionar à Fila")
+        self.btn_pick_img = QPushButton("🖼️ Selecionar Pasta de Imagens (Opcional)")
+        self.btn_pick_img.clicked.connect(self._pick_img_dir)
+        self.lbl_img_val = QLabel("(usar padrão do projeto)")
+        self.lbl_img_val.setStyleSheet("color:#666; font-size:11px;")
+        self.video_fl.addRow("Imagens:", self.btn_pick_img)
+        self.video_fl.addRow("", self.lbl_img_val)
+        
+        fl.addRow(self.video_container)
+        
+        self.combo_workflow.currentTextChanged.connect(self._on_workflow_changed)
+        self._on_workflow_changed()
+        self._on_engine_changed()
+        
+        btn_add = QPushButton("➕ Adicionar tarefa à Fila")
         btn_add.setObjectName("primary")
         btn_add.setMinimumHeight(40)
-        btn_add.clicked.connect(self._add_task)
-        fl.addWidget(btn_add, row, 0, 1, 3); row += 1
-        lv.addWidget(add_group)
+        btn_add.clicked.connect(self._add_single_job)
+        fl.addRow(btn_add)
+        
+        form_v.addWidget(group_add)
+        form_v.addStretch()
+        add_scroll.setWidget(form_w)
+        splitter.addWidget(add_scroll)
 
-        lv.addWidget(QLabel("📋 Tarefas Pendentes:"))
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.task_list_container = QWidget()
-        self._list_layout = QVBoxLayout(self.task_list_container)
-        self._list_layout.setContentsMargins(5, 5, 5, 5)
-        self._list_layout.setSpacing(8)
-        self._list_layout.addStretch()
-        self.scroll.setWidget(self.task_list_container)
-        lv.addWidget(self.scroll)
+        # --- LADO DIREITO: DASHBOARD LIVE ---
+        right_panel = QSplitter(Qt.Orientation.Vertical)
+        
+        # A. Timing Header Bar
+        timing_w = QWidget()
+        timing_h = QHBoxLayout(timing_w)
+        timing_h.setContentsMargins(5, 5, 5, 5)
+        # estilo glassmorphism sutil
+        timing_w.setStyleSheet("QWidget { background: rgba(0,0,0,0.2); border-radius: 8px; border: 1px solid rgba(255,255,255,0.05); }")
+        
+        self.lbl_clock_audio = QLabel("🎙️ Audio: --:--:--")
+        self.lbl_clock_audio.setStyleSheet("color: #00bcd4; font-size: 15px; font-weight: bold; padding: 5px;")
+        self.lbl_clock_job = QLabel("📁 Job: --:--:--  ETA: --:--:--")
+        self.lbl_clock_job.setStyleSheet("color: #ffb300; font-size: 15px; font-weight: bold; padding: 5px;")
+        self.lbl_clock_queue = QLabel("📦 Queue: --:--:--  ETA: --:--:--")
+        self.lbl_clock_queue.setStyleSheet("color: #ba68c8; font-size: 15px; font-weight: bold; padding: 5px;")
+        
+        timing_h.addWidget(self.lbl_clock_audio)
+        timing_h.addStretch()
+        timing_h.addWidget(self.lbl_clock_job)
+        timing_h.addStretch()
+        timing_h.addWidget(self.lbl_clock_queue)
+        
+        right_panel.addWidget(timing_w)
+        
+        # B. Fila de Jobs (Tabela)
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels(["#", "Projeto", "Workflow", "Engine", "Status", "🎙️ Áudio", "🎬 Vídeo", "Elapsed", "Ação"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Fixed)
+        self.table.setColumnWidth(5, 120)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Fixed)
+        self.table.setColumnWidth(6, 120)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setStyleSheet("""
+            QTableWidget { background: transparent; border: none; }
+            QTableWidget::item { padding: 5px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+        """)
+        right_panel.addWidget(self.table)
+        
+        # C. Log e Stats Strip (Bottom Splitter)
+        bottom_w = QWidget()
+        bottom_h = QHBoxLayout(bottom_w)
+        bottom_h.setContentsMargins(0, 0, 0, 0)
+        
+        # Live Log
+        log_container = QWidget()
+        log_v = QVBoxLayout(log_container)
+        log_v.setContentsMargins(0, 0, 0, 0)
+        
+        log_tools = QHBoxLayout()
+        self.combo_log_filter = QComboBox()
+        self.combo_log_filter.addItems(["Todas as Mensagens", "Erros Apenas", "Avisos ou Erros"])
+        log_tools.addWidget(self.combo_log_filter)
+        log_tools.addStretch()
+        btn_copy = QPushButton("📑 Copiar Log")
+        btn_copy.clicked.connect(self._copy_log)
+        log_tools.addWidget(btn_copy)
+        
+        self.log_html = QTextEdit()
+        self.log_html.setReadOnly(True)
+        self.log_html.setStyleSheet("font-family: Consolas, monospace; font-size: 11px; background: rgba(0,0,0,0.3); border-radius: 4px;")
+        
+        log_v.addLayout(log_tools)
+        log_v.addWidget(self.log_html)
+        
+        # Stats Strip
+        self.stats_frame = QFrame()
+        self.stats_frame.setFixedWidth(250)
+        self.stats_frame.setStyleSheet("QFrame { background: rgba(255,255,255,0.02); border-radius: 8px; border: 1px solid rgba(255,255,255,0.05); }")
+        stats_v = QVBoxLayout(self.stats_frame)
+        stats_v.addWidget(QLabel("<b>Estatísticas da Sessão</b>"))
+        
+        self.lbl_stats_paras = QLabel("Parágrafos: 0/0")
+        self.lbl_stats_time = QLabel("Média Tempo: 0.0s")
+        self.lbl_stats_extremes = QLabel("Rápido: - | Lento: -")
+        self.lbl_stats_retries = QLabel("Retentativas: 0 (0%)")
+        self.lbl_stats_quality = QLabel("Sim: 0.00 | RMS: 0.0")
+        
+        for lbl in [self.lbl_stats_paras, self.lbl_stats_time, self.lbl_stats_extremes, self.lbl_stats_retries, self.lbl_stats_quality]:
+            lbl.setStyleSheet("color: #ccc; font-size: 12px;")
+            stats_v.addWidget(lbl)
+            
+        stats_v.addStretch()
+        
+        bottom_h.addWidget(log_container, 3)
+        bottom_h.addWidget(self.stats_frame, 1)
+        right_panel.addWidget(bottom_w)
+        
+        # Distribuição de altura no right_panel: 5% header, 65% table, 30% log
+        right_panel.setSizes([50, 400, 200])
+        
+        splitter.addWidget(right_panel)
+        # Mais espaço para o lado direito
+        splitter.setSizes([350, 850])
+        main_v.addWidget(splitter, 1)
 
-        ctrl_group = QWidget()
-        cl = QHBoxLayout(ctrl_group)
-        cl.setContentsMargins(0, 5, 0, 0)
-        self.btn_start = QPushButton("🚀 Iniciar Fila")
+        # Barra de Ação Final
+        self.btn_start = QPushButton("🚀 INICIAR VERIFICAÇÃO E MACRO")
         self.btn_start.setObjectName("primary")
-        self.btn_start.setMinimumHeight(40)
-        self.btn_start.clicked.connect(self._start_queue)
-        self.btn_stop = QPushButton("🛑 Parar")
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self._stop_queue)
-        cl.addWidget(self.btn_start)
-        cl.addWidget(self.btn_stop)
-        lv.addWidget(ctrl_group)
+        self.btn_start.setMinimumHeight(45)
+        self.btn_start.clicked.connect(self._start_macro)
+        
+        self.btn_pause = QPushButton("🛑 Parar Macro")
+        self.btn_pause.clicked.connect(self.coordinator.stop)
+        self.btn_pause.setEnabled(False)
+        
+        action_h = QHBoxLayout()
+        action_h.addWidget(self.btn_start, 3)
+        action_h.addWidget(self.btn_pause, 1)
+        main_v.addLayout(action_h)
+
+    def _setup_connections(self):
+        # Timing
+        self.timing.tick.connect(self._on_tick)
+        
+        # Coordinator (Macro)
+        self.coordinator.queue_log.connect(self._on_queue_log)
+        self.coordinator.job_started.connect(self._on_job_started)
+        self.coordinator.job_progress.connect(self._update_audio_bar)
+        self.coordinator.job_log.connect(self._on_job_log)
+        self.coordinator.job_finished.connect(self._on_job_finished)
+        self.coordinator.queue_complete.connect(self._on_queue_complete)
+        self.coordinator.request_model_switch.connect(self.main_window.trigger_model_preload)
+
+        # Precisamos conectar aos pipelines (Audio/Video) via a instância atual de AudioPipeline
+        # O interceptador principal é injetado no job_started se o pipeline for recriado, 
+        # mas como PySide6 permite conectar sinais de forma flexível, faremos uma proxy 
+        # intercept function em `_start_job_workflow` no macro_core, ou interceptamos via os
+        # eventos emitidos pelo pipeline atual.
+        # Por segurança, vamos varrer pipeline a cada job_started via MainWindow.
+
+    def _hook_pipelines(self):
+        # Hook on current audio pipeline if exists and not hooked
+        if self.coordinator._audio_pipeline and not hasattr(self.coordinator._audio_pipeline, "_dash_hooked"):
+            pipe = self.coordinator._audio_pipeline
+            pipe.paragraph_started.connect(self._on_para_started, Qt.ConnectionType.QueuedConnection)
+            pipe.paragraph_done_stats.connect(self._on_para_done_stats, Qt.ConnectionType.QueuedConnection)
+            pipe.paragraph_retry.connect(self._on_para_retry, Qt.ConnectionType.QueuedConnection)
+            pipe._dash_hooked = True
+            
+        if self.coordinator._video_pipeline and not hasattr(self.coordinator._video_pipeline, "_dash_hooked"):
+            pipe = self.coordinator._video_pipeline
+            pipe.video_scene_done.connect(self._on_video_scene, Qt.ConnectionType.QueuedConnection)
+            pipe.video_complete.connect(self._on_video_complete, Qt.ConnectionType.QueuedConnection)
+            pipe._dash_hooked = True
+
+    # -------------------------------------------------------------------------
+    # PIPELINE HOOKS & TIMING
+    # -------------------------------------------------------------------------
+    @Slot(str, str, str, str, str)
+    def _on_tick(self, para_c, job_c, job_e, queue_c, queue_e):
+        self.lbl_clock_audio.setText(f"🎙️ Audio: {para_c}")
+        self.lbl_clock_job.setText(f"📁 Job: {job_c}  ETA: {job_e}")
+        self.lbl_clock_queue.setText(f"📦 Queue: {queue_c}  ETA: {queue_e}")
+        
+        # Atualiza a coluna de Tempo do job atual na tabela
+        if self.coordinator._is_running and self.coordinator._current_idx >= 0:
+            idx = self.coordinator._current_idx
+            jid = self.coordinator.jobs[idx].id
+            if jid in self._job_widgets:
+                w = self._job_widgets[jid]
+                if "lbl_time" in w:
+                    w["lbl_time"].setText(job_c)
+
+    @Slot(int, int, str)
+    def _on_para_started(self, idx, total, preview):
+        self.timing.on_para_started(idx, total)
+        self.lbl_clock_audio.setText(f"🎙️ Audio: 00:00:00  (Para {idx}/{total})")
+        self._append_dash_log("AUDIO", "INFO", f"Para {idx}/{total} iniciou: \"{preview}\"")
+
+    @Slot(int, int, float, float, float, int)
+    def _on_para_done_stats(self, idx, total, elapsed, sim, rms, attempts):
+        self.timing.on_para_done(idx, total, elapsed)
+        
+        # Atualiza Stats Strip
+        self._total_paras_done += 1
+        self._sim_sum += sim
+        self._rms_sum += rms
+        self._total_retries += (attempts - 1)
+        self._fastest_para = min(self._fastest_para, elapsed) if elapsed > 0 else self._fastest_para
+        self._slowest_para = max(self._slowest_para, elapsed)
+        
+        avg_time = sum(self.timing._para_times) / len(self.timing._para_times) if self.timing._para_times else 0.0
+        avg_sim = self._sim_sum / self._total_paras_done
+        avg_rms = self._rms_sum / self._total_paras_done
+        retry_pct = (self._total_retries / self._total_paras_done) * 100
+        
+        self.lbl_stats_paras.setText(f"Parágrafos: {idx}/{total}")
+        self.lbl_stats_time.setText(f"Média Tempo: {avg_time:.1f}s")
+        self.lbl_stats_extremes.setText(f"Rápido: {self._fastest_para:.1f}s | Lento: {self._slowest_para:.1f}s")
+        self.lbl_stats_retries.setText(f"Retentativas: {self._total_retries} ({retry_pct:.1f}%)")
+        self.lbl_stats_quality.setText(f"Sim: {avg_sim:.2f} | RMS: {avg_rms:.2f}")
+
+    @Slot(int, int, str)
+    def _on_para_retry(self, idx, attempt, reason):
+        self._append_dash_log("AUDIO", "WARN", f"Para {idx} retry {attempt}/3 ({reason})")
+
+    @Slot(int, int)
+    def _on_video_scene(self, current, total):
+        if self.coordinator._is_running and self.coordinator._current_idx >= 0:
+            jid = self.coordinator.jobs[self.coordinator._current_idx].id
+            if jid in self._job_widgets:
+                pb = self._job_widgets[jid]["vid_bar"]
+                pb.setMaximum(total)
+                pb.setValue(current)
+
+    @Slot(str, float, float)
+    def _on_video_complete(self, path, dur, el):
+        self.timing.on_video_complete(dur)
+        self._append_dash_log("VIDEO", "INFO", f"Composição concluída. Dura: {dur:.1f}s, Elapsed: {el:.1f}s")
+
+    @Slot(str, int, int)
+    def _on_job_started(self, jid, jidx, total):
+        self.btn_start.setEnabled(False)
+        self.btn_pause.setEnabled(True)
+        self.timing.on_job_started(jid, jidx, total)
+        self._hook_pipelines() # Prende os novos pipelines recém-criados
+        
+        # Atualiza Status na tabela
+        if jid in self._job_widgets:
+            self._job_widgets[jid]["status_lbl"].setText("🔵 Run")
+            self._job_widgets[jid]["status_lbl"].setStyleSheet("color: #4fc3f7; font-weight: bold;")
+            for col in range(self.table.columnCount()):
+                item = self.table.item(self._job_widgets[jid]["row"], col)
+                if item: item.setBackground(QColor(0, 50, 100, 50)) # Fundo azul leve
+
+    @Slot(str, int, int)
+    def _update_audio_bar(self, jid, current, total):
+        if jid in self._job_widgets:
+            pb = self._job_widgets[jid]["aud_bar"]
+            if total > 0:
+                pb.setMaximum(total)
+                pb.setValue(current)
+            elif total == -1:
+                pb.setMaximum(100)
+                pb.setValue(100)
+
+    @Slot(str, bool, str)
+    def _on_job_finished(self, jid, success, msg):
+        # Apenas pega o snapshot do final
+        elapsed_s = 0.0
+        if self.timing._job_start > 0:
+            import time
+            elapsed_s = time.time() - self.timing._job_start
+            self.timing.on_job_done(elapsed_s)
+            
+        if jid in self._job_widgets:
+            st = "✅ Done" if success else "❌ Error"
+            col = "#81c784" if success else "#e57373"
+            self._job_widgets[jid]["status_lbl"].setText(st)
+            self._job_widgets[jid]["status_lbl"].setStyleSheet(f"color: {col}; font-weight: bold;")
+            if success:
+                self._job_widgets[jid]["aud_bar"].setValue(self._job_widgets[jid]["aud_bar"].maximum())
+            for c in range(self.table.columnCount()):
+                item = self.table.item(self._job_widgets[jid]["row"], c)
+                bg = QColor(0, 100, 0, 30) if success else QColor(100, 0, 0, 30)
+                if item: item.setBackground(bg)
+                
+    @Slot(float)
+    def _on_queue_complete(self, total_s):
+        self.btn_start.setEnabled(True)
+        self.btn_pause.setEnabled(False)
+        self.timing.stop_queue()
+        QMessageBox.information(self, "Macro Finalizado", f"Fila processada com sucesso!\nTempo Gasto: {self.timing._fmt(total_s)}")
+
+    # -------------------------------------------------------------------------
+    # LOGGER COMPONENTE
+    # -------------------------------------------------------------------------
+    def _append_dash_log(self, stage, level, msg):
+        import time
+        ts = time.strftime("%H:%M:%S")
+        
+        # Filtros
+        cfilter = self.combo_log_filter.currentText()
+        if cfilter == "Erros Apenas" and level != "ERROR": return
+        if cfilter == "Avisos ou Erros" and level not in ("ERROR", "WARN"): return
+        
+        color_stage = {"AUDIO": "#00bcd4", "VIDEO": "#ff4081", "MACRO": "#ba68c8"}.get(stage, "#ccc")
+        color_lvl = {"INFO": "#eee", "WARN": "#ffd54f", "ERROR": "#ef5350"}.get(level, "#eee")
+        
+        entry = (
+            f"<span style='color:#888'>[{ts}]</span> "
+            f"<span style='color:{color_stage}; font-weight:bold;'>[{stage}]</span> "
+            f"<span style='color:{color_lvl}'>[{level}]</span> "
+            f"<span style='color:#ccc'>{msg}</span>"
+        )
+        self.log_html.append(entry)
+
+    @Slot(str)
+    def _on_queue_log(self, msg):
+        self._append_dash_log("MACRO", "INFO", msg)
+
+    @Slot(str, str)
+    def _on_job_log(self, jid, msg):
+        if "Erro" in msg or "Falha" in msg or "Error" in msg:
+            self._append_dash_log("AUDIO" if "TTS" in msg else "MACRO", "ERROR", msg)
+        else:
+            self._append_dash_log("AUDIO" if "TTS" in msg else "MACRO", "INFO", msg)
+
+    def _copy_log(self):
+        cb = QApplication.clipboard()
+        cb.setText(self.log_html.toPlainText())
+        
+    # -------------------------------------------------------------------------
+    # RESTO DO FORMULÁRIO (Igual à original, adaptado para tabela)
+    # -------------------------------------------------------------------------
+
+    def _start_macro(self):
+        self.log_html.clear()
+        self.timing.start_queue(len(self.coordinator.jobs))
+        
+        # Reseta tabela UI
+        for jid, w in self._job_widgets.items():
+            w["status_lbl"].setText("⏳ Wait")
+            w["status_lbl"].setStyleSheet("color: #ccc;")
+            w["aud_bar"].setValue(0)
+            w["vid_bar"].setValue(0)
+            w["vid_bar"].setMaximum(100)
+            w["lbl_time"].setText("--:--:--")
+            for c in range(self.table.columnCount()):
+                item = self.table.item(w["row"], c)
+                if item: item.setBackground(QColor(0, 0, 0, 0))
+                
+        self.coordinator.start()
+
+    def _on_engine_changed(self):
+        self.combo_model_type.clear()
+        eng = self.combo_engine.currentData()
+        if eng == "chatterbox":
+            self.combo_model_type.addItem("Turbo (Recomendado)", "turbo")
+            self.combo_model_type.addItem("Multilingual (Sotaque)", "multilingual")
+            self.combo_model_type.addItem("Original (RTX 30+)", "original")
+        else:
+            self.combo_model_type.addItem("Kokoro Fast (24kHz)", "fast")
+            self.combo_model_type.addItem("Kokoro v1.0 (Beta)", "kokoro_v1")
+
+    @Slot()
+    def _on_workflow_changed(self):
+        wf = self.combo_workflow.currentData()
+        self.tts_container.setVisible(wf != "video_edit")
+        self.video_container.setVisible(wf in ("audio_video", "video_edit"))
+        self.btn_pick_aud.setVisible(wf == "video_edit")
+        self.lbl_aud_val.setVisible(wf == "video_edit")
+        
+    def _refresh_voices(self):
+        self.combo_voice.clear()
+        root_voices = Path(__file__).resolve().parent.parent / "voices"
+        cloned_voices = root_voices / "cloned"
+        
+        potential_files = []
+        if root_voices.exists():
+            potential_files.extend(list(root_voices.glob("*.pt")) + list(root_voices.glob("*.wav")))
+        if cloned_voices.exists():
+            potential_files.extend(list(cloned_voices.glob("*.wav")) + list(cloned_voices.glob("*.mp3")))
+            
+        found_paths = set()
+        for f in sorted(potential_files, key=lambda x: x.name.lower()):
+            if str(f) in found_paths: continue
+            found_paths.add(str(f))
+            name = f"👤 {f.name}" if "cloned" in str(f) else f"🔊 {f.name}"
+            self.combo_voice.addItem(name, str(f))
 
     def _pick_txt(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Arquivo de Texto", "", "Text Files (*.txt)")
+        f, _ = QFileDialog.getOpenFileName(self, "Selecionar Script", "", "Scripts (*.txt)")
         if f:
             self._current_txt = f
-            self.lbl_txt.setText(Path(f).name)
-            p_name = Path(f).stem.replace(" ", "_").lower()
-            self.proj_edit.setText(p_name)
+            self.lbl_txt_val.setText(Path(f).name)
+            self.edit_proj.setText(Path(f).stem.replace(" ","_").lower())
 
-    def _pick_imgs(self):
-        f = QFileDialog.getExistingDirectory(self, "Pasta de Imagens")
+    def _pick_aud_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Selecionar Pasta de Áudios")
+        if d:
+            self._audio_dir = d
+            self.lbl_aud_val.setText(Path(d).name)
+            
+    def _pick_voice(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Selecionar Referência", "", "Audio (*.pt *.wav *.mp3)")
         if f:
-            self._alt_img_path = f
-            self.lbl_imgs.setText(Path(f).name)
+            name = f"👤 {Path(f).name} (Externo)"
+            idx = self.combo_voice.findData(f)
+            if idx < 0:
+                self.combo_voice.addItem(name, f)
+                idx = self.combo_voice.count() - 1
+            self.combo_voice.setCurrentIndex(idx)
 
-    def _pick_voice_file(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Arquivo de Voz", "", "Voz (*.pt *.wav *.mp3 *.pth)")
-        if f:
-            self.q_voice_edit.setText(f)
+    def _pick_img_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Selecionar Pasta de Imagens")
+        if d:
+            self._img_dir = d
+            self.lbl_img_val.setText(Path(d).name)
 
-    def _on_mode_changed(self):
-        m = self.mode_combo.currentData()
-        is_alt = (m == "audio+video+alt")
-        self.lbl_img.setVisible(is_alt)
-        self.img_row.setVisible(is_alt)
-        self.lbl_imgs.setVisible(is_alt)
+    def _add_single_job(self):
+        curr_wf = self.combo_workflow.currentData()
+        curr_proj = self.edit_proj.text().strip()
 
-    def _add_task(self):
-        if not self._current_txt:
-            QMessageBox.warning(self, "Erro", "Selecione um arquivo .txt")
-            return
-        mode = self.mode_combo.currentData()
-        voice_val = self.q_voice_edit.text().strip() or None
-        task = QueueTask(
-            project_name=self.proj_edit.text().strip() or "projeto",
-            txt_path=self._current_txt,
-            mode=mode,
-            engine_override=self.q_engine_combo.currentData(),
-            model_type_override=self.q_model_combo.currentData(),
-            voice_override=voice_val,
-            lang_override=self.q_lang_combo.currentData(),
-            img_path=self._alt_img_path if mode == "audio+video+alt" else None
+        if curr_wf == "video_edit":
+            if not curr_proj: return QMessageBox.warning(self, "Erro", "Digite o nome do Projeto.")
+        else:
+            if not self._current_txt: return QMessageBox.warning(self, "Erro", "Selecione script.")
+        
+        # Same setup as before
+        audio_snapshot = {}
+        if hasattr(self.main_window.audio_tab, "get_session"):
+            audio_snapshot = self.main_window.audio_tab.get_session()
+        if hasattr(self.main_window.tts_tab, "get_session"):
+            audio_snapshot.update(self.main_window.tts_tab.get_session())
+            
+        video_snapshot = {}
+        if hasattr(self.main_window.video_tab, "get_session"):
+            video_snapshot = self.main_window.video_tab.get_session()
+
+        import re, time
+        safe_proj = re.sub(r'[^a-zA-Z0-9_\-]', '_', curr_proj or "projeto_macro")
+        job_id = f"job_{int(time.time())}_{len(self.coordinator.jobs)}"
+        curr_voice = self.combo_voice.currentData() or ""
+        
+        job = MacroJob(
+            id=job_id, project_name=safe_proj, workflow=curr_wf,
+            txt_path=self._current_txt, img_dir=self._img_dir,
+            engine=self.combo_engine.currentData(), model_type=self.combo_model_type.currentData(),
+            voice=curr_voice, lang=self.combo_lang.currentData(),
+            output_root=self.main_window.audio_tab.output_root_edit.text() if hasattr(self.main_window.audio_tab, "output_root_edit") else "output",
+            audio_dir=self._audio_dir if curr_wf == "video_edit" else "",
+            temperature=audio_snapshot.get("temperature", 0.8),
+            speed=audio_snapshot.get("speed", 1.0),
+            top_p=audio_snapshot.get("top_p", 1.0),
+            audio_params=audio_snapshot, video_params=video_snapshot
         )
-        self._tasks.append(task)
-        self._refresh_list()
-    def _notify_dashboard(self):
-        w = self.window()
-        if hasattr(w, "dashboard_tab"):
-            w.dashboard_tab.rebuild_task_rows(self._tasks)
+        self.coordinator.add_job(job)
+        self._add_job_row(job)
 
-    def _start_queue(self):
-        if not self._tasks:
-            QMessageBox.warning(self, "Fila Vazia", "Adicione tarefas primeiro.")
-            return
-        if self._orchestrator and self._orchestrator.isRunning():
-            return
+    def _bulk_import(self):
+        root = QFileDialog.getExistingDirectory(self, "Selecionar Pasta Raiz")
+        if not root: return
+        scripts = list(Path(root).rglob("*.txt"))
+        if not scripts: return QMessageBox.information(self, "Vazio", "Nenhum .txt.")
+        
+        # Similar à anterior ...
+        import time
+        audio_snapshot, video_snapshot = {}, {}
+        if hasattr(self.main_window.audio_tab, "get_session"): audio_snapshot = self.main_window.audio_tab.get_session()
+        if hasattr(self.main_window.tts_tab, "get_session"): audio_snapshot.update(self.main_window.tts_tab.get_session())
+        if hasattr(self.main_window.video_tab, "get_session"): video_snapshot = self.main_window.video_tab.get_session()
 
-        w = self.window()
-        self._orchestrator = QueueOrchestrator(self._tasks, w, parent=self)
+        for i, s in enumerate(scripts):
+            job = MacroJob(
+                id=f"job_{int(time.time())}_{i}_{len(self.coordinator.jobs)}", project_name=s.stem.replace(" ","_").lower(),
+                workflow=self.combo_workflow.currentData(), txt_path=str(s), img_dir="",
+                engine=self.combo_engine.currentData(), model_type=self.combo_model_type.currentData(),
+                voice=self.combo_voice.currentData() or "", lang=self.combo_lang.currentData(),
+                output_root=self.main_window.audio_tab.output_root_edit.text() if hasattr(self.main_window.audio_tab, "output_root_edit") else "output",
+                audio_dir="", temperature=audio_snapshot.get("temperature", 0.8),
+                speed=audio_snapshot.get("speed", 1.0), top_p=audio_snapshot.get("top_p", 1.0),
+                audio_params=audio_snapshot, video_params=video_snapshot
+            )
+            self.coordinator.add_job(job)
+            self._add_job_row(job)
 
-        if hasattr(w, "dashboard_tab"):
-            db = w.dashboard_tab
-            db.rebuild_task_rows(self._tasks)
-            self._orchestrator.task_started.connect(db.on_task_started)
-            self._orchestrator.task_progress.connect(db.on_task_progress)
-            self._orchestrator.task_log.connect(db.on_task_log)
-            self._orchestrator.task_finished.connect(db.on_task_finished)
-            self._orchestrator.queue_log.connect(db.on_queue_log)
+    def _add_job_row(self, job):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        
+        self.table.setItem(row, 0, QTableWidgetItem(str(row+1)))
+        self.table.setItem(row, 1, QTableWidgetItem(job.project_name))
+        self.table.setItem(row, 2, QTableWidgetItem(job.mode_label()))
+        self.table.setItem(row, 3, QTableWidgetItem(job.engine_label()))
+        
+        lbl_status = QLabel("⏳ Wait")
+        lbl_status.setStyleSheet("color: #ccc; margin-left: 5px;")
+        self.table.setCellWidget(row, 4, lbl_status)
+        
+        # Audio Bar
+        p_aud = QProgressBar(); p_aud.setValue(0); p_aud.setFixedHeight(12)
+        p_aud.setStyleSheet("QProgressBar { border-radius: 6px; text-align: center; color: transparent; background: rgba(0,188,212,0.1); border: 1px solid rgba(0,188,212,0.3); } QProgressBar::chunk { background: #00bcd4; border-radius: 5px; }")
+        self.table.setCellWidget(row, 5, p_aud)
+        
+        # Video Bar
+        p_vid = QProgressBar(); p_vid.setValue(0); p_vid.setFixedHeight(12)
+        p_vid.setStyleSheet("QProgressBar { border-radius: 6px; text-align: center; color: transparent; background: rgba(255,64,129,0.1); border: 1px solid rgba(255,64,129,0.3); } QProgressBar::chunk { background: #ff4081; border-radius: 5px; }")
+        self.table.setCellWidget(row, 6, p_vid)
+        
+        lbl_time = QLabel("--:--:--")
+        lbl_time.setStyleSheet("color: #888; font-family: monospace; font-size: 11px;")
+        self.table.setCellWidget(row, 7, lbl_time)
+        
+        btn_del = QPushButton("❌")
+        btn_del.setFixedSize(24, 24)
+        btn_del.setStyleSheet("QPushButton { background: rgba(255,100,100,0.1); border: none; } QPushButton:hover { background: rgba(255,100,100,0.3); }")
+        btn_del.clicked.connect(lambda: self._remove_job(job.id))
+        self.table.setCellWidget(row, 8, btn_del)
+        
+        self._job_widgets[job.id] = {
+            "row": row, "status_lbl": lbl_status, "aud_bar": p_aud, "vid_bar": p_vid, "lbl_time": lbl_time
+        }
 
-        # engine auto-switch
-        self._orchestrator.engine_switch_needed.connect(w._handle_audio_tab_engine_switch)
+    def _remove_job(self, jid):
+        if self.coordinator.remove_job(jid):
+            row = self._job_widgets[jid]["row"]
+            self.table.removeRow(row)
+            del self._job_widgets[jid]
+            # Refresh rows
+            for j in self.coordinator.jobs:
+                if j.id in self._job_widgets:
+                    r = self._job_widgets[j.id]["row"]
+                    if r > row:
+                        self._job_widgets[j.id]["row"] = r - 1
+                        self.table.item(r-1, 0).setText(str(r))
 
-        self._orchestrator.task_started.connect(self._on_task_started)
-        self._orchestrator.task_finished.connect(self._on_task_finished)
-        self._orchestrator.all_done.connect(self._on_all_done)
+    def _clear_all(self):
+        if self.coordinator.clear_jobs():
+            self.table.setRowCount(0)
+            self._job_widgets.clear()
+            self.log_html.clear()
 
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        w.dashboard_tab and w.tabs.setCurrentWidget(w.dashboard_tab)
-        self._orchestrator.start()
-
-    def _on_task_started(self, idx: int):
-        if idx < len(self._tasks):
-            self._tasks[idx].status = "running"
-        self._refresh_list()
-
-    def _on_task_finished(self, idx: int, success: bool):
-        if idx < len(self._tasks):
-            self._tasks[idx].status = "done" if success else "error"
-        self._refresh_list()
-
-    def _stop_queue(self):
-        if self._orchestrator:
-            self._orchestrator.cancel()
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-
-    def _on_all_done(self):
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        QMessageBox.information(self, "Fila Concluída", "Todas as tarefas foram processadas!")
-
+    # Serialization (Mesmo que o original)
     def get_session(self) -> dict:
-        return {}   # tasks are transient — not persisted across sessions
+        cs = [{"text": self.combo_voice.itemText(i), "data": self.combo_voice.itemData(i)} for i in range(self.combo_voice.count())]
+        return {"jobs": [j.to_dict() for j in self.coordinator.jobs], "custom_voices": cs}
 
     def load_session(self, data: dict):
-        pass
+        if "custom_voices" in data:
+            self.combo_voice.clear()
+            for v in data["custom_voices"]: self.combo_voice.addItem(v["text"], v["data"])
+        jobs_data = data.get("jobs", [])
+        if not jobs_data: return
+        self._clear_all()
+        for jd in jobs_data:
+            job = MacroJob.from_dict(jd)
+            self.coordinator.add_job(job)
+            self._add_job_row(job)
+
+    def _export_queue(self):
+        f, _ = QFileDialog.getSaveFileName(self, "Exportar Fila", "", "Macro JSON (*.json)")
+        if f:
+            with open(f, "w", encoding="utf-8") as file: json.dump(self.get_session(), file, indent=4, ensure_ascii=False)
+            QMessageBox.information(self, "Sucesso", "Exportada.")
+
+    def _import_queue(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Importar Fila", "", "Macro JSON (*.json)")
+        if f:
+            with open(f, "r", encoding="utf-8") as file: self.load_session(json.load(file))
+            QMessageBox.information(self, "Sucesso", "Importada.")
 
 
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
+    model_loaded = Signal(bool, str)
 
     def __init__(self):
         super().__init__()
@@ -3851,6 +4223,9 @@ class MainWindow(QMainWindow):
         # [AUDIO PIPELINE FIX] Liberar a QThread se estivermos rodando um batch de múltiplos idiomas
         if hasattr(self, "audio_tab") and hasattr(self.audio_tab, "_pipeline") and self.audio_tab._pipeline is not None:
              self.audio_tab._pipeline.confirm_switch_done()
+             
+        # [MACRO FIX] Notifica o MacroCoordinator que o modelo está pronto
+        self.model_loaded.emit(success, info)
 
     @Slot(str, str)
     def _handle_audio_tab_engine_switch(self, engine_str: str, model_type: str):
@@ -3995,7 +4370,7 @@ class MainWindow(QMainWindow):
 
         self.settings_tab  = SettingsTab()
 
-        self.queue_tab     = QueueTab()
+        self.macro_tab     = MacroTab(self)
 
         self.tabs.addTab(self.dashboard_tab, "📊 Dashboard")
 
@@ -4009,7 +4384,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(self.settings_tab, "🔧 Configurações")
 
-        self.tabs.addTab(self.queue_tab,    "⛓️ Fila")
+        self.tabs.addTab(self.macro_tab,    "🚀 Macro")
 
         self.tabs.setStyleSheet("QTabWidget { background: transparent; }")
         layout.addWidget(self.tabs)
@@ -4216,6 +4591,8 @@ class MainWindow(QMainWindow):
                     self.video_tab.load_session(self._session["video_tab"])
                 if "settings_tab" in self._session:
                     self.settings_tab.load_session(self._session["settings_tab"])
+                if "macro_tab" in self._session:
+                    self.macro_tab.load_session(self._session["macro_tab"])
 
     def get_session(self) -> dict:
         return {
@@ -4225,6 +4602,7 @@ class MainWindow(QMainWindow):
             "tts_tab": self.tts_tab.get_session(),
             "video_tab": self.video_tab.get_session(),
             "settings_tab": self.settings_tab.get_session(),
+            "macro_tab": self.macro_tab.get_session(),
         }
 
     def _reset_to_defaults(self):

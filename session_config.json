@@ -2,16 +2,17 @@
   "theme": "🧛 Dracula",
   "bg_overlay_alpha": 80,
   "audio_tab": {
-    "project": "god level esp true",
+    "project": "The Frontier Count esp",
     "output_root": "output",
     "preset_lang": "es",
-    "preset_voice": "Sem clonagem (Voz do Modelo)"
+    "preset_voice": "E:\\backup\\v6\\voices\\cloned\\voz esp principal.mp3",
+    "save_voice_project": true
   },
   "tts_tab": {
     "tts_engine": "chatterbox",
     "model_type": "multilingual",
     "temperature": 0.7,
-    "speed": 1.05,
+    "speed": 1.1,
     "exaggeration": 0.5,
     "cfg_weight": 0.5,
     "seed": 3000,
@@ -24,7 +25,7 @@
     "norm_loudness": true,
     "max_retries": 5,
     "whisper_model": "base",
-    "similarity_threshold": 0.92,
+    "similarity_threshold": 0.85,
     "use_spacy": true,
     "ref_vad_trimming": false,
     "fx_highpass": true,

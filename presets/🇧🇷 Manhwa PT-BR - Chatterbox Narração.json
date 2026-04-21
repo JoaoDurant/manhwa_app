@@ -1,0 +1,55 @@
+{
+    "_comment": "=== MANHWA PT-BR — Chatterbox Multilingual ===",
+    "_notas": [
+        "Modelo: Multilingual (obrigatório — Turbo gera sotaque americano em PT)",
+        "cfg_weight 0.05: praticamente zerado para eliminar herança de sotaque",
+        "  → Se sua referência for gravada em PT-BR nativo, suba para 0.25-0.35",
+        "exaggeration 0.68: PT-BR tem entonação naturalmente expressiva",
+        "  não precisa de muito boost — exaggeration alto soa overdramatizado",
+        "temperature 0.82: necessário para variar prosódia no PT (o modelo tem",
+        "  menos dados de PT que EN, temperatura mais alta compensa isso)",
+        "repetition_penalty 1.05: mínimo necessário, PT já tem prosódia rica",
+        "  valores altos (1.2+) causam monotonia justamente em PT",
+        "top_p 0.94 / top_k 650: janela ampla para cobrir fonemas PT-BR",
+        "  (ão, lh, nh, ch) que são menos frequentes no treinamento multilingual",
+        "FX: sem de-esser (sibilância PT é natural e importante para clareza)",
+        "FX: compressor ratio 2.2 (menor que EN) — PT tem dinâmica maior",
+        "FX: loudnorm -16 LUFS com LRA=14 para preservar drama narrativo",
+        "ALERTA CRÍTICO: referência de voz EM PT-BR é o maior ganho de qualidade",
+        "  Use 10-20s de fala clara, sem música, com a energia de narração"
+    ],
+
+    "tts_engine": "chatterbox",
+    "model_type": "multilingual",
+    "lang": "pt",
+
+    "temperature": 0.82,
+    "exaggeration": 0.68,
+    "cfg_weight": 0.05,
+    "seed": 3000,
+    "speed": 0.97,
+
+    "min_p": 0.03,
+    "top_p": 0.94,
+    "top_k": 650,
+    "repetition_penalty": 1.05,
+    "norm_loudness": true,
+
+    "whisper_model": "base",
+    "similarity_threshold": 0.62,
+    "max_retries": 3,
+
+    "fx_highpass": true,
+    "fx_deesser": false,
+    "fx_compressor": true,
+    "fx_silence": false,
+    "fx_reverb": false,
+    "fx_loudnorm": true,
+
+    "use_spacy": false,
+    "use_phonetic": false,
+    "ref_vad_trimming": false,
+
+    "output_format": "wav",
+    "sample_rate": 24000
+}

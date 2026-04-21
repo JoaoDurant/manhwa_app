@@ -1,0 +1,49 @@
+{
+    "_comment": "=== MANHWA ES — Chatterbox Multilingual ===",
+    "_notas": [
+        "Modelo: Multilingual (obrigatório para ES sem sotaque americano)",
+        "cfg_weight 0.10: quase zerado pois referência provavelmente é EN",
+        "  → Se sua referência for em espanhol nativo, suba para 0.30-0.40",
+        "exaggeration 0.70: espanhol tem ritmo mais marcado, expressividade ajuda",
+        "temperature 0.80: mais variação para cobrir o ritmo natural do ES",
+        "repetition_penalty 1.06: idioma já tem entonação rica, não precisa forçar",
+        "top_k 600: janela um pouco maior para cobrir fonemas menos comuns em ES",
+        "FX: highpass 120Hz (voz espanhola tem mais presença nos médios-graves)",
+        "Compressor ratio 2.5 para preservar dinâmica dramática de manhwa",
+        "ALERTA: referência de voz DEVE ser em espanhol. Com ref EN, cfg_weight=0.0"
+    ],
+
+    "tts_engine": "chatterbox",
+    "model_type": "multilingual",
+    "lang": "es",
+
+    "temperature": 0.80,
+    "exaggeration": 0.70,
+    "cfg_weight": 0.10,
+    "seed": 3000,
+    "speed": 1.0,
+
+    "min_p": 0.04,
+    "top_p": 0.93,
+    "top_k": 600,
+    "repetition_penalty": 1.06,
+    "norm_loudness": true,
+
+    "whisper_model": "base",
+    "similarity_threshold": 0.65,
+    "max_retries": 3,
+
+    "fx_highpass": true,
+    "fx_deesser": false,
+    "fx_compressor": true,
+    "fx_silence": false,
+    "fx_reverb": false,
+    "fx_loudnorm": true,
+
+    "use_spacy": false,
+    "use_phonetic": false,
+    "ref_vad_trimming": false,
+
+    "output_format": "wav",
+    "sample_rate": 24000
+}

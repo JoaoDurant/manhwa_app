@@ -30,7 +30,7 @@ import contextlib
 import concurrent.futures
 from pathlib import Path
 from difflib import SequenceMatcher
-from typing import Any, List, Optional, Tuple, Dict, Generator
+from typing import Any, List, Optional, Tuple, Dict, Generator, Set
 
 # Suppress Numba and HTTP chatty debug logs
 logging.getLogger('numba').setLevel(logging.WARNING)
@@ -78,7 +78,8 @@ try:
     from manhwa_app.text_processor import process_text_fluency, init_spacy
     from manhwa_app.advanced_text_processor import process_text, improve_pronunciation_for_tts
     from manhwa_app.audio_fx import apply_audio_post_processing
-    from manhwa_app.models import get_qwen_model, get_whisper_model, unload_whisper, transcribe_audio
+    from manhwa_app.models import get_whisper_model, unload_whisper, transcribe_audio
+    from manhwa_app.utils import get_safe_path
     _ENGINE_AVAILABLE = True
 except ImportError as _import_err:
     _engine = None  # type: ignore
@@ -155,6 +156,38 @@ def _text_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
 
 
+def _evaluate_audio_quality(wav_path: str) -> float:
+    """
+    Avalia a energia RMS e variação de pitch do áudio.
+    Retorna um score (0.0 a 1.0+) que funciona como proxy
+    de prosódia natural vs robótica (plana).
+    """
+    try:
+        import soundfile as sf
+        import numpy as np
+        audio_arr, sr = sf.read(wav_path, dtype="float32")
+        if audio_arr.ndim > 1:
+            audio_arr = audio_arr[:, 0]
+        if len(audio_arr) == 0: return 0.0
+
+        # Frame de 50ms
+        frame_length = int(sr * 0.05)
+        if len(audio_arr) < frame_length: return 0.0
+
+        frames = np.array_split(audio_arr, len(audio_arr) // frame_length)
+        rms_values = np.array([np.sqrt(np.mean(f**2)) for f in frames])
+        
+        # Filtra puro silêncio (menos de -60dB)
+        rms_values = rms_values[rms_values > 0.001]
+        if len(rms_values) < 2: return 0.0
+
+        # Variação alta = mais dinâmica = melhor prosódia
+        variation = np.std(rms_values) / (np.mean(rms_values) + 1e-6)
+        return float(variation)
+    except Exception:
+        return 0.0
+
+
 
 # ---------------------------------------------------------------------------
 # Remoção de silêncio via utils.py do Chatterbox
@@ -189,9 +222,12 @@ def _remove_silence_from_file(wav_path: str, out_path: str, sample_rate: int) ->
             audio_arr,
             sr,
             silence_threshold_db=-40.0,
-            min_silence_to_fix_ms=500,   # silêncios > 500ms serão encurtados
-            max_allowed_silence_ms=300,  # manter máximo 300ms de pausa
+            # [P6] 250ms (era 500ms) — PT-BR usa pausas de 300–400ms para efeito dramático
+            # Eliminar essas pausas tornava a narração apressada e artificial
+            min_silence_to_fix_ms=250,
+            max_allowed_silence_ms=280,  # Levemente mais justo que 300ms anterior
         )
+
 
         # Passo 3: salvar arquivo final
         if _utils.save_audio_to_file(audio_arr, sr, out_path):
@@ -249,6 +285,12 @@ class AudioPipeline(QObject):
     # [BUG FIX] Sinal para a thread principal sinalizando necessidade de troca de engine
     engine_switch_needed = Signal(str, str) # (engine_str, model_type)
 
+    # Dashboard Signals
+    paragraph_started  = Signal(int, int, str)
+    paragraph_done_stats = Signal(int, int, float, float, float, int)
+    paragraph_retry    = Signal(int, int, str)
+    stage_complete     = Signal(int, float)
+
     def __init__(
         self,
         file_configs: List[dict],       # [{"path":str, "voice":str, "lang":str}]
@@ -277,13 +319,12 @@ class AudioPipeline(QObject):
         fx_silence: bool = False,
         fx_reverb: bool = False,
         fx_loudnorm: bool = False,
+        fx_natural_mode: bool = False,
         use_spacy: bool = False,
         use_phonetic: bool = False,
-        qwen_task: str = "CustomVoice",
-        qwen_instruct: str = "",
-        qwen_ref_text: str = "",
         parent=None,
         sample_rate: int = 24000,
+        lang: str = "pt",
         **kwargs,
     ):
         super().__init__(parent)
@@ -315,11 +356,10 @@ class AudioPipeline(QObject):
         self.fx_silence            = fx_silence
         self.fx_reverb             = fx_reverb
         self.fx_loudnorm           = fx_loudnorm
+        self.fx_natural_mode       = fx_natural_mode
         self.use_spacy             = use_spacy
         self.use_phonetic          = use_phonetic
-        self.qwen_task             = qwen_task
-        self.qwen_instruct         = qwen_instruct
-        self.qwen_ref_text         = qwen_ref_text
+        self.lang                  = lang
         self._cancelled            = False
         
         # [PIPELINE PARALLELISM] - 3-stage worker system (Pre-proc | Synthesis | Post-proc)
@@ -411,11 +451,18 @@ class AudioPipeline(QObject):
             if self.use_spacy:
                 tts_text = process_text_fluency(tts_text, lang=lang)
             
-            adv_cfg = _config_manager.get("production.text_processing", {
-                "normalize_text": True, "clean_symbols": True, "improve_punctuation": True,
-                "add_natural_pauses": True, "convert_numbers": True
-            })
-            verification_text = process_text(tts_text, adv_cfg, lang=kokoro_lang)
+            # [PARIDADE TOTAL] Sincroniza configurações de texto com os flags da instância
+            adv_cfg = {
+                "normalize_text": True, 
+                "clean_symbols": True, 
+                "improve_punctuation": True,
+                "add_natural_pauses": True, 
+                "convert_numbers": True,
+                "use_phonetic": getattr(self, "use_phonetic", False),
+                "use_spacy": getattr(self, "use_spacy", False)
+            }
+            
+            verification_text = process_text(tts_text, adv_cfg, lang=lang) # Usar o lang passado
             
             # _normalize_text_for_tts é uma função local deste módulo (audio_pipeline.py)
             tts_text = _normalize_text_for_tts(verification_text, lang=lang, engine=self.tts_engine)
@@ -425,7 +472,7 @@ class AudioPipeline(QObject):
             logger.error(f"Erro no Stage 1 (Pre-proc): {e}")
             return (paragraph, paragraph, lang)
 
-    def _post_process_task(self, idx, wav_tmp, silence_out, wav_final, p_cfg, paragraph, source_file, sample_rate, fixed_sim=0.0):
+    def _post_process_task(self, idx, wav_tmp, silence_out, wav_final, p_cfg, paragraph, source_file, sample_rate, fixed_sim=0.0, lang="en", para_elapsed=0.0, attempts=1, rms_var=0.0):
         """
         [STAGE 3 - INDUSTRIAL] Pós-processamento e I/O Assíncrono.
         A validação Whisper ocorreu sincronamente no Stage 2 para permitir retentativas.
@@ -446,17 +493,28 @@ class AudioPipeline(QObject):
             f_sl = p_cfg.get("fx_silence", self.fx_silence)
             f_rv = p_cfg.get("fx_reverb", self.fx_reverb)
             f_ln = p_cfg.get("fx_loudnorm", self.fx_loudnorm)
+            f_nt = p_cfg.get("fx_natural_mode", self.fx_natural_mode)
 
-            _any_fx = f_hp or f_de or f_cp or f_sl or f_rv or f_ln
-            if _any_fx:
-                fx_config = {"production": {"audio": {"highpass": f_hp, "deesser": f_de, "compressor": f_cp, "reverb": f_rv, "remove_silence": f_sl, "normalize": f_ln}}}
-                try:
-                    from manhwa_app.audio_fx import apply_audio_post_processing
-                    apply_audio_post_processing(final_path_no_fx, str(wav_final), fx_config)
-                except Exception as fx_err:
-                    logger.warning(f"FX falhou parágrafo {idx}: {fx_err}. Usando áudio sem FX.")
-                    shutil.copy2(final_path_no_fx, str(wav_final))
-            else:
+            _any_fx = f_hp or f_de or f_cp or f_sl or f_rv or f_ln or f_nt
+            fx_config = {
+                "production": {
+                    "audio": {
+                        "natural_mode": f_nt,
+                        "highpass": f_hp, 
+                        "deesser": f_de, 
+                        "compressor": f_cp, 
+                        "reverb": f_rv, 
+                        "remove_silence": f_sl, 
+                        "normalize": f_ln
+                    }
+                }
+            }
+            try:
+                from manhwa_app.audio_fx import apply_audio_post_processing
+                # Sempre aplica — no mínimo os EQs de presença/air rodam
+                apply_audio_post_processing(final_path_no_fx, str(wav_final), fx_config, lang=p_cfg.get("lang", "en"))
+            except Exception as fx_err:
+                logger.warning(f"FX falhou parágrafo {idx}: {fx_err}. Usando áudio sem FX.")
                 shutil.copy2(final_path_no_fx, str(wav_final))
 
             # 4. Notificação e Mapas (Thread-Safe)
@@ -475,6 +533,7 @@ class AudioPipeline(QObject):
             # 5. UI Updates
             self.paragraph_done.emit(idx, str(wav_final), paragraph)
             self.paragraph_ready.emit(idx, str(wav_final), self.paragrafos_map[idx])
+            self.paragraph_done_stats.emit(idx, len(self._all_paragraphs_ref), para_elapsed, best_sim, rms_var, attempts)
             
             # Calcular progresso/ETA
             elapsed = time.time() - self._start_time_ref
@@ -490,10 +549,10 @@ class AudioPipeline(QObject):
             logger.error(f"Erro Crítico no Stage 3 [#{idx}]: {e}", exc_info=True)
             self.log_message.emit(f"  ✗ Erro ao processar áudio [#{idx}]: {str(e)[:150]}")
         finally:
-            # LIMPEZA ATÔMICA
+            # LIMPEZA ATÔMICA: wav_tmp e silence_out são temporários deste stage
+            # best_wav_path é limpo em _run_internal após o loop de tentativas
             _cleanup(wav_tmp)
             _cleanup(silence_out)
-            if best_wav_path: _cleanup(best_wav_path)
             
 
     def run(self):
@@ -526,10 +585,6 @@ class AudioPipeline(QObject):
         wav_files.sort(key=lambda x: x[0])
         check_files = wav_files[-3:]
         
-        if self.tts_engine == "qwen":
-            self.log_message.emit("⚡ Qwen ativo: Bypass da verificação Whisper no Resume para economizar VRAM. Assumindo índice sequecial ativo.")
-            return wav_files[-1][0]
-
         model, _ = get_whisper_model(self.whisper_model)
         if model is None:
             self.log_message.emit("⚠ Whisper não disponível. Assumindo índice de forma passiva.")
@@ -610,6 +665,56 @@ class AudioPipeline(QObject):
                 torch.cuda.empty_cache()
                 gc.collect()
         
+        # [ESTABILIDADE] Auto-detecção de idioma baseada no roteiro se lang for 'auto'
+        from manhwa_app.text_processor import detect_language
+        
+        # Garantir que todos os itens no file_configs tenham o lang correto
+        all_langs = set()
+        for f_cfg in self.file_configs:
+            f_lang = f_cfg.get("lang", self.lang)
+            if f_lang == "auto":
+                try:
+                    with open(f_cfg["path"], "r", encoding="utf-8") as f:
+                        script_text = f.read()
+                    detected = detect_language(script_text)
+                    f_cfg["lang"] = detected
+                    self.log_message.emit(f"✨ Idioma detectado automaticamente: {detected.upper()} (para {os.path.basename(f_cfg['path'])})")
+                    all_langs.add(detected)
+                except Exception as e:
+                    f_cfg["lang"] = self.lang
+                    self.log_message.emit(f"⚠️ Falha na auto-detecção: {e}. Usando fallback: {self.lang}")
+                    all_langs.add(self.lang)
+            else:
+                f_cfg["lang"] = f_lang
+                all_langs.add(f_lang)
+
+        # [PARIDADE TOTAL - AGENTIC FIX] Regra de Ouro para Sotaque:
+        # Se houver Português ou Espanhol e estivermos no motor Chatterbox,
+        # o modelo DEVE ser multilingual. O 'turbo' geraria sotaque de 'robô americano'.
+        if self.tts_engine == "chatterbox" and self.model_type == "turbo":
+            needs_multi = any(l in ["pt", "pt-br", "es"] for l in all_langs)
+            if needs_multi:
+                self.log_message.emit("⚡ [AUTO-FIX] Idioma PT/ES detectado. Trocando modelo 'turbo' -> 'multilingual' para evitar sotaque estranho.")
+                self.model_type = "multilingual"
+                # [CORREÇÃO CRÍTICA] Executar o switch de forma SÍNCRONA diretamente no
+                # engine, sem depender do sinal engine_switch_needed + handshake de UI.
+                # No modo Macro a MainWindow nunca chama confirm_switch_done(), então
+                # o _switch_event ficava bloqueado e o modelo TURBO continuava sendo usado.
+                try:
+                    self.log_message.emit("⚙️ [AUTO-FIX] Carregando Chatterbox Multilingual agora...")
+                    ok = engine.switch_to_engine("multilingual")
+                    if ok:
+                        self.log_message.emit("✅ [AUTO-FIX] Chatterbox Multilingual carregado com sucesso.")
+                    else:
+                        self.log_message.emit("⚠️ [AUTO-FIX] switch_to_engine('multilingual') retornou False. Sotaque pode ser afetado.")
+                except Exception as _sw_err:
+                    self.log_message.emit(f"⚠️ [AUTO-FIX] Erro ao trocar para multilingual: {_sw_err}")
+                # Emite o sinal apenas para atualizar a UI (sem depender de resposta)
+                self.engine_switch_needed.emit("chatterbox", "multilingual")
+                # Garante que o _switch_event não bloqueie o pipeline
+                if hasattr(self, "_switch_event"):
+                    self._switch_event.set()
+        
         self._log_vram("Início do Pipeline")
 
         # Flush agressivo de VRAM antes de começar o pipeline
@@ -652,27 +757,37 @@ class AudioPipeline(QObject):
         self._poster = ThreadPoolExecutor(max_workers=12)
 
         try:
-            out_dir = Path(self.output_root) / self.project_name
+            out_root = get_safe_path(self.output_root)
+            out_dir = get_safe_path(out_root / self.project_name)
             audios_dir = out_dir / "audios"
             audios_dir.mkdir(parents=True, exist_ok=True)
             
             total = len(all_paragraphs)
             use_whisper_verification = (self.similarity_threshold > 0.0)
-            if self.tts_engine == "qwen":
-                use_whisper_verification = False
-            elif use_whisper_verification:
-                self.log_message.emit(f"🔌 Carregando Whisper [{self.whisper_model}] em CUDA para validação...")
+            if use_whisper_verification:
+                # [P3 / RTX 5070 Ti] Whisper em CPU com int8 para evitar contenda de GPU.
+                # Runs VERDADEIRAMENTE em paralelo com Chatterbox (que usa CUDA).
+                # int8 em CPU: ~280ms para clip de 5s — rápido o bastante para validação async.
+                self.log_message.emit(f"🔌 Carregando Whisper [{self.whisper_model}] (CPU/int8) para validação paralela...")
                 from manhwa_app.models import get_whisper_model
-                get_whisper_model(self.whisper_model, device_override=None) # Força CUDA
+                get_whisper_model(self.whisper_model, device_override="cpu", compute_type="int8")
+
 
             if self.tts_engine == "kokoro":
                 if engine.get_active_engine() != "kokoro":
                     self.log_message.emit("Carregando motor Kokoro-TTS...")
                     engine.switch_to_engine("kokoro")
             elif self.tts_engine == "chatterbox":
-                if engine.get_active_engine() != "chatterbox":
-                    self.log_message.emit("Carregando motor Chatterbox...")
-                    engine.switch_to_engine("chatterbox")
+                # [CORREÇÃO CRÍTICA] Usar o model_type (ex: "multilingual", "turbo") como alvo
+                # do switch, não a string genérica "chatterbox". Isso garante que o modelo
+                # correto seja carregado antes de iniciar a geração.
+                target_chatter = self.model_type  # "turbo", "multilingual", "original"
+                active = engine.get_active_engine()
+                loaded_type = getattr(engine, "loaded_model_type", None)
+                needs_reload = (active != "chatterbox") or (loaded_type != target_chatter)
+                if needs_reload:
+                    self.log_message.emit(f"Carregando Chatterbox [{target_chatter}]...")
+                    engine.switch_to_engine(target_chatter)
 
             self.log_message.emit(f"🚀 Iniciando Geração de {total} parágrafo(s)...")
 
@@ -711,14 +826,28 @@ class AudioPipeline(QObject):
                 if self._cancelled or self.thread().isInterruptionRequested():
                     break
 
+                # [CB2] Seed determinística por parágrafo: mesma seed = mesma voz/timbre,
+                # mesmo em retentativas ou re-runs. Elimina drift entre parágrafos.
+                # A seed é derivada do nome do projeto + índice para ser única e repeatvel.
+                paragraph_seed = abs(hash(f"{self.project_name}_{idx}")) % (2**31)
+                
                 wav_final = audios_dir / f"audio_{idx}.wav"
                 wav_tmp   = audios_dir / f"audio_{idx}_tmp.wav"
+
+                self.paragraph_started.emit(idx, total, f"{paragraph[:50]}...")
+                para_start_time = time.time()
                 
-                lang = p_cfg.get("lang", "en")
+                lang = p_cfg.get("lang", self.lang)
                 kokoro_lang = self._get_kokoro_lang(lang)
                 chatter_lang = lang.lower().split("-")[0]
                 voice_path = p_cfg.get("voice")
                 engine_str = p_cfg.get("engine", self.tts_engine)
+                # [CORREÇÃO CRÍTICA] Se engine_str == "chatterbox" (string genérica vinda do
+                # macro), resolvemos para o subtipo real (self.model_type) que foi carregado.
+                # Isso garante que utils.generate_paragraph_audio selecione o modelo correto
+                # (ex: "multilingual") e não o padrão/turbo, evitando sotaque errado.
+                if engine_str == "chatterbox":
+                    engine_str = self.model_type  # "turbo", "multilingual" ou "original"
                 p_temp = p_cfg.get("temperature", self.temperature)
                 
                 try:
@@ -731,102 +860,188 @@ class AudioPipeline(QObject):
                 if i + 1 < len(missing_indices):
                     next_idx = missing_indices[i + 1]
                     p_next, _, cfg_next = all_paragraphs[next_idx - 1]
-                    next_preprocess_future = self._executor.submit(self._preprocess_paragraph_task, p_next, cfg_next.get("lang", "en"))
+                    next_preprocess_future = self._executor.submit(self._preprocess_paragraph_task, p_next, cfg_next.get("lang", self.lang))
 
                 tts_text_input = _normalize_text_for_tts(tts_text_base, lang=lang, engine=engine_str)
 
-                # Geração com Loop de Retentativa (Aceleração CUDA + Whisper Sync + Best Effort)
-                success = False
-                best_sim_so_far = -1.0
-                best_wav_path = audios_dir / f"audio_{idx}_best_effort.wav"
-                current_temp = p_temp
-                
+                # ── GERAÇÃO COM SMART RETRY (Aceleração CUDA + Whisper + Best-of-N) ──────
+                # Estratégia:
+                #   1. Gera tentativa 1. Se similarity >= threshold → aceita (sem retries).
+                #   2. Só tenta novamente se a qualidade estiver abaixo do limiar.
+                #   3. Após máx. retries, escolhe a melhor versão por RMS dinâmica.
+                # Isso evita o overhead de 3x gerações quando a 1ª já é boa.
+                attempts_data = []  # [{path, similarity, rms, attempt}]
+                current_params = {
+                    "temperature": p_temp,
+                    "exaggeration": p_cfg.get("exaggeration", self.exaggeration),
+                    "cfg_weight":   p_cfg.get("cfg_weight",   self.cfg_weight),
+                }
+
                 from manhwa_app.models import transcribe_audio
-                
-                for attempt in range(1, 4): # Max 3 tentativas
-                    if self._cancelled: break
-                    
-                    # Log de tentativa se for retry
+
+                for attempt in range(1, 4):  # máx 3 tentativas
+                    if self._cancelled:
+                        break
+
+                    tmp_attempt_path = audios_dir / f"audio_{idx}_att_{attempt}.wav"
+
+                    # log só quando é retry para não poluir o log
                     if attempt > 1:
-                        self.log_message.emit(f"  ⚠️ [RETRY] #{idx} (Tentativa {attempt}/3) | Temp: {current_temp:.2f}...")
-                    
-                    success = utils.generate_paragraph_audio(
-                        text=tts_text_input, output_path=str(wav_tmp),
-                        engine_name=engine_str, 
-                        audio_prompt_path=voice_path, # Para Chatterbox/Turbo
-                        kokoro_voice=voice_path,     # Para Kokoro
-                        kokoro_lang=kokoro_lang, language=chatter_lang,
-                        temperature=current_temp, sample_rate=self.sample_rate
+                        self.paragraph_retry.emit(idx, attempt, f"T:{current_params['temperature']:.2f}")
+                        self.log_message.emit(
+                            f"  ↩️ [RETRY {attempt}/3] #{idx} | T:{current_params['temperature']:.2f} "
+                            f"E:{current_params['exaggeration']:.2f} C:{current_params['cfg_weight']:.2f}"
+                        )
+
+                    success_gen = utils.generate_paragraph_audio(
+                        text=tts_text_input, output_path=str(tmp_attempt_path),
+                        engine_name=engine_str,
+                        audio_prompt_path=voice_path,
+                        kokoro_voice=voice_path,
+                        kokoro_lang=kokoro_lang,
+                        language=chatter_lang,
+                        temperature=current_params["temperature"],
+                        exaggeration=current_params["exaggeration"],
+                        cfg_weight=current_params["cfg_weight"],
+                        # [CB2] Seed determinística: garante consistência de voz entre parágrafos
+                        seed=paragraph_seed,
+                        min_p=p_cfg.get("min_p", self.min_p),
+                        top_p=p_cfg.get("top_p", self.top_p),
+                        top_k=p_cfg.get("top_k", self.top_k),
+                        repetition_penalty=p_cfg.get("repetition_penalty", self.repetition_penalty),
+                        norm_loudness=p_cfg.get("norm_loudness", self.norm_loudness),
+                        sample_rate=self.sample_rate,
                     )
 
-                    if success:
-                        # Validação Imediata (GPU Whisper é ultra-rápido)
-                        similarity = 1.0
-                        if use_whisper_verification and verification_text:
-                            transcription = transcribe_audio(str(wav_tmp), self.whisper_model, device_override=None)
-                            similarity = _text_similarity(verification_text, transcription)
-                            
-                            msg_val = f"  [VALIDAÇÃO] #{idx} Sim: {similarity:.2f}"
-                            logger.info(msg_val)
-                            print(msg_val)
-                            
-                            # Rastrear a melhor tentativa para o modo de segurança (best effort)
-                            if similarity > best_sim_so_far:
-                                best_sim_so_far = similarity
-                                # Salva esta tentativa caso todas as outras falhem
-                                try:
-                                    if best_wav_path.exists(): best_wav_path.unlink()
-                                    shutil.copy2(str(wav_tmp), str(best_wav_path))
-                                except: pass
 
-                            if similarity < self.similarity_threshold:
-                                if attempt < 3:
-                                    self.log_message.emit(f"  ⚠️ [REGEN] #{idx}: Similaridade baixa ({similarity:.2f} < {self.similarity_threshold}). Regerando...")
-                                    current_temp += 0.05
-                                    _cleanup(wav_tmp)
-                                    continue # Tenta de novo
-                                else:
-                                    # Falhou após 3 tentativas - Modo Best Effort
-                                    self.log_message.emit(f"  ⚖️ [BEST-EFFORT] #{idx}: Nenhuma tentativa atingiu o limite. Usando melhor versão (Sim: {best_sim_so_far:.2f}).")
-                                    shutil.copy2(str(best_wav_path), str(wav_tmp))
-                                    similarity = best_sim_so_far
-                        
-                        # Se chegou aqui, passou na validação ou estamos no modo best effort
-                        best_sim = similarity
-                        _wav_tmp_path = Path(str(wav_tmp))
-                        silence_out = _wav_tmp_path.with_name(_wav_tmp_path.stem.replace("_tmp", "_silence") + _wav_tmp_path.suffix)
-                        
-                        self._poster.submit(
-                            self._post_process_task, 
-                            idx, Path(str(wav_tmp)), silence_out, wav_final, 
-                            p_cfg, paragraph, source_file, self.sample_rate,
-                            best_sim
+                    if not success_gen or not tmp_attempt_path.exists():
+                        _cleanup(tmp_attempt_path)
+                        # Ajuste para próxima tentativa se geração falhou
+                        current_params["temperature"] = min(current_params["temperature"] + 0.10, 1.2)
+                        continue
+
+                    # ── Avaliação da tentativa ──
+                    similarity = 1.0
+                    if use_whisper_verification and verification_text:
+                        transcription = transcribe_audio(str(tmp_attempt_path), self.whisper_model)
+                        similarity = _text_similarity(verification_text, transcription)
+
+                    rms_var = _evaluate_audio_quality(str(tmp_attempt_path))
+
+                    attempts_data.append({
+                        "path": tmp_attempt_path,
+                        "similarity": similarity,
+                        "rms": rms_var,
+                        "attempt": attempt
+                    })
+
+                    self.log_message.emit(
+                        f"  ✓ #{idx} Tentativa {attempt} | Sim: {similarity:.2f} | Dinâmica: {rms_var:.2f}"
+                    )
+
+                    # ── Critério de Parada Imediata ──────────────────────────
+                    # Se a similaridade passou no limiar (texto correto) → NÃO fazer retry
+                    # Isso é o comportamento padrão — só retenta se FALHAR
+                    if similarity >= self.similarity_threshold:
+                        break  # Aceitou na primeira/segunda tentativa
+
+                    # ── Ajuste Dinâmico para o próximo retry ─────────────────
+                    if attempt < 3:
+                        if similarity < 0.85:
+                            # Texto errado: aumenta temperatura para mais variação
+                            current_params["temperature"] = min(current_params["temperature"] + 0.10, 1.2)
+                        else:
+                            # Texto quase certo mas tom pode ser robótico
+                            current_params["exaggeration"] = min(current_params["exaggeration"] + 0.08, 1.0)
+                            current_params["cfg_weight"]   = min(current_params["cfg_weight"]   + 0.08, 1.0)
+                            current_params["temperature"]  = min(current_params["temperature"]  + 0.03, 1.2)
+
+                # ── Seleção da Melhor Versão ─────────────────────────────────
+                if not attempts_data:
+                    self.log_message.emit(f"  ❌ #{idx} Falhou em todas as tentativas. Pulando...")
+                    continue
+
+                # Prioriza quem passou no limiar de similaridade, desempata por RMS
+                passed = [a for a in attempts_data if a["similarity"] >= self.similarity_threshold]
+                if passed:
+                    best_match = max(passed, key=lambda x: x["rms"])
+                    if len(passed) > 1:
+                        self.log_message.emit(
+                            f"  🏆 #{idx}: Melhor de {len(passed)} tentativas válidas (Dinâmica: {best_match['rms']:.2f})."
                         )
-                        break
-                    else:
-                        _cleanup(wav_tmp)
-                
-                # Limpeza final do arquivo de best effort
-                _cleanup(best_wav_path)
-                
-                # --- ANTI-FRAGMENTAÇÃO VRAM (Solução para degradação do Chatterbox) ---
-                # Quando rodamos Transformers generate() 1000+ vezes, a VRAM se fragmenta
-                # porque o alocador do PyTorch não devolve a memória solta ao SO.
-                # Forçamos a limpeza das referências da iteração anterior para manter a velocidade 100%.
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    # Vazio leve: executa rápido e garante blocos grandes livres
-                    torch.cuda.empty_cache()
+                else:
+                    # Nenhuma passou — best effort pelo maior sim
+                    best_match = max(attempts_data, key=lambda x: x["similarity"])
+                    self.log_message.emit(
+                        f"  ⚖️ #{idx}: Best-effort (Sim: {best_match['similarity']:.2f} < {self.similarity_threshold})."
+                    )
+
+                # Copia a vencedora para wav_tmp (que vai para post_process)
+                if wav_tmp.exists():
+                    wav_tmp.unlink()
+                shutil.copy2(str(best_match["path"]), str(wav_tmp))
+                similarity = best_match["similarity"]
+                best_rms = best_match["rms"]
+
+                # Limpa tentativas (exceto a vencedora que foi copiada)
+                for a in attempts_data:
+                    _cleanup(a["path"])
+
+                # ── [BUG FIX CRÍTICO] Submete ao pool de pós-processamento ──
+                # Isso salva o arquivo final como audio_{idx}.wav
+                # ESTE PASSO ESTAVA FALTANDO — causava temp files e macro sem vídeo
+                _wav_tmp_path = Path(str(wav_tmp))
+                silence_out = _wav_tmp_path.with_name(
+                    _wav_tmp_path.stem.replace("_tmp", "_silence") + _wav_tmp_path.suffix
+                )
+                para_elapsed = time.time() - para_start_time
+                self._poster.submit(
+                    self._post_process_task,
+                    idx, Path(str(wav_tmp)), silence_out, wav_final,
+                    p_cfg, paragraph, source_file, self.sample_rate,
+                    similarity, lang, para_elapsed, len(attempts_data), best_rms
+                )
+
+                # ── Atualiza progresso ──
+                self.progress.emit(i + 1, len(missing_indices))
+
+                # ── Anti-fragmentação VRAM ──
+                # [P8] GC apenas a cada 10 parágrafos ou quando VRAM > 85%.
+                # empty_cache() bloqueia o stream CUDA por ~15–40ms — inaceitável a cada pausa.
+                _GC_INTERVAL = 10
+                if (i + 1) % _GC_INTERVAL == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        try:
+                            reserved = torch.cuda.memory_reserved(0)
+                            total_vram = torch.cuda.get_device_properties(0).total_memory
+                            if reserved / total_vram > 0.85:
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            torch.cuda.empty_cache()
+
 
             self.log_message.emit("⌛ Aguardando finalização dos áudios em segundo plano...")
+            if self._poster:
+                self._poster.shutdown(wait=True)
+                self._poster = None
+            
+            # --- LIBERAÇÃO DE VRAM (WHISPER) ---
+            if use_whisper_verification:
+                try:
+                    self.log_message.emit("🧹 Descarregando Whisper para liberar VRAM...")
+                    unload_whisper()
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception as e:
+                    logger.debug(f"Erro ao descarregar whisper: {e}")
             
         except Exception as e:
             logger.error(f"Erro no loop _run_internal: {e}", exc_info=True)
             self.log_message.emit(f"❌ Erro fatal: {e}")
-        finally:
             if self._poster:
-                self._poster.shutdown(wait=True)
+                self._poster.shutdown(wait=False)
                 self._poster = None
 
         with self._state_lock:
@@ -851,11 +1066,11 @@ class AudioPipeline(QObject):
     def _get_missing_indices(self, audios_dir: Path, all_paragraphs: list) -> List[int]:
         """
         Retorna a lista de índices (1-based) que não possuem o arquivo audio_N.wav correspondente.
-        Isto permite o modo 'Smart Fill' (preencher buracos na sequência).
+        Usa EXATO audio_{N}.wav — ignora arquivos temporários (_tmp, _att_N, _best_effort).
         """
         missing = []
         for i in range(1, len(all_paragraphs) + 1):
-            wav_path = audios_dir / f"audio_{i}.wav"
+            wav_path = audios_dir / f"audio_{i}.wav"  # Apenas o final, sem sufixo
             if not wav_path.exists():
                 missing.append(i)
         return missing

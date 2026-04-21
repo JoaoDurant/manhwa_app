@@ -1468,6 +1468,12 @@ def generate_paragraph_audio(
     chatter_c   = kwargs.get("cfg_weight", 0.5)
     chatter_s   = kwargs.get("seed", 0)
     chatter_l   = kwargs.get("language", "a")
+    # [PARIDADE TOTAL] Parâmetros avançados de prosódia — extraídos para não serem descartados
+    chatter_min_p  = kwargs.get("min_p", 0.05)
+    chatter_top_p  = kwargs.get("top_p", 1.0)
+    chatter_top_k  = kwargs.get("top_k", 1000)
+    chatter_rep    = kwargs.get("repetition_penalty", 1.2)
+    chatter_norm   = kwargs.get("norm_loudness", True)
 
     audio_array = None
     target_sample_rate = kwargs.get("sample_rate", 24000)
@@ -1490,12 +1496,6 @@ def generate_paragraph_audio(
             audio_array = normalize_audio_output(raw_output)
             sample_rate = 24000 # Kokoro KPipeline default sr
 
-# =========================================================
-        # INDEXTTS
-        # =========================================================
-# =========================================================
-        # CHATTERBOX / TURBO
-        # =========================================================
         # =========================================================
         # CHATTERBOX / TURBO
         # =========================================================
@@ -1508,7 +1508,9 @@ def generate_paragraph_audio(
             raw_output = synthesize(
                 text=text, audio_prompt_path=audio_prompt_path,
                 temperature=chatter_t, exaggeration=chatter_e, cfg_weight=chatter_c,
-                seed=chatter_s, language=chatter_l
+                seed=chatter_s, language=chatter_l,
+                min_p=chatter_min_p, top_p=chatter_top_p, top_k=chatter_top_k,
+                repetition_penalty=chatter_rep, norm_loudness=chatter_norm,
             )
             logger.debug(f"[DISPATCHER] Retorno bruto Chatterbox: {type(raw_output)}")
             audio_array = normalize_audio_output(raw_output)

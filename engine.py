@@ -20,12 +20,22 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple, Any, Dict
 
-# [HARDWARE EXTRACTOR] - Extrair potência máxima da RTX 5070 Ti e CPU 14th Gen
+# [HARDWARE EXTRACTOR] - Blackwell RTX 5070 Ti & i7-14700K (28 threads)
+import os as _os
+_os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.7")
+
+# Threads — libera núcleos para driver CUDA
+torch.set_num_threads(12)
+torch.set_num_interop_threads(4)
+
+# Tensor Cores Blackwell sm_120
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.benchmark      = True
+torch.backends.cudnn.deterministic  = False
+
 torch._dynamo.config.suppress_errors = True
-torch._dynamo.config.cache_size_limit = 128  # Para max-autotune caching agressivo
-try:
-    torch.set_num_threads(8)
-except: pass
+torch._dynamo.config.cache_size_limit = 128
 
 logger = logging.getLogger(__name__)
 

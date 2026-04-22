@@ -132,6 +132,186 @@ class ModelLoaderThread(QThread):
         except Exception as e:
             logger.error(f"Erro no ModelLoaderThread: {e}", exc_info=True)
             self.finished_loading.emit(False, str(e))
+                
+# ---------------------------------------------------------------------------
+
+# Sistema de Fila (Coordenador)
+# ---------------------------------------------------------------------------
+
+class QueueCoordinator(QObject):
+    """Coordenador de fila event-driven. Usa o pipeline da aba Audio."""
+    task_started  = Signal(int)
+    task_progress = Signal(int, int, int)
+    task_log      = Signal(int, str)
+    task_finished = Signal(int, bool)
+    queue_log     = Signal(str)
+    all_done      = Signal()
+
+    def __init__(self, tasks: list, main_window, parent=None):
+        super().__init__(parent)
+        self.tasks       = list(tasks)
+        self.main_window = main_window
+        self._idx        = 0
+        self._cancelled  = False
+        self._audio_paths: list = []
+
+    def cancel(self):
+        self._cancelled = True
+        at = self.main_window.audio_tab
+        if at._pipeline:
+            at._pipeline.cancel()
+
+    def start(self):
+        if not self.tasks:
+            self.all_done.emit(); return
+        self._idx = 0
+        self._cancelled = False
+        self._connect_audio()
+        self._run_current()
+
+    def _connect_audio(self):
+        at = self.main_window.audio_tab
+        at.pipeline_progress.connect(self._on_progress)
+        at.pipeline_log.connect(self._on_log)
+        at.pipeline_finished.connect(self._on_audio_done)
+        at.audio_generated.connect(self._on_generated)
+
+    def _disconnect_audio(self):
+        at = self.main_window.audio_tab
+        for sig, slot in [
+            (at.pipeline_progress, self._on_progress),
+            (at.pipeline_log,      self._on_log),
+            (at.pipeline_finished, self._on_audio_done),
+            (at.audio_generated,   self._on_generated),
+        ]:
+            try: sig.disconnect(slot)
+            except: pass
+
+    def _run_current(self):
+        if self._cancelled or self._idx >= len(self.tasks):
+            self._finish(); return
+        task = self.tasks[self._idx]
+        task.status = "running"
+        self.task_started.emit(self._idx)
+        
+        at = self.main_window.audio_tab
+        at.output_root_edit.setText(task.output_root)
+        at.project_edit.setText(task.project_name)
+        at._files = [{"path": str(p)} for p in task.input_files]
+        at._refresh_list()
+        
+        # Inicia a geração (aba Audio)
+        at._start_pipeline(at._files, project_override=task.project_name)
+
+    def _on_progress(self, current, total):
+        self.task_progress.emit(self._idx, current, total)
+
+    def _on_log(self, msg):
+        self.task_log.emit(self._idx, msg)
+
+    def _on_audio_done(self, success, msg):
+        if not success:
+            self.queue_log.emit(f"❌ Falha na tarefa {self._idx}: {msg}")
+        self.task_finished.emit(self._idx, success)
+        self._idx += 1
+        self._run_current()
+
+    def _on_generated(self, paths):
+        self._audio_paths.extend(paths)
+
+    def _finish(self):
+        self._disconnect_audio()
+        self.all_done.emit()
+
+QueueOrchestrator = QueueCoordinator
+
+class QComboBox(_QComboBox):
+    def wheelEvent(self, e): e.ignore()
+
+class QSpinBox(_QSpinBox):
+    def wheelEvent(self, e): e.ignore()
+
+class QDoubleSpinBox(_QDoubleSpinBox):
+    def wheelEvent(self, e): e.ignore()
+
+class QSlider(_QSlider):
+    def wheelEvent(self, e): e.ignore()
+
+from manhwa_app.audio_pipeline import split_into_paragraphs
+from manhwa_app.video_pipeline import EFFECTS
+
+from config import config_manager as _config_manager
+from utils import resolve_voice_path
+
+logger = logging.getLogger(__name__)
+
+# Mapeamento de prefixos de voz Kokoro por idioma
+KOKORO_LANG_MAP = {
+    "en": ["af_", "am_", "bf_", "bm_"],
+    "en-us": ["af_", "am_"],
+    "en-gb": ["bf_", "bm_"],
+    "pt": ["pf_", "pm_"],
+    "pt-br": ["pf_", "pm_"],
+    "es": ["ef_", "em_"],
+    "fr": ["ff_"],
+    "ja": ["jf_", "jm_"],
+    "zh": ["zf_", "zm_"],
+    "it": ["if_", "im_"],
+    "hi": ["hf_", "hm_"]
+}
+
+from manhwa_app.dashboard_timing import DashboardTiming
+from manhwa_app.utils import _append_log, natural_sort_key
+
+# ---------------------------------------------------------------------------
+# Thread para carregamento de modelos em background
+# ---------------------------------------------------------------------------
+class ModelLoaderThread(QThread):
+    finished_loading = Signal(bool, str)
+
+    def __init__(self, tts_engine: str, model_type: str, parent=None):
+        super().__init__(parent)
+        self.tts_engine = tts_engine
+        self.model_type = model_type
+
+    def run(self):
+        try:
+            from manhwa_app.audio_pipeline import _engine, _ENGINE_AVAILABLE
+            if not _ENGINE_AVAILABLE or _engine is None:
+                self.finished_loading.emit(False, "Engine não disponível")
+                return
+
+            # Para Chatterbox, o engine real é o subtipo (turbo, multilingual, original)
+            target = self.tts_engine
+            if self.tts_engine == "chatterbox":
+                target = self.model_type
+
+            logger.info(f"ModelLoaderThread: trocando para {target}")
+            
+            if _engine.switch_to_engine(target):
+                name_map = {
+                    "turbo": "Chatterbox Turbo",
+                    "multilingual": "Chatterbox Multilingual",
+                    "original": "Chatterbox Original",
+                    "kokoro": "Kokoro TTS"
+                }
+                display_name = name_map.get(target, target.capitalize())
+                
+                # Detect the actual device used (could be CPU fallback)
+                actual_device = "GPU"
+                try:
+                    if hasattr(_engine, "engine") and _engine.engine and hasattr(_engine.engine, "device"):
+                         if str(_engine.engine.device) == "cpu":
+                             actual_device = "CPU (Fallback)"
+                except: pass
+                
+                self.finished_loading.emit(True, f"{display_name} [{actual_device}]")
+            else:
+                self.finished_loading.emit(False, f"Falha ao carregar {target}")
+                
+        except Exception as e:
+            logger.error(f"Erro no ModelLoaderThread: {e}", exc_info=True)
+            self.finished_loading.emit(False, str(e))
 
 # ---------------------------------------------------------------------------
 # Configurações de sessão (persistência entre execuções)

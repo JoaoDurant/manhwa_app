@@ -119,10 +119,23 @@ def unload_whisper():
             logger.info("Modelo Whisper descarregado.")
 
 
-def transcribe_audio(wav_path: str, whisper_model_name: str = "base", device_override: str = None) -> str:
+def transcribe_audio(
+    wav_path: str, 
+    whisper_model_name: str = "base", 
+    device_override: str = None,
+    language: Optional[str] = None,
+    initial_prompt: Optional[str] = None
+) -> str:
     """
     Transcreve um WAV preexistente utilizando o motor Whisper instanciado.
     Emprega uma amostragem nos primeiros 10s para verificação ultrarrápida (útil para TTS check).
+    
+    Args:
+        wav_path: Caminho para o arquivo de áudio.
+        whisper_model_name: Nome do modelo (base, small, etc).
+        device_override: Forçar dispositivo (cpu, cuda).
+        language: Código do idioma (ex: 'pt', 'es', 'en'). Se None, faz auto-detecção.
+        initial_prompt: Texto de referência para guiar o Whisper (aumenta precisão).
     """
     model, device = get_whisper_model(whisper_model_name, device_override=device_override)
     if model is None:
@@ -134,14 +147,22 @@ def transcribe_audio(wav_path: str, whisper_model_name: str = "base", device_ove
             segments, _ = model.transcribe(
                 wav_path,
                 beam_size=1,
-                language=None,
+                language=language,
+                initial_prompt=initial_prompt,
                 clip_timestamps="0,10",  # Amostragem: primeiros 10s
                 vad_filter=True,
             )
             return " ".join(s.text for s in segments).strip()
         else:
             # openai-whisper fallback
-            result = model.transcribe(wav_path, fp16=(device == "cuda"))
+            # [NOTE] openai-whisper chama 'initial_prompt' de 'prompt' as vezes, 
+            # mas o padrão da API original é 'initial_prompt'.
+            result = model.transcribe(
+                wav_path, 
+                fp16=(device == "cuda"),
+                language=language,
+                initial_prompt=initial_prompt
+            )
             return result.get("text", "").strip()
     except Exception as e:
         logger.error(f"Transcrição Whisper falhou para {wav_path}: {e}", exc_info=True)

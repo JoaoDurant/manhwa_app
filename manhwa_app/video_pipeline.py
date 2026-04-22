@@ -1,16 +1,3 @@
-# manhwa_app/video_pipeline.py
-# Pipeline de composição de vídeo para o Manhwa Video Creator.
-#
-# Constrói clips Ken Burns de pares (áudio, imagem):
-#   • Fundo com blur gaussiano (cover fill, raio=30) via Pillow
-#   • Imagem principal centralizada na área segura
-#   • Efeito Ken Burns adaptativo com easing suave (ease_in_out)
-#   • Coordenadas sub-pixel float (Image.Transform.EXTENT) sem travamentos
-#   • Geração multithread acelerada por NVENC e com motion blur
-#
-# Exporta clips individuais e o arquivo final H.264/AAC 1920×1080 60fps.
-# Roda dentro de uma QThread e emite sinais PySide6.
-
 import concurrent.futures
 import json
 import logging
@@ -21,20 +8,22 @@ import random
 import subprocess
 import time
 import shutil
+import threading
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 from manhwa_app.utils import get_safe_path
 
 try:
-    from PySide6.QtCore import QObject, Signal, QThread
+    from PySide6.QtCore import QObject, Signal
 except ImportError:
     class QObject: pass
     class Signal:
         def __init__(self, *args): pass
         def emit(self, *args): pass
-    class QThread: pass
 
 logger = logging.getLogger(__name__)
+logging.getLogger("PIL").setLevel(logging.WARNING)
+logging.getLogger("PIL.PngImagePlugin").setLevel(logging.WARNING)
 
 # --- CUDA / PyTorch SETUP ---
 try:
@@ -44,692 +33,463 @@ try:
     from PIL import Image, ImageFilter
     _TORCH_AVAILABLE = torch.cuda.is_available()
 except ImportError:
-    # Caso torch ou PIL nao existam
     _TORCH_AVAILABLE = False
 
-try:
-    import soundfile as sf
-except ImportError:
-    sf = None
+# ---------------------------------------------------------------------------
+# CORE RENDER - Top-level, sem closures, sem torch.compile (instável no Win)
+# ---------------------------------------------------------------------------
+def _render_anim_impl(t, base_w, base_h, z, dx, dy):
+    tx = -(dx * 2.0 / base_w)
+    ty = -(dy * 2.0 / base_h)
+    # Grid sample espera [1, 4, H, W] para RGBA
+    theta = torch.tensor([[[1.0/z, 0.0, tx], [0.0, 1.0/z, ty]]],
+                          dtype=torch.float32, device=t.device)
+    grid = F.affine_grid(theta, [1, 4, base_h, base_w], align_corners=False)
+    return F.grid_sample(t, grid, mode='bicubic', padding_mode='border', align_corners=False)
 
-if _TORCH_AVAILABLE:
-    # Máxima utilização de threads intra-op do PyTorch na CPU
-    torch.set_num_threads(os.cpu_count() or 4)
-    torch.set_num_interop_threads(max(2, (os.cpu_count() or 4) // 2))
+_IMAGE_TENSOR_CACHE: dict = {}
+_IMAGE_CACHE_MAX = 32
 
-    # --- OTIMIZAÇÃO CUDA RTX (5070 Ti) ---
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        try:
-            torch.set_float32_matmul_precision('high')
-        except Exception:
-            pass
+_warmup_done = False
+_warmup_lock = threading.Lock()
+
+def _ensure_warmup():
+    """Pré-aquecimento thread-safe dentro do worker."""
+    global _warmup_done
+    if _warmup_done or not _TORCH_AVAILABLE: return
+    with _warmup_lock:
+        if _warmup_done: return
+        if torch.cuda.is_available():
+            try:
+                dummy = torch.zeros(1, 4, 128, 128, device='cuda')
+                _render_anim_impl(dummy, 128, 128, 1.0, 0.0, 0.0)
+                torch.cuda.synchronize()
+            except Exception: pass
+        _warmup_done = True
 
 # ---------------------------------------------------------------------------
-# Constantes
+# Constantes e Helpers
 # ---------------------------------------------------------------------------
 OUTPUT_W  = 1920
 OUTPUT_H  = 1080
-FPS       = 60      # Suavidade máxima
+FPS       = 60
+BATCH_SIZE = 60  # 1s de vídeo por escrita no stdin (reduz syscalls do pipe)
 
-# Total de núcleos lógicos disponíveis
-_CPU_COUNT = os.cpu_count() or 4
-
-# Movimentos disponíveis
-EFFECTS = [
-    "zoom_in", "zoom_out", "pan_up", "pan_down",
-    "pan_left", "pan_right"
-]
-
-
-# ---------------------------------------------------------------------------
-# Helpers FFmpeg e Animação
-# ---------------------------------------------------------------------------
+EFFECTS = ["zoom_in", "zoom_out", "pan_up", "pan_down", "pan_left", "pan_right"]
 
 def _ffmpeg_ok() -> bool:
     try:
-        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=10)
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
         return r.returncode == 0
-    except Exception:
-        return False
+    except: return False
 
 def _get_best_encoder() -> str:
     try:
-        r = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True, timeout=10)
-        encoders = r.stdout
-        if "h264_nvenc" in encoders: return "h264_nvenc"
-        if "h264_amf" in encoders: return "h264_amf"
-        if "h264_qsv" in encoders: return "h264_qsv"
-    except Exception:
-        pass
+        r = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True, timeout=5)
+        if "h264_nvenc" in r.stdout: return "h264_nvenc"
+        if "h264_amf" in r.stdout: return "h264_amf"
+        if "h264_qsv" in r.stdout: return "h264_qsv"
+    except: pass
     return "libx264"
 
 def _audio_duration(path: str) -> float:
-    """Obtém a duração via ffprobe."""
     try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
-            capture_output=True, text=True, timeout=30
-        )
-        for stream in json.loads(r.stdout).get("streams", []):
-            dur = stream.get("duration")
-            if dur:
-                return float(dur)
-    except Exception:
-        pass
-    if sf:
-        try:
-            with sf.SoundFile(path) as f:
-                return float(f.frames / f.samplerate)
-        except Exception:
-            return 0.0
+        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout)
+        for s in data.get("streams", []):
+            if s.get("duration"): return float(s["duration"])
+    except: pass
     return 0.0
 
-def _smoothstep(t: float, better_easing: bool = True) -> float:
-    """
-    Easing Suave (Ease-in-out).
-    Se better_easing for true, usa a curva parabólica polinomial avançada:
-    t*t*t*(t*(6*t - 15) + 10) -> cria movimento mais fluido que ease-in-out tradicional.
-    """
-    t = max(0.0, min(1.0, t))
-    if better_easing:
-        return t * t * t * (t * (6.0 * t - 15.0) + 10.0)
-    # Fallback para o clássico:
+def _smoothstep_tensor(t: torch.Tensor, better: bool = True) -> torch.Tensor:
+    t = t.clamp(0.0, 1.0)
+    if better: return t * t * t * (t * (6.0 * t - 15.0) + 10.0)
     return t * t * (3.0 - 2.0 * t)
 
+_BLUR_KERNEL_CACHE: dict = {}
+
+def _get_blur_kernel(radius: int, channels: int, device_str: str) -> torch.Tensor:
+    """
+    Retorna kernel gaussiano cacheado por (radius, channels, device).
+    Criado uma vez por processo — reutilizado em todas as cenas.
+    """
+    key = (radius, channels, device_str)
+    if key not in _BLUR_KERNEL_CACHE:
+        k_size = radius * 2 + 1
+        sigma  = radius / 2.0
+        x      = torch.arange(k_size, device=device_str).float() - radius
+        k1d    = torch.exp(-x**2 / (2 * sigma**2))
+        k1d    = k1d / k1d.sum()
+        k2d    = (k1d.view(1, 1, k_size, 1) * k1d.view(1, 1, 1, k_size))
+        k2d    = k2d.expand(channels, 1, k_size, k_size).contiguous()
+        _BLUR_KERNEL_CACHE[key] = k2d
+    return _BLUR_KERNEL_CACHE[key]
+
+# ---------------------------------------------------------------------------
+# Worker: Renderização de Cena Individual
+# ---------------------------------------------------------------------------
 def _python_render_clip(
     image_paths: Union[str, Tuple[str, str]],
-    audio_path: Union[str, Tuple[str, str]],
-    effect: str,
-    duration: float,
-    output_mp4: str,
-    fps: int,
-    encoder: str,
-    log_fn: Optional[Callable] = None,
-    transition_mode: str = "fade",
-    transition_time: float = 0.5,
-    scene_idx: int = 0,
-    config: dict = None
-) -> bool:
-    """Renderiza a cena usando Cuda PyTorch nativo com Smoothstep, Sombra Fundida e Panning Relativo!"""
-    if not _TORCH_AVAILABLE:
-        if log_fn: log_fn("PyTorch não disponível, pulando renderização de cena.")
-        return True # Mock success se nao tiver torch
-
+    audio_path:  Union[str, Tuple[str, str]],
+    effect:      str,
+    duration:    float,
+    output_mp4:  str,
+    fps:         int,
+    encoder:     str,
+    log_fn:      Optional[Callable] = None,
+    transition_mode:  str   = "fade",
+    transition_time:  float = 0.5,
+    scene_idx:        int   = 0,
+    config:           dict  = None
+) -> Tuple[bool, float]:
+    _ensure_warmup()
+    t0_render = time.monotonic()
+    
+    if not _TORCH_AVAILABLE: return False, 0.0
+    
     try:
-        import random
-
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         frames = int(duration * fps)
-        if frames <= 0: return False
+        if frames <= 0: return False, 0.0
 
         is_split = isinstance(image_paths, (tuple, list)) and len(image_paths) == 2
+        
+        # --- Helpers de Assets ---
+        def load_asset(path, max_w, max_h):
+            cache_key = (path, max_w, max_h, str(device))
+            global _IMAGE_TENSOR_CACHE
+            if cache_key in _IMAGE_TENSOR_CACHE:
+                return _IMAGE_TENSOR_CACHE[cache_key]
 
-        # Aloca buffer reutilizável de frame em CPU (pinned memory = transferência rápida GPU→CPU)
-        _use_pinned = (device == 'cuda')
+            with Image.open(path) as im:
 
-        # ------ Helper Functions ------
-        # pad_size grande garante que a sombra não seja cortada durante o zoom
-        def create_torch_tensor(img_path, max_w, max_h, pad_size=200, shadow_off=28):
-            with Image.open(img_path) as im: img = im.convert("RGBA")
-            rat = min(max_w / img.width, max_h / img.height)
-            new_w, new_h = int(img.width * rat), int(img.height * rat)
-            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-            
+                img = im.convert("RGBA")
+            orig_w, orig_h = img.width, img.height
+
+            # Pré-resize grosseiro se for gigante
+            MAX_UPLOAD_SIZE = 4096
+            if max(orig_w, orig_h) > MAX_UPLOAD_SIZE * 2:
+                pre_scale = MAX_UPLOAD_SIZE * 2 / max(orig_w, orig_h)
+                pre_w = int(orig_w * pre_scale)
+                pre_h = int(orig_h * pre_scale)
+                img = img.resize((pre_w, pre_h), Image.Resampling.BILINEAR)
+                orig_w, orig_h = pre_w, pre_h
+
+            arr_orig = np.array(img)
+            t_orig   = torch.from_numpy(arr_orig).permute(2,0,1).unsqueeze(0).float().to(device)
+
+            # Resize na GPU
+            rat   = min(max_w / orig_w, max_h / orig_h)
+            new_w = int(orig_w * rat)
+            new_h = int(orig_h * rat)
+            t_img = F.interpolate(
+                t_orig, size=(new_h, new_w),
+                mode='bicubic', align_corners=False, antialias=True
+            ).clamp(0, 255)
+
+            pad_size = 200
+            shadow_off = 28
             base_w = new_w + pad_size * 2
             base_h = new_h + pad_size * 2
-            
-            # Sombra fundida — nunca se separa em qualquer animação
-            shadow = Image.new("RGBA", (base_w, base_h), (0,0,0,0))
-            black = Image.new("RGBA", (new_w, new_h), (0,0,0, 255))  # Sombra máxima
-            shadow.paste(black, (pad_size + shadow_off, pad_size + shadow_off), black)
-            shadow = shadow.filter(ImageFilter.GaussianBlur(28))   # Espalha mais a sombra
-            shadow.paste(img, (pad_size, pad_size), img)
-            
-            arr = np.array(shadow)
-            t = torch.from_numpy(arr).permute(2,0,1).unsqueeze(0).float()
-            if _use_pinned:
-                t = t.pin_memory()
-            return t.to(device), base_w, base_h, new_w, new_h
+
+            canvas = torch.zeros(1, 4, base_h, base_w, device=device)
+            sy = pad_size + shadow_off
+            sx = pad_size + shadow_off
+            canvas[0, 3, sy:sy+new_h, sx:sx+new_w] = 255.0
+
+            k_shadow = _get_blur_kernel(radius=28, channels=4, device_str=str(device))
+            canvas   = F.conv2d(canvas, k_shadow, padding=28, groups=4).clamp(0, 255)
+
+            py = pad_size
+            px = pad_size
+            alpha_img = t_img[:, 3:4, :, :] / 255.0
+            canvas[:, :, py:py+new_h, px:px+new_w].mul_(1.0 - alpha_img).add_(
+                t_img * alpha_img
+            )
+
+            res = (canvas, base_w, base_h)
+            if len(_IMAGE_TENSOR_CACHE) >= _IMAGE_CACHE_MAX:
+                oldest_key = next(iter(_IMAGE_TENSOR_CACHE))
+                del _IMAGE_TENSOR_CACHE[oldest_key]
+            _IMAGE_TENSOR_CACHE[cache_key] = res
+            return res
 
         def paste_to_bg(bg, fg, x0, y0):
-            H_f, W_f = fg.shape[2], fg.shape[3]
-            bg_x0, bg_y0 = max(0, int(x0)), max(0, int(y0))
-            bg_x1, bg_y1 = min(bg.shape[3], int(x0 + W_f)), min(bg.shape[2], int(y0 + H_f))
-            fg_x0, fg_y0 = bg_x0 - int(x0), bg_y0 - int(y0)
-            fg_x1, fg_y1 = fg_x0 + (bg_x1 - bg_x0), fg_y0 + (bg_y1 - bg_y0)
-            
-            if bg_x1 <= bg_x0 or bg_y1 <= bg_y0: return
-            
-            alpha = fg[:, 3:4, fg_y0:fg_y1, fg_x0:fg_x1] / 255.0
-            rgb = fg[:, 0:3, fg_y0:fg_y1, fg_x0:fg_x1]
-            bg_slice = bg[:, :, bg_y0:bg_y1, bg_x0:bg_x1]
-            bg[:, :, bg_y0:bg_y1, bg_x0:bg_x1] = bg_slice * (1.0 - alpha) + rgb * alpha
+            hb, wb = bg.shape[2], bg.shape[3]
+            hf, wf = fg.shape[2], fg.shape[3]
+            x, y = int(x0), int(y0)
+            y1, y2 = max(0, y), min(hb, y + hf)
+            x1, x2 = max(0, x), min(wb, x + wf)
+            if y2 <= y1 or x2 <= x1: return
+            fy1, fx1 = y1 - y, x1 - x
+            fy2, fx2 = fy1 + (y2 - y1), fx1 + (x2 - x1)
+            alpha = fg[:, 3:4, fy1:fy2, fx1:fx2] / 255.0
+            bg[:, :3, y1:y2, x1:x2].mul_(1.0 - alpha).add_(fg[:, :3, fy1:fy2, fx1:fx2] * alpha)
 
-        def render_anim(t, base_w, base_h, z, dx, dy):
-            tx, ty = -(dx * 2.0 / base_w), -(dy * 2.0 / base_h)
-            theta = torch.tensor([[[1.0/z, 0.0, tx], [0.0, 1.0/z, ty]]], dtype=torch.float32, device=device)
-            grid = F.affine_grid(theta, [1, 4, base_h, base_w], align_corners=False)
-            # padding_mode='border' evita cortes negros na sombra durante zoom!
-            return F.grid_sample(t, grid, mode='bicubic', padding_mode='border', align_corners=False)
-
-        # ------ Pipeline ------
+        # --- Carregamento ---
         bg_path = image_paths[0] if is_split else image_paths
         with Image.open(bg_path).convert("RGB") as im:
-            bg_rat = max(1920 / im.width, 1080 / im.height)
-            new_w, new_h = int(im.width * bg_rat), int(im.height * bg_rat)
-            bg_full = im.resize((new_w, new_h), Image.Resampling.LANCZOS)
-            bx, by = (new_w - 1920)//2, (new_h - 1080)//2
-            bg_crop = bg_full.crop((bx, by, bx + 1920, by + 1080))
-            bg_blur = bg_crop.filter(ImageFilter.GaussianBlur(25))
-            bg_t_base = torch.from_numpy(np.array(bg_blur)).permute(2,0,1).unsqueeze(0).float().to(device)
+            orig_w, orig_h = im.width, im.height
+            MAX_UPLOAD_SIZE = 4096
+            if max(orig_w, orig_h) > MAX_UPLOAD_SIZE * 2:
+                pre_scale = MAX_UPLOAD_SIZE * 2 / max(orig_w, orig_h)
+                im = im.resize((int(orig_w * pre_scale), int(orig_h * pre_scale)), Image.Resampling.BILINEAR)
+
+            rat = max(1920/im.width, 1080/im.height)
+            nw, nh = int(im.width*rat), int(im.height*rat)
+            bg_f = im.resize((nw, nh), Image.Resampling.LANCZOS)
+            bx, by = (nw-1920)//2, (nh-1080)//2
+            bg_c = bg_f.crop((bx, by, bx+1920, by+1080))
+            bg_np = np.array(bg_c)
+
+        bg_t_base = torch.from_numpy(bg_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
+        k_bg = _get_blur_kernel(radius=25, channels=3, device_str=str(device))
+        bg_t_base = F.conv2d(bg_t_base, k_bg, padding=25, groups=3).clamp(0, 255)
 
         if is_split:
-            img1_p, img2_p = image_paths
-            fg1_t, w1, h1, core_w1, core_h1 = create_torch_tensor(img1_p, 850, 900)
-            fg2_t, w2, h2, core_w2, core_h2 = create_torch_tensor(img2_p, 850, 900)
+            fg1_t, w1, h1 = load_asset(image_paths[0], 850, 900)
+            fg2_t, w2, h2 = load_asset(image_paths[1], 850, 900)
             cx1, cy1 = (960 - w1)//2, (1080 - h1)//2
             cx2, cy2 = 960 + (960 - w2)//2, (1080 - h2)//2
         else:
-            # Auto-siz: imagens retrato muito altas usam toda a altura disponível
-            with Image.open(image_paths) as _im_probe:
-                _probe_w, _probe_h = _im_probe.size
-            is_portrait = _probe_h > _probe_w * 1.2   # imagem claramente vertical
-            if is_portrait:
-                _max_w, _max_h = 1100, 1020          # ocupa quase toda a altura
-            else:
-                _max_w, _max_h = 1400, 900           # paisagem: mais larga
-            fg_t, w, h, core_w, core_h = create_torch_tensor(image_paths, _max_w, _max_h)
+            with Image.open(image_paths) as p: pw, ph = p.size
+            max_w, max_h = (1100, 1020) if ph > pw*1.2 else (1400, 900)
+            fg_t, w, h = load_asset(image_paths, max_w, max_h)
             cx, cy = (1920 - w)//2, (1080 - h)//2
 
-        # --- FILTROS VISUAIS DINÂMICOS ---
-        cfg_vid = (config or {}).get("production", {}).get("video", {})
-        do_grading = cfg_vid.get("color_grading", True)
-        do_sharpen = cfg_vid.get("sharpen", True)
-        do_grain = cfg_vid.get("film_grain", False)
+        if log_fn:
+            log_fn(f"[GPU] Cena #{scene_idx+1}: BG blur GPU ✓ | Shadow blur GPU ✓ | Resize GPU ✓")
 
-        vf_filters = []
-        if do_grading:
-            # eq=contrast=1.05:brightness=0.02:saturation=1.1 → evita imagem lavada
-            vf_filters.append("eq=contrast=1.05:brightness=0.02:saturation=1.1")
-        if do_sharpen:
-            # unsharp=3:3:0.5:3:3:0 → sharpen leve nos contornos/texto
-            vf_filters.append("unsharp=3:3:0.5:3:3:0")
-        if do_grain:
-            # Grain sutil: alls=15:allf=t
-            vf_filters.append("noise=alls=15:allf=t")
-
-        COLOR_CORRECTION = ",".join(vf_filters) if vf_filters else "null"
-
-        # FFmpeg piped render — threads=0 usa TODOS os núcleos disponíveis
-        # NVENC p4 = excelente custo/benefício: 2-3x mais rápido que p7 com qualidade similar a 1080p60
+        # --- Encoder Config (Blackwell) ---
         if encoder == "h264_nvenc":
-            vcodec = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "22", "-b:v", "0", "-maxrate", "15M"]
-        elif encoder == "h264_amf":
-            vcodec = ["-c:v", "h264_amf", "-quality", "speed", "-qp_i", "20", "-qp_p", "20"]
-        elif encoder == "h264_qsv":
-            vcodec = ["-c:v", "h264_qsv", "-preset", "fast", "-global_quality", "22"]
+            vcodec = ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "20",
+                      "-b:v", "0", "-maxrate", "18M", "-bufsize", "36M", "-multipass", "fullres",
+                      "-spatial-aq", "1", "-temporal-aq", "1", "-rc-lookahead", "20", "-profile:v", "high"]
         else:
-            vcodec = ["-c:v", "libx264", "-preset", "faster", "-crf", "20", "-threads", "0"]
-        cmd = ["ffmpeg", "-y", "-threads", "0",
-               "-f", "rawvideo", "-vcodec", "rawvideo", "-s", "1920x1080",
-               "-pix_fmt", "rgb24", "-r", str(fps), "-i", "-"]
-        if isinstance(audio_path, (tuple, list)):
+            vcodec = ["-c:v", "libx264", "-preset", "faster", "-crf", "20"]
+
+        cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", "1920x1080", "-pix_fmt", "rgb24", "-r", str(fps), "-i", "-"]
+        if is_split:
             cmd.extend(["-i", audio_path[0], "-i", audio_path[1], "-filter_complex", "[1:a][2:a]concat=n=2:v=0:a=1[a_out]", "-map", "0:v", "-map", "[a_out]"])
         else:
             cmd.extend(["-i", audio_path, "-map", "0:v", "-map", "1:a"])
-        # Aplica filtros visuais no encode final
-        if COLOR_CORRECTION != "null":
-            cmd.extend(["-vf", COLOR_CORRECTION])
-        cmd.extend([*vcodec, "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-shortest", output_mp4])
         
-        create_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=create_flags)
+        # Filtros Visuais
+        cfg_v = (config or {}).get("production", {}).get("video", {})
+        vf = []
+        if cfg_v.get("color_grading", True): vf.append("eq=contrast=1.05:brightness=0.02:saturation=1.1")
+        if cfg_v.get("sharpen", True): vf.append("unsharp=3:3:0.5:3:3:0")
+        if cfg_v.get("film_grain", False): vf.append("noise=alls=15:allf=t")
+        if vf: cmd.extend(["-vf", ",".join(vf)])
+        
+        cmd.extend([*vcodec, "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-shortest", output_mp4])
 
-        # Buffer pre-alocado reutilizavel (evita alloc+copy por frame)
-        frame_buf = torch.empty(1, 3, 1080, 1920, dtype=torch.uint8, device='cpu')
+        # --- Loop de Renderização com Batch Writing ---
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+        
+        t_all = torch.linspace(0, 1, frames, device=device)
+        e_all = _smoothstep_tensor(t_all, better=cfg_v.get("better_easing", True))
+        fade_all = torch.ones(frames, device=device)
+        f_len = int(transition_time * fps)
+        if f_len > frames//2: f_len = frames//2
+        if f_len > 0 and transition_mode != "none":
+            if scene_idx > 0: fade_all[:f_len] = torch.linspace(0, 1, f_len, device=device)
+            fade_all[-f_len:] = torch.linspace(1, 0, f_len, device=device)
 
-        # CORRIGIDO: anim_val determinado UMA VEZ antes do loop de frames
-        # random.choice dentro do loop causava mudança de animação a cada frame
-        anim_val_once = random.choice(EFFECTS) if (not is_split and effect == "auto") else effect
+        if not is_split:
+            z_s, z_e, dx_s, dx_e, dy_s, dy_e = 1.0, 1.0, 0.0, 0.0, 0.0, 0.0
+            dist = h * 0.08
+            if effect == "zoom_in": z_e = 1.10
+            elif effect == "zoom_out": z_s = 1.10
+            elif effect == "pan_up": dy_s, dy_e, z_s, z_e = dist, -dist, 1.08, 1.08
+            elif effect == "pan_down": dy_s, dy_e, z_s, z_e = -dist, dist, 1.08, 1.08
+            elif effect == "pan_left": dx_s, dx_e, z_s, z_e = dist, -dist, 1.08, 1.08
+            elif effect == "pan_right": dx_s, dx_e, -dist, dist, 1.08, 1.08
+            z_vals, dx_vals, dy_vals = z_s + (z_e-z_s)*e_all, dx_s + (dx_e-dx_s)*e_all, dy_s + (dy_e-dy_s)*e_all
+        else:
+            z1_vals = 1.0 + 0.1*e_all
+            dy2_vals = (h2*0.08) * (1 - 2*e_all)
 
-        # CORRIGIDO: do_better_easing calculado UMA VEZ por cena (era dict lookup por frame)
-        do_better_easing = (config or {}).get("production", {}).get("video", {}).get("better_easing", True)
+        frame_buf = torch.empty_like(bg_t_base)
 
-        # CORRIGIDO: FADE_FRAMES é constante por cena — calculado UMA VEZ antes do loop
-        FADE_FRAMES = int(transition_time * fps)
-        if frames > 0 and FADE_FRAMES > frames // 2:
-            FADE_FRAMES = frames // 2
+        batch_frames_list = []
+        for i in range(frames):
+            frame_buf.copy_(bg_t_base)
+            f_bg = frame_buf
+            
+            if is_split:
+                a1 = _render_anim_impl(fg1_t, w1, h1, z1_vals[i].item(), 0, 0)
+                paste_to_bg(f_bg, a1, cx1, cy1)
+                a2 = _render_anim_impl(fg2_t, w2, h2, 1.0, 0, dy2_vals[i].item())
+                paste_to_bg(f_bg, a2, cx2, cy2)
+            else:
+                a = _render_anim_impl(fg_t, w, h, z_vals[i].item(), dx_vals[i].item(), dy_vals[i].item())
+                paste_to_bg(f_bg, a, cx, cy)
+            
+            f_val = fade_all[i].item()
+            if transition_mode == "blur" and f_val < 1.0:
+                r = int((1-f_val)*15 + 0.5)
+                if r > 0: f_bg = F.conv2d(f_bg.clamp(0, 255), _get_blur_kernel(r, 3, str(device)), padding=r, groups=3)
+                f_rgb = f_bg.clamp(0, 255)
+            else:
+                f_rgb = f_bg.clamp(0, 255) * f_val
+            
+            batch_frames_list.append(f_rgb.squeeze(0).permute(1, 2, 0).to(torch.uint8))
+            
+            if len(batch_frames_list) == BATCH_SIZE or i == frames - 1:
+                batch_cpu = torch.stack(batch_frames_list).cpu()
+                proc.stdin.write(batch_cpu.numpy().tobytes())
+                batch_frames_list.clear()
 
-        try:
-            for i in range(frames):
-                t_linear = i / max(1, frames - 1)
-                e = _smoothstep(t_linear, better_easing=do_better_easing)
-
-                frame_bg = bg_t_base.clone()
-
-                if is_split:
-                    # Esquerda (Zoom In)
-                    z1 = 1.0 + (1.10 - 1.0) * e
-                    anim1 = render_anim(fg1_t, w1, h1, z1, 0, 0)
-                    paste_to_bg(frame_bg, anim1, cx1, cy1)
-                    
-                    # Direita (Movimento Vertical: Baixo pra Cima proporcinal à img)
-                    pan_dist2 = h2 * 0.08
-                    dy2 = pan_dist2 - (pan_dist2 * 2.0) * e # Vai de +X até -X
-                    anim2 = render_anim(fg2_t, w2, h2, 1.0, 0, dy2)
-                    paste_to_bg(frame_bg, anim2, cx2, cy2)
-                else:
-                    # CORRIGIDO: anim_val decidido uma vez antes do loop (anim_val_once)
-                    # antes era random.choice() por frame, fazendo a animação pular a cada frame
-                    anim_val = anim_val_once
-                    z_start, z_end = 1.0, 1.0
-                    dx_start, dx_end = 0.0, 0.0
-                    dy_start, dy_end = 0.0, 0.0
-                    pan_dist = h * 0.08
-                    
-                    if anim_val == "zoom_in":
-                        z_start, z_end = 1.0, 1.10
-                    elif anim_val == "zoom_out":
-                        z_start, z_end = 1.10, 1.0
-                    elif anim_val == "pan_up":
-                        dy_start, dy_end = pan_dist, -pan_dist
-                        z_start, z_end = 1.08, 1.08
-                    elif anim_val == "pan_down":
-                        dy_start, dy_end = -pan_dist, pan_dist
-                        z_start, z_end = 1.08, 1.08
-                    elif anim_val == "pan_left":
-                        dx_start, dx_end = pan_dist, -pan_dist
-                        z_start, z_end = 1.08, 1.08
-                    elif anim_val == "pan_right":
-                        dx_start, dx_end = -pan_dist, pan_dist
-                        z_start, z_end = 1.08, 1.08
-                    elif anim_val == "zoom_pan_diag":
-                        z_start, z_end = 1.0, 1.12
-                        dx_start, dx_end = pan_dist * 0.8, -pan_dist * 0.8
-                        dy_start, dy_end = pan_dist * 0.8, -pan_dist * 0.8
-                        
-                    z = z_start + (z_end - z_start) * e
-                    dx = dx_start + (dx_end - dx_start) * e
-                    dy = dy_start + (dy_end - dy_start) * e
-                    
-                    anim = render_anim(fg_t, w, h, z, dx, dy)
-                    paste_to_bg(frame_bg, anim, cx, cy)
-                
-                # ---------- Transição entre cenas ----------
-                # FADE_FRAMES já calculado antes do loop (constante por cena)
-                if transition_mode == "none" or FADE_FRAMES <= 0:
-                    # Corte direto — sem fade nem blur
-                    frame_rgb = frame_bg.clamp(0, 255)
-                    frame_u8 = frame_rgb.to(torch.uint8).squeeze(0).permute(1, 2, 0)
-                    frame_bytes = frame_u8.cpu().numpy().tobytes()
-                elif transition_mode == "blur":
-                    # Blur suave: fica nítido no meio, levemente desfocado no início/fim
-                    if i < FADE_FRAMES and scene_idx > 0:
-                        alpha_t = i / FADE_FRAMES           # 0.0 → 1.0
-                    elif i >= frames - FADE_FRAMES:
-                        alpha_t = (frames - 1 - i) / FADE_FRAMES  # 1.0 → 0.0
-                    else:
-                        alpha_t = 1.0
-                    frame_rgb = frame_bg.clamp(0, 255)
-                    frame_u8 = frame_rgb.to(torch.uint8).squeeze(0).permute(1, 2, 0)
-                    frame_np = frame_u8.cpu().numpy()
-                    if alpha_t < 1.0:
-                        from PIL import Image as _PIL_Image, ImageFilter as _PIL_IF
-                        blur_r = int((1.0 - alpha_t) * 28 + 0.5)  # max radius 28
-                        if blur_r > 0:
-                            _pil_f = _PIL_Image.fromarray(frame_np)
-                            _pil_f = _pil_f.filter(_PIL_IF.GaussianBlur(blur_r))
-                            frame_np = _pil_f.tobytes()
-                        else:
-                            frame_np = frame_np.tobytes()
-                    else:
-                        frame_np = frame_np.tobytes()
-                    frame_bytes = frame_np
-                else:
-                    # Fade padrão: escurece para preto
-                    if i < FADE_FRAMES and scene_idx > 0:
-                        fade = i / FADE_FRAMES
-                    elif i >= frames - FADE_FRAMES:
-                        fade = (frames - 1 - i) / FADE_FRAMES
-                    else:
-                        fade = 1.0
-                    frame_rgb = frame_bg.clamp(0, 255) * fade
-                    frame_u8 = frame_rgb.to(torch.uint8).squeeze(0).permute(1, 2, 0)
-                    frame_bytes = frame_u8.cpu().numpy().tobytes()
-                proc.stdin.write(frame_bytes)
-
-            # CORRIGIDO: proc.stdin.close() e proc.wait() agora estão DENTRO do try
-            # antes ficavam fora, impossível acessar proc em caso de exceção init
-            proc.stdin.close()
-            proc.wait()
-            return proc.returncode == 0
-
-        except Exception as e:
-            # CORRIGIDO: matar o proc FFmpeg se render falhar a meio (zombie process prevention)
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
-            except Exception:
-                pass
-            if log_fn: log_fn(f"Exception GPU Render Cena: {e}")
-            return False
-
+        proc.stdin.close()
+        proc.wait()
+        return proc.returncode == 0, time.monotonic() - t0_render
     except Exception as e:
-        # Outer except: captura erros durante setup (carregamento de imagem, FFmpeg init, etc.)
-        if log_fn: log_fn(f"Exception GPU Render Cena (setup): {e}")
-        return False
-
+        if log_fn: log_fn(f"Erro Cena #{scene_idx+1}: {e}")
+        return False, 0.0
 
 # ---------------------------------------------------------------------------
-# Pipeline de vídeo principal (QObject com sinais)
+# Pipeline Principal
 # ---------------------------------------------------------------------------
-
 class VideoPipeline(QObject):
-    progress    = Signal(int, int)      # (atual, total)
-    video_progress = Signal(int, int)   # Dashboard compatibility
+    progress = Signal(int, int)
+    video_progress = Signal(int, int)
     log_message = Signal(str)
-    finished    = Signal(bool, str)     # (sucesso, caminho_resultado_ou_erro)
-
+    finished = Signal(bool, str)
     video_scene_done = Signal(int, int)
     video_complete = Signal(str, float, float)
 
-    def __init__(
-        self,
-        pairs: List[Tuple[Union[str, Tuple[str, str]], Union[str, Tuple[str, str]]]],
-        output_path: str,
-        effect_mode: str = "auto",
-        layout_mode: str = "single",
-        transition_mode: str = "fade",
-        transition_time: float = 0.2,
-        bg_music_path: str = "",
-        bg_music_volume: int = 10,
-        config: dict = None,
-        parent=None,
-    ):
+    def __init__(self, pairs, output_path, effect_mode="auto", layout_mode="single",
+                 transition_mode="fade", transition_time=0.2, bg_music_path="", bg_music_volume=10, config=None, parent=None):
         super().__init__(parent)
-        self.pairs           = pairs
-        self.output_path     = output_path
-        self.effect_mode     = effect_mode
-        self.layout_mode     = layout_mode
-        self.transition_mode = transition_mode
-        self.transition_time = transition_time
-        self.bg_music_path   = bg_music_path
-        self.bg_music_volume = bg_music_volume
-        self.config          = config or {}
-        self._cancelled      = False
+        self.pairs, self.output_path = pairs, output_path
+        self.effect_mode, self.layout_mode = effect_mode, layout_mode
+        self.transition_mode, self.transition_time = transition_mode, transition_time
+        self.bg_music_path, self.bg_music_volume = bg_music_path, bg_music_volume
+        self.config, self._cancelled = config or {}, False
 
-    def cancel(self):
-        self._cancelled = True
+    def cancel(self): self._cancelled = True
 
     def run(self):
-        if not self.pairs:
-            self.finished.emit(False, "Nenhum par áudio/imagem fornecido.")
-            return
-
-        n_pairs = len(self.pairs)
-        self.log_message.emit(
-            f"Iniciando Renderização Multithread Sub-pixel 60FPS: {n_pairs} cenas.\n"
-            f"Destino final: {self.output_path}\n"
-        )
-
-        if not _ffmpeg_ok():
-            self.finished.emit(False, "FFmpeg não encontrado.")
-            return
-
-        encoder = _get_best_encoder()
-        self.log_message.emit(
-            f"Aceleração de Vídeo / Base de render: {encoder}"
-        )
-
-        start_time = time.time()
-
+        if not self.pairs: return self.finished.emit(False, "Sem pares áudio/imagem.")
+        if not _ffmpeg_ok(): return self.finished.emit(False, "FFmpeg não encontrado.")
+        
+        self.log_message.emit(f"🚀 Iniciando Renderização Otimizada (Batch Writing 60FPS)\nDestino: {self.output_path}\n")
+        
+        encoder, start_time = _get_best_encoder(), time.time()
         out_root = get_safe_path(self.output_path)
-        scenes_dir = get_safe_path(out_root.parent / f"{out_root.stem}_cenas_individuais")
+        scenes_dir = get_safe_path(out_root.parent / f"{out_root.stem}_cenas")
         scenes_dir.mkdir(parents=True, exist_ok=True)
 
         clip_tasks = []
-        single_clip_count = 0
+        base_effs = ["pan_up", "pan_down", "zoom_in", "zoom_out"]
+        random.shuffle(base_effs)
         
-        # Embaralha a ordem base dos efeitos UMA VEZ por vídeo.
-        # Assim, o padrão se repete de forma coesa (Ex: A->C->B->D -> A->C->B->D) 
-        # mas muda toda vez que você clica em gerar, tirando a repetição constante do Preview!
-        import random
-        base_effects = ["pan_up", "pan_down", "zoom_in", "zoom_out"]
-        random.shuffle(base_effects)
-        
-        for clip_i, pair in enumerate(self.pairs, start=1):
+        for i, pair in enumerate(self.pairs):
             is_split = isinstance(pair[0], tuple)
             if is_split:
-                a1, a2 = pair[0]
-                img1, img2 = pair[1]
-                audio_path = (a1, a2)
-                image_path = (img1, img2)
-                duration = _audio_duration(a1) + _audio_duration(a2)
+                a_p, i_p = pair[0], pair[1]
+                dur = _audio_duration(a_p[0]) + _audio_duration(a_p[1])
             else:
-                audio_path, image_path = pair
-                duration = _audio_duration(audio_path)
-                single_clip_count += 1
-                
-            if duration <= 0:
-                continue
-
-            if self.effect_mode == "auto":
-                if is_split:
-                    effect = "auto"
-                else:
-                    effect = base_effects[(single_clip_count - 1) % 4]
-            else:
-                effect = self.effect_mode
-                
-            clip_name = f"scene_{clip_i:03d}.mp4"
-            clip_mp4 = str(scenes_dir / clip_name)
+                a_p, i_p = pair[0], pair[1]
+                dur = _audio_duration(a_p)
             
-            # Formata qual será a animação base de feedback pro log
-            clip_tasks.append((clip_i, audio_path, image_path, effect, duration, clip_mp4))
+            if dur <= 0: continue
+            eff = self.effect_mode if self.effect_mode != "auto" else (base_effs[i % 4] if not is_split else "auto")
+            out = str(scenes_dir / f"scene_{i+1:03d}.mp4")
+            clip_tasks.append((i+1, a_p, i_p, eff, dur, out))
 
-        if not clip_tasks:
-            self.finished.emit(False, "Durações de áudio inválidas.")
-            return
-
-        total = len(clip_tasks)
-        completed = 0
-        concat_map: dict[int, str] = {}
-
-        # CORRIGIDO: NVENC consumer GPUs suportam ~3-5 sessões de encode simultaneamente.
-        # CPU_COUNT * 2 causava falhas silenciosas por excesso de sessões NVENC.
-        # libx264: todos os núcleos são seguros.
-        MAX_NVENC_SESSIONS = 4  # limite conservador e seguro para consumer GPUs
-        if encoder == "h264_nvenc" or encoder == "h264_amf":
-            max_workers = min(MAX_NVENC_SESSIONS, _CPU_COUNT)
-        elif encoder == "h264_qsv":
-            max_workers = min(6, _CPU_COUNT)  # QSV tem limite mais alto
-        else:
-            max_workers = _CPU_COUNT  # libx264: all cores safe
-
-        self.log_message.emit(f"Renderizando com Smoothstep Easing 60fps — {max_workers} cenas em paralelo ({_CPU_COUNT} núcleos detectados)...")
-
-        # CORRIGIDO: log_message.emit não pode ser chamado de threads nativas (ThreadPoolExecutor)
-        # Usamos uma Queue thread-safe: workers colocam logs nela, o loop principal processa
-        _log_queue: queue.Queue = queue.Queue()
-
-        def _safe_log(msg: str):
-            """Logging thread-safe: coloca na fila em vez de emitir diretamente."""
-            _log_queue.put(msg)
-
+        if not clip_tasks: return self.finished.emit(False, "Durações inválidas.")
+        
+        total, completed, frames_total = len(clip_tasks), 0, sum(int(t[4]*FPS) for t in clip_tasks)
+        frames_done, concat_map = 0, {}
+        
+        max_workers = 3 if encoder == "h264_nvenc" else (os.cpu_count() or 4)
+        _log_q = queue.Queue()
         def _flush_log_queue():
-            """Esvazia a fila de logs e emite via sinal Qt (thread principal)."""
-            while not _log_queue.empty():
-                try:
-                    self.log_message.emit(_log_queue.get_nowait())
-                except queue.Empty:
-                    break
+            while not _log_q.empty(): self.log_message.emit(_log_q.get_nowait())
+
+        _eta_history: list = []        # histórico de fps pontuais por cena
+        _eta_start_time = time.time()  # referência local para o ETA
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {}
-            for idx, task in enumerate(clip_tasks):
-                clip_i, audio_path, image_path, effect, duration, clip_mp4 = task
-                fut = executor.submit(
-                    _python_render_clip,
-                    image_path, audio_path, effect, duration, clip_mp4, FPS, encoder,
-                    _safe_log,  # CORRIGIDO: usa logging thread-safe em vez de emit direto
-                    self.transition_mode, self.transition_time, idx, self.config
-                )
-                future_to_idx[fut] = (idx, task)
-
-            for fut in concurrent.futures.as_completed(future_to_idx):
+            fut_to_task = {executor.submit(_python_render_clip, t[2], t[1], t[3], t[4], t[5], FPS, encoder, _log_q.put, self.transition_mode, self.transition_time, i, self.config): (i, t) for i, t in enumerate(clip_tasks)}
+            
+            for fut in concurrent.futures.as_completed(fut_to_task):
                 if self._cancelled:
                     executor.shutdown(wait=False, cancel_futures=True)
-                    self.finished.emit(False, "Cancelado pelo usuário.")
-                    return
+                    return self.finished.emit(False, "Cancelado.")
+                
+                idx, t = fut_to_task[fut]
+                try: success, r_time = fut.result()
+                except: success, r_time = False, 0.0
+                
+                frames_done += int(t[4] * FPS)
+                elapsed = time.time() - _eta_start_time
 
-                idx, task = future_to_idx[fut]
-                clip_i, audio_path, image_path, effect, duration, clip_mp4 = task
-
-                try:
-                    success = fut.result()
-                    if success:
-                        single_clip_count += 1
-                        self.progress.emit(single_clip_count, n_pairs)
-                        self.video_scene_done.emit(single_clip_count, n_pairs)
-                except Exception as e:
-                    success = False
-                    e_str = str(e)
-                    if e_str and len(e_str) > 100:
-                        e_str = e_str[0:100]
-                    self.log_message.emit(f"  [ERRO] Exceção durante renderização da Cena #{clip_i:02d}: {e_str}")
-
-
+                # Só calcula após 3s reais de dados — evita explosão no início paralelo
+                if elapsed >= 3.0 and frames_done > 0:
+                    fps_instant = int(t[4] * FPS) / r_time if r_time > 0 else 1
+                    _eta_history.append(fps_instant)
+                    if len(_eta_history) > 8:          # janela dos últimos 8 resultados
+                        _eta_history.pop(0)
+                    fps_smooth  = sum(_eta_history) / len(_eta_history)
+                    eta_sec     = int((frames_total - frames_done) / fps_smooth)
+                    if eta_sec <= 0:
+                        eta_s = "finalizando..."
+                    elif eta_sec >= 3600:
+                        eta_s = f"{eta_sec//3600}h {(eta_sec%3600)//60}m"
+                    elif eta_sec >= 60:
+                        eta_s = f"{eta_sec//60}m {eta_sec%60}s"
+                    else:
+                        eta_s = f"{eta_sec}s"
+                else:
+                    eta_s = "calculando..."
                 completed += 1
                 
-                elapsed = time.time() - start_time
-                avg_time = elapsed / completed if completed > 0 else 0
-                eta_sec = int(avg_time * (total - completed))
-                eta_str = f"{eta_sec // 60}m {eta_sec % 60}s" if eta_sec >= 60 else f"{eta_sec}s"
-                
+                _flush_log_queue()
                 self.progress.emit(completed, total)
-
-                if success and os.path.exists(clip_mp4):
-                    self.log_message.emit(f"  [ETA: {eta_str}] ✓ Cena #{clip_i:02d} gerada individualmente em: {Path(clip_mp4).name}")
-                    concat_map[idx] = str(clip_mp4)
-                else:
-                    self.log_message.emit(f"  [ETA: {eta_str}] ✗ Falha na Cena #{clip_i:02d}")
-
-        # Esvazia a fila de logs dos workers antes de prosseguir para o concat
-        _flush_log_queue()
-
-        # Reconstrói lista ordenada por índice de cena (as_completed não garante ordem)
-        concat_list = [concat_map[k] for k in sorted(concat_map)]
-        if not concat_list:
-            self.finished.emit(False, "Nenhuma cena foi gerada com sucesso.")
-            return
-
-        # Concat Demuxer final
-        self.log_message.emit("\nAgrupando vídeo final (sem perdas na qualidade)...")
-        concat_txt = scenes_dir / "concat_list.txt"
-        with open(concat_txt, "w", encoding="utf-8") as f:
-            for c_path in concat_list:
-                # O txt está no mesmo diretório dos vídeos, usar apenas o nome é mais seguro
-                f.write(f"file '{Path(c_path).name}'\n")
-
-        # Garante que o diretório de saída existe antes de escrever o vídeo final
-        out_path = Path(self.output_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        concat_cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(concat_txt),
-            "-c", "copy",
-            str(out_path)
-        ]
-
-        self.log_message.emit(f"  Saída final: {out_path}")
-        try:
-            create_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-            result = subprocess.run(
-                concat_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=120,  # CORRIGIDO: timeout para evitar bloqueio infinito no concat final
-                creationflags=create_flags
-            )
-            if result.returncode == 0 and out_path.exists():
+                self.video_scene_done.emit(completed, total)
                 
-                if getattr(self, "bg_music_path", ""):
-                    self.log_message.emit("🎵 Adicionando Música de Fundo (Loop infinito)...")
-                    bg_path = self.bg_music_path
-                    bg_vol = getattr(self, "bg_music_volume", 10) / 100.0
-                    temp_mp4 = out_path.with_name(f"{out_path.stem}_bgtemp.mp4")
-                    
-                    do_ducking = self.config.get("production", {}).get("sound_design", {}).get("auto_ducking", False)
-                    
-                    if do_ducking:
-                        self.log_message.emit("🎵 Auto-Ducking Ativado: abaixando BGM durante as falas...")
-                        # Usa o split para [0:a] (voz principal).
-                        # [0:a] vai para mixagem final e sidechain control.
-                        # sidechaincompress threshold -30dB, ratio 4, attack 50, release 300, makeup 1.
-                        fc = f"[0:a]asplit=2[voce][vside];[1:a]volume={bg_vol}[bgm];[bgm][vside]sidechaincompress=threshold=-30dB:ratio=4:attack=50:release=300[bgm_ducked];[voce][bgm_ducked]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-                    else:
-                        fc = f"[1:a]volume={bg_vol}[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+                if success and os.path.exists(t[5]):
+                    speed = t[4]/r_time if r_time > 0 else 0
+                    self.log_message.emit(f"  ✓ Cena #{t[0]:02d} | {t[4]:.1f}s | {int(t[4]*FPS)} frames | render: {r_time:.1f}s | {speed:.1f}x realtime | ETA: {eta_s}")
+                    concat_map[idx] = t[5]
+                else: self.log_message.emit(f"  ✗ Falha Cena #{t[0]:02d} | ETA: {eta_s}")
 
-                    bgm_cmd = [
-                        "ffmpeg", "-y",
-                        "-i", str(out_path),
-                        "-stream_loop", "-1",
-                        "-i", str(bg_path),
-                        "-filter_complex", fc,
-                        "-map", "0:v", "-map", "[aout]",
-                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                        str(temp_mp4)
-                    ]
-                    
-                    # CORRIGIDO: adicionar timeout ao subprocess do BGM
-                    # Sem timeout, um arquivo de áudio corrompido ou FFmpeg travado
-                    # bloqueia o pipeline indefinidamente
-                    try:
-                        bg_res = subprocess.run(
-                            bgm_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                            creationflags=create_flags, timeout=120
-                        )
-                        if bg_res.returncode == 0 and temp_mp4.exists():
-                            shutil.move(str(temp_mp4), str(out_path))
-                            self.log_message.emit("  ✓ Música de Fundo adicionada com sucesso!")
-                        else:
-                            err_msg = bg_res.stderr.decode('utf-8', errors='ignore') if bg_res.stderr else "Erro desconhecido"
-                            if len(err_msg) > 100:
-                                err_msg = err_msg[0:100]
-                            self.log_message.emit(f"  ✗ Erro ao mixar BGM: {err_msg}...\n(Mantendo vídeo sem música)")
-                            # CORRIGIDO: limpar temp_mp4 se BGM falhou
-                            if temp_mp4.exists():
-                                try: temp_mp4.unlink()
-                                except Exception: pass
-                    except subprocess.TimeoutExpired:
-                        self.log_message.emit("  ⚠ BGM timeout (120s). Mantendo vídeo sem música.")
-                        # CORRIGIDO: limpar temp_mp4 se timeout
-                        if temp_mp4.exists():
-                            try: temp_mp4.unlink()
-                            except Exception: pass
+        _flush_log_queue()
+        
+        # Concatenação e Finalização
+        c_list = [concat_map[k] for k in sorted(concat_map)]
+        if not c_list: return self.finished.emit(False, "Sem cenas geradas.")
+        
+        self.log_message.emit("\nAgrupando vídeo final...")
+        c_txt = scenes_dir / "concat.txt"
+        with open(c_txt, "w", encoding="utf-8") as f:
+            for p in c_list: f.write(f"file '{Path(p).name}'\n")
+            
+        out_p = Path(self.output_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        
+        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(c_txt), "-c", "copy", str(out_p)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # BGM Auto-ducking (simplificado)
+        if self.bg_music_path and out_p.exists():
+            self.log_message.emit("🎵 Adicionando BGM + Auto-ducking...")
+            tmp = out_p.with_name(f"{out_p.stem}_tmp.mp4")
+            vol = self.bg_music_volume / 100.0
+            fc = f"[0:a]asplit=2[v][vs];[1:a]volume={vol}[bg];[bg][vs]sidechaincompress=threshold=-30dB:ratio=4[bgd];[v][bgd]amix=inputs=2:duration=first[a]"
+            subprocess.run(["ffmpeg", "-y", "-i", str(out_p), "-stream_loop", "-1", "-i", self.bg_music_path, "-filter_complex", fc, "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", str(tmp)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if tmp.exists(): shutil.move(str(tmp), str(out_p))
 
-                total_time = time.time() - start_time
-                mins, secs = divmod(int(total_time), 60)
-                time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
-                total_duration = sum(t[4] for t in clip_tasks)
+        total_time = time.time() - start_time
+        total_dur = sum(t[4] for t in clip_tasks)
+        speed = total_dur / total_time if total_time > 0 else 0
+        mr, sr = divmod(int(total_time), 60)
+        md, sd = divmod(int(total_dur), 60)
 
-                self.log_message.emit(f"\n✓ Vídeo final salvo em: {out_path} (Tempo demorado: {time_str})")
-                self.video_complete.emit(str(out_path), total_duration, total_time)
-                self.finished.emit(True, str(out_path))
-            else:
-                err = result.stderr.decode("utf-8", errors="replace")[-500:]
-                self.log_message.emit(f"\n✗ Concat falhou (código {result.returncode}):\n{err}")
-                self.finished.emit(False, f"Concat falhou. Ver log para detalhes.")
-        except Exception as e:
-            self.finished.emit(False, f"Erro no Mux final: {e}")
+        self.log_message.emit("═"*42 + f"\n✓ Vídeo finalizado!\n   Cenas        : {completed}\n   Duração      : {md}m {sd}s\n   Render       : {mr}m {sr}s\n   Velocidade   : {speed:.2f}x realtime\n   Encoder      : {encoder}\n   Saída        : {out_p}\n" + "═"*42)
+        self.video_complete.emit(str(out_p), total_time, speed)
+        self.finished.emit(True, "Sucesso")

@@ -140,3 +140,19 @@ def detect_language(text: str) -> str:
         return "en"
 
     return "pt" # Fallback para o idioma principal do usuário
+
+def detect_language_from_file(file_path: str) -> str:
+    """
+    Lê o início de um arquivo de texto e detecta o idioma.
+    """
+    try:
+        import os
+        if not os.path.exists(file_path):
+            return "en"
+            
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read(5000) # Lê os primeiros 5KB
+            
+        return detect_language(content)
+    except Exception:
+        return "en"

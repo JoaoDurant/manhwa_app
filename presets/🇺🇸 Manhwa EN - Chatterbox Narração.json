@@ -15,9 +15,9 @@
     "model_type": "turbo",
     "lang": "en",
 
-    "temperature": 0.78,
-    "exaggeration": 0.72,
-    "cfg_weight": 0.35,
+    "temperature": 0.65,
+    "exaggeration": 0.55,
+    "cfg_weight": 0.45,
     "seed": 3000,
     "speed": 1.0,
 

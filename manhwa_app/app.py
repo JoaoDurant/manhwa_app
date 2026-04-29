@@ -28,7 +28,7 @@ if torch.cuda.is_available():
         pass
 
 from PySide6.QtCore import (
-    QObject, Qt, QThread, QUrl, Signal, Slot,
+    QObject, Qt, QThread, QUrl, Signal, Slot, QTimer,
 )
 from PySide6.QtGui import (
     QColor, QDragEnterEvent, QDropEvent, QFont, QPixmap,
@@ -138,104 +138,9 @@ class ModelLoaderThread(QThread):
 # Sistema de Fila (Coordenador)
 # ---------------------------------------------------------------------------
 
-class QueueCoordinator(QObject):
-    """Coordenador de fila event-driven. Usa o pipeline da aba Audio."""
-    task_started  = Signal(int)
-    task_progress = Signal(int, int, int)
-    task_log      = Signal(int, str)
-    task_finished = Signal(int, bool)
-    queue_log     = Signal(str)
-    all_done      = Signal()
+# (Primeira definição de QueueCoordinator removida — movida para o final para maior robustez)
 
-    def __init__(self, tasks: list, main_window, parent=None):
-        super().__init__(parent)
-        self.tasks       = list(tasks)
-        self.main_window = main_window
-        self._idx        = 0
-        self._cancelled  = False
-        self._audio_paths: list = []
-
-    def cancel(self):
-        self._cancelled = True
-        at = self.main_window.audio_tab
-        if at._pipeline:
-            at._pipeline.cancel()
-
-    def start(self):
-        if not self.tasks:
-            self.all_done.emit(); return
-        self._idx = 0
-        self._cancelled = False
-        self._connect_audio()
-        self._run_current()
-
-    def _connect_audio(self):
-        at = self.main_window.audio_tab
-        at.pipeline_progress.connect(self._on_progress)
-        at.pipeline_log.connect(self._on_log)
-        at.pipeline_finished.connect(self._on_audio_done)
-        at.audio_generated.connect(self._on_generated)
-
-    def _disconnect_audio(self):
-        at = self.main_window.audio_tab
-        for sig, slot in [
-            (at.pipeline_progress, self._on_progress),
-            (at.pipeline_log,      self._on_log),
-            (at.pipeline_finished, self._on_audio_done),
-            (at.audio_generated,   self._on_generated),
-        ]:
-            try: sig.disconnect(slot)
-            except: pass
-
-    def _run_current(self):
-        if self._cancelled or self._idx >= len(self.tasks):
-            self._finish(); return
-        task = self.tasks[self._idx]
-        task.status = "running"
-        self.task_started.emit(self._idx)
-        
-        at = self.main_window.audio_tab
-        at.output_root_edit.setText(task.output_root)
-        at.project_edit.setText(task.project_name)
-        at._files = [{"path": str(p)} for p in task.input_files]
-        at._refresh_list()
-        
-        # Inicia a geração (aba Audio)
-        at._start_pipeline(at._files, project_override=task.project_name)
-
-    def _on_progress(self, current, total):
-        self.task_progress.emit(self._idx, current, total)
-
-    def _on_log(self, msg):
-        self.task_log.emit(self._idx, msg)
-
-    def _on_audio_done(self, success, msg):
-        if not success:
-            self.queue_log.emit(f"❌ Falha na tarefa {self._idx}: {msg}")
-        self.task_finished.emit(self._idx, success)
-        self._idx += 1
-        self._run_current()
-
-    def _on_generated(self, paths):
-        self._audio_paths.extend(paths)
-
-    def _finish(self):
-        self._disconnect_audio()
-        self.all_done.emit()
-
-QueueOrchestrator = QueueCoordinator
-
-class QComboBox(_QComboBox):
-    def wheelEvent(self, e): e.ignore()
-
-class QSpinBox(_QSpinBox):
-    def wheelEvent(self, e): e.ignore()
-
-class QDoubleSpinBox(_QDoubleSpinBox):
-    def wheelEvent(self, e): e.ignore()
-
-class QSlider(_QSlider):
-    def wheelEvent(self, e): e.ignore()
+# (Redundâncias removidas)
 
 from manhwa_app.audio_pipeline import split_into_paragraphs
 from manhwa_app.video_pipeline import EFFECTS
@@ -260,58 +165,12 @@ KOKORO_LANG_MAP = {
     "hi": ["hf_", "hm_"]
 }
 
-from manhwa_app.dashboard_timing import DashboardTiming
-from manhwa_app.utils import _append_log, natural_sort_key
+# (Importações duplicadas removidas)
 
 # ---------------------------------------------------------------------------
 # Thread para carregamento de modelos em background
 # ---------------------------------------------------------------------------
-class ModelLoaderThread(QThread):
-    finished_loading = Signal(bool, str)
-
-    def __init__(self, tts_engine: str, model_type: str, parent=None):
-        super().__init__(parent)
-        self.tts_engine = tts_engine
-        self.model_type = model_type
-
-    def run(self):
-        try:
-            from manhwa_app.audio_pipeline import _engine, _ENGINE_AVAILABLE
-            if not _ENGINE_AVAILABLE or _engine is None:
-                self.finished_loading.emit(False, "Engine não disponível")
-                return
-
-            # Para Chatterbox, o engine real é o subtipo (turbo, multilingual, original)
-            target = self.tts_engine
-            if self.tts_engine == "chatterbox":
-                target = self.model_type
-
-            logger.info(f"ModelLoaderThread: trocando para {target}")
-            
-            if _engine.switch_to_engine(target):
-                name_map = {
-                    "turbo": "Chatterbox Turbo",
-                    "multilingual": "Chatterbox Multilingual",
-                    "original": "Chatterbox Original",
-                    "kokoro": "Kokoro TTS"
-                }
-                display_name = name_map.get(target, target.capitalize())
-                
-                # Detect the actual device used (could be CPU fallback)
-                actual_device = "GPU"
-                try:
-                    if hasattr(_engine, "engine") and _engine.engine and hasattr(_engine.engine, "device"):
-                         if str(_engine.engine.device) == "cpu":
-                             actual_device = "CPU (Fallback)"
-                except: pass
-                
-                self.finished_loading.emit(True, f"{display_name} [{actual_device}]")
-            else:
-                self.finished_loading.emit(False, f"Falha ao carregar {target}")
-                
-        except Exception as e:
-            logger.error(f"Erro no ModelLoaderThread: {e}", exc_info=True)
-            self.finished_loading.emit(False, str(e))
+# (Segunda definição de ModelLoaderThread removida)
 
 # ---------------------------------------------------------------------------
 # Configurações de sessão (persistência entre execuções)
@@ -1487,6 +1346,9 @@ class AudioTab(QWidget):
     def _run_all_next(self):
         if self._run_all_index >= len(self._files):
             self._run_all_mode = False
+            self.btn_generate.setEnabled(True)
+            self.btn_run_all.setEnabled(True)
+            self.btn_cancel.setEnabled(False)
             _append_log(self.log_text, "\n🎉 Run All concluído com sucesso para todos os arquivos!")
             QMessageBox.information(self, "Run All Concluído", "Todos os projetos foram gerados.")
             return
@@ -1631,25 +1493,48 @@ class AudioTab(QWidget):
         # [PARIDADE TOTAL] Se houver audio_params (snapshot da UI), elevamos para a raiz do cfg
         # Isso garante que fx_highpass, fx_deesser etc. sejam passados corretamente.
         if "audio_params" in cfg and isinstance(cfg["audio_params"], dict):
-            # [REGRA DE OURO] Parâmetros da UI (snapshot) SEMPRE sobrescrevem os defaults do Job
+            # [FIX 3] Eleva audio_params para raiz, mas protege campos críticos definidos pelo Macro
+            # Isso evita que o snapshot da UI (que pode ter voz genérica) sobrescreva a voz específica do Job.
+            protected = {"voice", "tts_engine", "model_type", "lang", 
+                         "project_name", "output_root", "txt_path", "file_configs"}
             for k, v in cfg["audio_params"].items():
-                cfg[k] = v
+                if k not in protected:
+                    cfg[k] = v
+        
+        # [FIX 4] Normaliza nome da chave de voz (preset_voice → voice)
+        if not cfg.get("voice") and cfg.get("preset_voice"):
+            cfg["voice"] = cfg["preset_voice"]
 
         # Se vier de um MacroJob individual, pode não ter file_configs mas sim txt_path
         if "file_configs" not in cfg and "txt_path" in cfg:
             cfg["file_configs"] = [{
-                "path": cfg["txt_path"],
-                "voice": cfg.get("voice", ""),
-                "lang": cfg.get("lang", "auto"),
-                "engine": cfg.get("tts_engine", "chatterbox"),
-                # Repassa FX individuais para cada arquivo
-                "fx_highpass": cfg.get("fx_highpass", False),
-                "fx_compressor": cfg.get("fx_compressor", False),
-                "fx_deesser": cfg.get("fx_deesser", False),
-                "fx_reverb": cfg.get("fx_reverb", False),
-                "fx_silence": cfg.get("fx_silence", False),
-                "fx_loudnorm": cfg.get("fx_loudnorm", False),
+                "path":         cfg["txt_path"],
+                "voice":        cfg.get("voice", ""),
+                "lang":         cfg.get("lang", "auto"),
+                "engine":       cfg.get("tts_engine", "chatterbox"),
+                # Parâmetros de Prosódia (Importante para paridade total)
+                "temperature":  cfg.get("temperature", 0.65),
+                "speed":        cfg.get("speed", 1.0),
+                "exaggeration": cfg.get("exaggeration", 0.5),
+                "cfg_weight":   cfg.get("cfg_weight", 0.5),
+                "top_p":        cfg.get("top_p", 1.0),
+                "top_k":        cfg.get("top_k", 1000),
+                "repetition_penalty": cfg.get("repetition_penalty", 1.2),
+                # Flags de FX (Default True para combinar com Modo Manual)
+                "fx_highpass":  cfg.get("fx_highpass", True),
+                "fx_compressor":cfg.get("fx_compressor", True),
+                "fx_deesser":   cfg.get("fx_deesser", True),
+                "fx_reverb":    cfg.get("fx_reverb", False),
+                "fx_silence":   cfg.get("fx_silence", True),
+                "fx_loudnorm":  cfg.get("fx_loudnorm", True),
+                "fx_natural_mode": cfg.get("fx_natural_mode", False),
             }]
+        elif "file_configs" in cfg:
+            # [FIX 3] Se file_configs já existe, garante que a voz correta do Macro está em cada item
+            resolved_voice = cfg.get("voice", "")
+            for fc in cfg["file_configs"]:
+                if resolved_voice and not fc.get("voice"):
+                    fc["voice"] = resolved_voice
 
         return AudioPipeline(
             file_configs=cfg.get("file_configs", []),
@@ -1825,8 +1710,8 @@ class AudioTab(QWidget):
         def _on_regen_done(success, msg):
             Path(tmp_txt).unlink(missing_ok=True)
             self._regen_thread.quit()
-            # CORRIGIDO: aguardar a thread terminar para evitar 'QThread destroyed while running'
-            thread.wait(3000)   # timeout de 3s
+            # [BUG 10 FIX] Usar self._regen_thread em vez de thread inexistente
+            self._regen_thread.wait(3000)   # timeout de 3s
             new_wav = (Path(self.output_root_edit.text().strip() or "output") / project / "audios" / "audio_1.wav")
             if success and new_wav.exists():
                 import shutil
@@ -1895,7 +1780,7 @@ class AudioTab(QWidget):
             self.save_voice_project_chk.setChecked(data["save_voice_project"])
 
     def get_session(self) -> dict:
-        return {
+        data = {
             "project": self.project_edit.text().strip(),
             "output_root": self.output_root_edit.text().strip(),
             "preset_lang": self.preset_lang_combo.currentText(),
@@ -1905,6 +1790,11 @@ class AudioTab(QWidget):
             "tts_engine": self.combo_engine.currentData() if hasattr(self, "combo_engine") else "chatterbox",
             "model_type": self.combo_model_type.currentData() if hasattr(self, "combo_model_type") else "turbo",
         }
+        # [BUG 3 FIX] Merge automático com a aba TTS para snapshot completo
+        main_win = self.window()
+        if hasattr(main_win, "tts_tab"):
+            data.update(main_win.tts_tab.get_session())
+        return data
 
     def reset_defaults(self):
         self.project_edit.setText("")
@@ -2861,8 +2751,14 @@ class VideoTab(QWidget):
         else:
             self._on_log(f"✗ Falha no vídeo: {message}")
         
-        # Avisa a AudioTab para continuar o loop
-        self.window().audio_tab.continue_run_all()
+        # Avisa a AudioTab para continuar o loop ou finalizar
+        main_win = self.window()
+        if hasattr(main_win, "audio_tab"):
+            main_win.audio_tab.continue_run_all()
+        else:
+            # Fallback caso não ache via window()
+            self.btn_generate.setEnabled(True)
+            self.btn_cancel.setEnabled(False)
 
     @Slot(str)
     def _on_log(self, msg: str):
@@ -3773,11 +3669,31 @@ class MacroTab(QWidget):
         self._on_workflow_changed()
         self._on_engine_changed()
         
-        btn_add = QPushButton("➕ Adicionar tarefa à Fila")
-        btn_add.setObjectName("primary")
-        btn_add.setMinimumHeight(40)
-        btn_add.clicked.connect(self._add_single_job)
-        fl.addRow(btn_add)
+        self.btn_add = QPushButton("➕ Adicionar tarefa à Fila")
+        self.btn_add.setObjectName("primary")
+        self.btn_add.setMinimumHeight(40)
+        self.btn_add.clicked.connect(self._add_single_job)
+        fl.addRow(self.btn_add)
+        
+        # [NEW] Botões de Edição (escondidos por padrão)
+        self.edit_mode_job_id = None
+        self.edit_btn_layout = QHBoxLayout()
+        self.btn_save_edit = QPushButton("💾 Salvar Alterações")
+        self.btn_save_edit.setObjectName("primary")
+        self.btn_save_edit.setMinimumHeight(40)
+        self.btn_save_edit.clicked.connect(self._save_job_edit)
+        self.btn_save_edit.setVisible(False)
+        
+        self.btn_cancel_edit = QPushButton("✖")
+        self.btn_cancel_edit.setObjectName("danger")
+        self.btn_cancel_edit.setMinimumHeight(40)
+        self.btn_cancel_edit.setFixedWidth(50)
+        self.btn_cancel_edit.clicked.connect(self._cancel_job_edit)
+        self.btn_cancel_edit.setVisible(False)
+        
+        self.edit_btn_layout.addWidget(self.btn_save_edit, 1)
+        self.edit_btn_layout.addWidget(self.btn_cancel_edit)
+        fl.addRow(self.edit_btn_layout)
         
         form_v.addWidget(group_add)
         form_v.addStretch()
@@ -3825,6 +3741,26 @@ class MacroTab(QWidget):
             QTableWidget::item { padding: 5px; border-bottom: 1px solid rgba(255,255,255,0.05); }
         """)
         right_panel.addWidget(self.table)
+        
+        # [NEW] C. Histórico de Concluídos
+        hist_group = QGroupBox("✅ Histórico de Concluídos")
+        hist_v = QVBoxLayout(hist_group)
+        self.table_history = QTableWidget(0, 7)
+        self.table_history.setHorizontalHeaderLabels(["#", "Projeto", "Workflow", "Engine", "Status", "🎙️ Finalizado", "Mensagem"])
+        self.table_history.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_history.setAlternatingRowColors(True)
+        self.table_history.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table_history.setStyleSheet("QTableWidget { background: rgba(0,0,0,0.1); }")
+        hist_v.addWidget(self.table_history)
+        
+        hist_btn_row = QHBoxLayout()
+        btn_clear_hist = QPushButton("🗑 Limpar Histórico")
+        btn_clear_hist.clicked.connect(lambda: self.table_history.setRowCount(0))
+        hist_btn_row.addStretch()
+        hist_btn_row.addWidget(btn_clear_hist)
+        hist_v.addLayout(hist_btn_row)
+        
+        right_panel.addWidget(hist_group)
         
         # C. Log e Stats Strip (Bottom Splitter)
         bottom_w = QWidget()
@@ -3875,8 +3811,9 @@ class MacroTab(QWidget):
         bottom_h.addWidget(self.stats_frame, 1)
         right_panel.addWidget(bottom_w)
         
-        # Distribuição de altura no right_panel: 5% header, 65% table, 30% log
-        right_panel.setSizes([50, 400, 200])
+        # Distribuição de altura no right_panel: Timing, Tabela Fila, Tabela Histórico, Log/Stats
+        # [FIX] Garantindo que todos os 4 widgets tenham espaço visível.
+        right_panel.setSizes([80, 300, 200, 300])
         
         splitter.addWidget(right_panel)
         # Mais espaço para o lado direito
@@ -3942,6 +3879,9 @@ class MacroTab(QWidget):
         self.lbl_clock_job.setText(f"📁 Job: {job_c}  ETA: {job_e}")
         self.lbl_clock_queue.setText(f"📦 Queue: {queue_c}  ETA: {queue_e}")
         
+        # [BUG 7 FIX] Tentativa contínua de hook para garantir que novos pipelines sejam pegos
+        self._hook_pipelines()
+        
         # Atualiza a coluna de Tempo do job atual na tabela
         if self.coordinator._is_running and self.coordinator._current_idx >= 0:
             idx = self.coordinator._current_idx
@@ -3982,7 +3922,7 @@ class MacroTab(QWidget):
 
     @Slot(int, int, str)
     def _on_para_retry(self, idx, attempt, reason):
-        self._append_dash_log("AUDIO", "WARN", f"Para {idx} retry {attempt}/3 ({reason})")
+        self._append_dash_log("AUDIO", "WARN", f"Para {idx} retry {attempt} ({reason})")
 
     @Slot(int, int)
     def _on_video_scene(self, current, total):
@@ -4003,7 +3943,7 @@ class MacroTab(QWidget):
         self.btn_start.setEnabled(False)
         self.btn_pause.setEnabled(True)
         self.timing.on_job_started(jid, jidx, total)
-        self._hook_pipelines() # Prende os novos pipelines recém-criados
+        # O hook agora é feito via _on_tick para maior robustez temporal
         
         # Atualiza Status na tabela
         if jid in self._job_widgets:
@@ -4045,6 +3985,39 @@ class MacroTab(QWidget):
                 bg = QColor(0, 100, 0, 30) if success else QColor(100, 0, 0, 30)
                 if item: item.setBackground(bg)
                 
+            # [NEW] Se sucesso, move para o histórico e sai da fila
+            if success:
+                QTimer.singleShot(1000, lambda: self._move_to_history(jid))
+
+    def _move_to_history(self, jid):
+        """Remove o job da fila ativa e insere na tabela de histórico."""
+        if jid not in self._job_widgets: return
+        
+        # Pega o Job do coordinator (antes de remover)
+        job = None
+        for j in self.coordinator.jobs:
+            if j.id == jid:
+                job = j; break
+        if not job: return
+
+        # Dados para o histórico
+        h_row = self.table_history.rowCount()
+        self.table_history.insertRow(h_row)
+        self.table_history.setItem(h_row, 0, QTableWidgetItem(str(h_row+1)))
+        self.table_history.setItem(h_row, 1, QTableWidgetItem(job.project_name))
+        self.table_history.setItem(h_row, 2, QTableWidgetItem(job.mode_label()))
+        self.table_history.setItem(h_row, 3, QTableWidgetItem(job.engine_label()))
+        self.table_history.setItem(h_row, 4, QTableWidgetItem("✅ Concluído"))
+        
+        import time
+        finished_at = time.strftime("%H:%M:%S")
+        self.table_history.setItem(h_row, 5, QTableWidgetItem(finished_at))
+        self.table_history.setItem(h_row, 6, QTableWidgetItem(job.message))
+
+        # Remove da fila ativa
+        self._remove_job(jid)
+        self._append_dash_log("MACRO", "INFO", f"Tarefa '{job.project_name}' movida para o histórico.")
+                
     @Slot(float)
     def _on_queue_complete(self, total_s):
         self.btn_start.setEnabled(True)
@@ -4081,10 +4054,15 @@ class MacroTab(QWidget):
 
     @Slot(str, str)
     def _on_job_log(self, jid, msg):
-        if "Erro" in msg or "Falha" in msg or "Error" in msg:
-            self._append_dash_log("AUDIO" if "TTS" in msg else "MACRO", "ERROR", msg)
-        else:
-            self._append_dash_log("AUDIO" if "TTS" in msg else "MACRO", "INFO", msg)
+        # [BUG 8 FIX] Heurística melhorada para classificação de logs
+        is_error = any(x in msg for x in ["Erro", "Falha", "Error", "✗", "❌"])
+        
+        category = "MACRO"
+        if "TTS" in msg or "Áudio" in msg: category = "AUDIO"
+        elif "Vídeo" in msg or "Composição" in msg or "🎬" in msg: category = "VIDEO"
+        
+        level = "ERROR" if is_error else "INFO"
+        self._append_dash_log(category, level, msg)
 
     def _copy_log(self):
         cb = QApplication.clipboard()
@@ -4110,7 +4088,8 @@ class MacroTab(QWidget):
                 item = self.table.item(w["row"], c)
                 if item: item.setBackground(QColor(0, 0, 0, 0))
                 
-        self.coordinator.start()
+        # [FIX 1] Sempre reinicia do zero ao clicar em Iniciar (recuperação total de status)
+        self.coordinator.start(restart=True)
 
     def _on_engine_changed(self):
         self.combo_model_type.clear()
@@ -4183,16 +4162,37 @@ class MacroTab(QWidget):
         curr_proj = self.edit_proj.text().strip()
 
         if curr_wf == "video_edit":
-            if not curr_proj: return QMessageBox.warning(self, "Erro", "Digite o nome do Projeto.")
+            if not curr_proj:
+                QMessageBox.warning(self, "Erro", "Digite o nome do Projeto.")
+                return
         else:
-            if not self._current_txt: return QMessageBox.warning(self, "Erro", "Selecione script.")
+            if not self._current_txt:
+                QMessageBox.warning(self, "Erro", "Selecione o script (.txt) primeiro.")
+                return
+            if not Path(self._current_txt).exists():
+                QMessageBox.warning(self, "Erro", f"Arquivo não encontrado:\n{self._current_txt}")
+                self._current_txt = ""
+                self.lbl_txt_val.setText("(nenhum)")
+                return
         
-        # Same setup as before
+        # Snapshots seguros de áudio e vídeo
         audio_snapshot = {}
         if hasattr(self.main_window.audio_tab, "get_session"):
             audio_snapshot = self.main_window.audio_tab.get_session()
         if hasattr(self.main_window.tts_tab, "get_session"):
             audio_snapshot.update(self.main_window.tts_tab.get_session())
+        
+        # Resolve voz: prioriza seleção do formulário Macro, cai para AudioTab
+        curr_voice = self.combo_voice.currentData() or ""
+        if not curr_voice:
+            if hasattr(self.main_window.audio_tab, "preset_voice_combo"):
+                curr_voice = self.main_window.audio_tab.preset_voice_combo.currentData() or ""
+                if curr_voice:
+                    self._append_dash_log("MACRO", "INFO", f"🎤 [VOZ] Herdando voz do AudioTab: {Path(curr_voice).name}")
+        
+        # Garante que a voz está no snapshot com o nome correto para o pipeline
+        audio_snapshot["voice"] = curr_voice
+        audio_snapshot["preset_voice"] = curr_voice
             
         video_snapshot = {}
         if hasattr(self.main_window.video_tab, "get_session"):
@@ -4201,7 +4201,6 @@ class MacroTab(QWidget):
         import re, time
         safe_proj = re.sub(r'[^a-zA-Z0-9_\-]', '_', curr_proj or "projeto_macro")
         job_id = f"job_{int(time.time())}_{len(self.coordinator.jobs)}"
-        curr_voice = self.combo_voice.currentData() or ""
         
         job = MacroJob(
             id=job_id, project_name=safe_proj, workflow=curr_wf,
@@ -4210,13 +4209,17 @@ class MacroTab(QWidget):
             voice=curr_voice, lang=self.combo_lang.currentData(),
             output_root=self.main_window.audio_tab.output_root_edit.text() if hasattr(self.main_window.audio_tab, "output_root_edit") else "output",
             audio_dir=self._audio_dir if curr_wf == "video_edit" else "",
-            temperature=audio_snapshot.get("temperature", 0.8),
+            temperature=audio_snapshot.get("temperature", 0.65),
             speed=audio_snapshot.get("speed", 1.0),
             top_p=audio_snapshot.get("top_p", 1.0),
             audio_params=audio_snapshot, video_params=video_snapshot
         )
         self.coordinator.add_job(job)
         self._add_job_row(job)
+        self._append_dash_log("MACRO", "INFO", f"Tarefa '{job.project_name}' adicionada à fila.")
+        
+        # Se já estiver rodando, o coordenador vai encontrar o novo job naturalmente.
+        # Se estiver parado, não forçamos o início para evitar sustos, mas o usuário pode clicar em Iniciar.
 
     def _bulk_import(self):
         root = QFileDialog.getExistingDirectory(self, "Selecionar Pasta Raiz")
@@ -4232,15 +4235,23 @@ class MacroTab(QWidget):
         if hasattr(self.main_window.video_tab, "get_session"): video_snapshot = self.main_window.video_tab.get_session()
 
         for i, s in enumerate(scripts):
+            # [FIX 3] Herda voz do AudioTab no bulk import se vazio
+            curr_voice = self.combo_voice.currentData() or ""
+            if not curr_voice:
+                curr_voice = self.main_window.audio_tab.preset_voice_combo.currentData() or ""
+
+            audio_snapshot["voice"] = curr_voice
+            audio_snapshot["preset_voice"] = curr_voice
+
             job = MacroJob(
                 id=f"job_{int(time.time())}_{i}_{len(self.coordinator.jobs)}", project_name=s.stem.replace(" ","_").lower(),
                 workflow=self.combo_workflow.currentData(), txt_path=str(s), img_dir="",
                 engine=self.combo_engine.currentData(), model_type=self.combo_model_type.currentData(),
-                voice=self.combo_voice.currentData() or "", lang=self.combo_lang.currentData(),
+                voice=curr_voice, lang=self.combo_lang.currentData(),
                 output_root=self.main_window.audio_tab.output_root_edit.text() if hasattr(self.main_window.audio_tab, "output_root_edit") else "output",
                 audio_dir="", temperature=audio_snapshot.get("temperature", 0.8),
                 speed=audio_snapshot.get("speed", 1.0), top_p=audio_snapshot.get("top_p", 1.0),
-                audio_params=audio_snapshot, video_params=video_snapshot
+                audio_params=audio_snapshot.copy(), video_params=video_snapshot.copy()
             )
             self.coordinator.add_job(job)
             self._add_job_row(job)
@@ -4276,24 +4287,141 @@ class MacroTab(QWidget):
         btn_del.setFixedSize(24, 24)
         btn_del.setStyleSheet("QPushButton { background: rgba(255,100,100,0.1); border: none; } QPushButton:hover { background: rgba(255,100,100,0.3); }")
         btn_del.clicked.connect(lambda: self._remove_job(job.id))
-        self.table.setCellWidget(row, 8, btn_del)
+        
+        btn_edit = QPushButton("✏️")
+        btn_edit.setFixedSize(24, 24)
+        btn_edit.setStyleSheet("QPushButton { background: rgba(255,255,255,0.05); border: none; } QPushButton:hover { background: rgba(255,255,255,0.15); }")
+        btn_edit.clicked.connect(lambda: self._on_edit_job(job.id))
+        
+        actions_w = QWidget()
+        actions_l = QHBoxLayout(actions_w)
+        actions_l.setContentsMargins(0, 0, 0, 0)
+        actions_l.setSpacing(4)
+        actions_l.addWidget(btn_edit)
+        actions_l.addWidget(btn_del)
+        self.table.setCellWidget(row, 8, actions_w)
         
         self._job_widgets[job.id] = {
-            "row": row, "status_lbl": lbl_status, "aud_bar": p_aud, "vid_bar": p_vid, "lbl_time": lbl_time
+            "row": row, "status_lbl": lbl_status, "aud_bar": p_aud, "vid_bar": p_vid, "lbl_time": lbl_time, "actions": actions_w
         }
 
     def _remove_job(self, jid):
         if self.coordinator.remove_job(jid):
+            # [FIX] Ao remover, precisamos deletar a linha e re-sincronizar os row_indices salvos
             row = self._job_widgets[jid]["row"]
             self.table.removeRow(row)
             del self._job_widgets[jid]
-            # Refresh rows
-            for j in self.coordinator.jobs:
-                if j.id in self._job_widgets:
-                    r = self._job_widgets[j.id]["row"]
-                    if r > row:
-                        self._job_widgets[j.id]["row"] = r - 1
-                        self.table.item(r-1, 0).setText(str(r))
+            self._refresh_table_indices()
+            
+    def _refresh_table_indices(self):
+        """Sincroniza os row_indices salvos no dicionário com a tabela física."""
+        for i in range(self.table.rowCount()):
+            # Procura qual JID está nesta linha (pode ser lento, mas a fila é pequena)
+            # Uma forma melhor é varrer coordinator.jobs
+            pass
+        
+        # Simplesmente re-varre o coordinator.jobs e atualiza o row no widgets
+        for i, job in enumerate(self.coordinator.jobs):
+            if job.id in self._job_widgets:
+                self._job_widgets[job.id]["row"] = i
+                # Atualiza também a primeira coluna (#)
+                self.table.setItem(i, 0, QTableWidgetItem(str(i+1)))
+
+    def _on_edit_job(self, jid):
+        """Carrega dados do job no formulário e entra em Edit Mode."""
+        # Se estiver rodando o macro, bloqueia edição do atual
+        if self.coordinator._is_running and self.coordinator._current_idx >= 0:
+            if self.coordinator.jobs[self.coordinator._current_idx].id == jid:
+                return QMessageBox.warning(self, "Bloqueado", "Não é possível editar a tarefa em execução.")
+
+        job = None
+        for j in self.coordinator.jobs:
+            if j.id == jid:
+                job = j; break
+        if not job: return
+
+        self.edit_mode_job_id = jid
+        self.edit_proj.setText(job.project_name)
+        self.combo_workflow.setCurrentText(self.combo_workflow.findData(job.workflow)) # simplificado
+        idx = self.combo_workflow.findData(job.workflow)
+        if idx >= 0: self.combo_workflow.setCurrentIndex(idx)
+        
+        self._current_txt = job.txt_path
+        self.lbl_txt_val.setText(Path(job.txt_path).name if job.txt_path else "(nenhum)")
+        
+        idx_e = self.combo_engine.findData(job.engine)
+        if idx_e >= 0: self.combo_engine.setCurrentIndex(idx_e)
+        
+        # Voz - se for path, precisa adicionar ao combo se não existir
+        v_idx = self.combo_voice.findData(job.voice)
+        if v_idx < 0 and job.voice:
+             self.combo_voice.addItem(f"👤 {Path(job.voice).name}", job.voice)
+             v_idx = self.combo_voice.count() - 1
+        if v_idx >= 0: self.combo_voice.setCurrentIndex(v_idx)
+        
+        idx_l = self.combo_lang.findData(job.lang)
+        if idx_l >= 0: self.combo_lang.setCurrentIndex(idx_l)
+        
+        self._img_dir = job.img_dir
+        self.lbl_img_val.setText(Path(job.img_dir).name if job.img_dir else "(usar padrão)")
+        
+        self._audio_dir = job.audio_dir
+        self.lbl_aud_val.setText(Path(job.audio_dir).name if job.audio_dir else "(usar padrão)")
+
+        # Switch buttons
+        self.btn_add.setVisible(False)
+        self.btn_save_edit.setVisible(True)
+        self.btn_cancel_edit.setVisible(True)
+        
+        self._append_dash_log("MACRO", "INFO", f"Editando tarefa: {job.project_name}")
+
+    def _save_job_edit(self):
+        jid = self.edit_mode_job_id
+        if not jid: return
+
+        # Coleta novos dados
+        curr_proj = self.edit_proj.text().strip()
+        curr_wf   = self.combo_workflow.currentData()
+        curr_engine = self.combo_engine.currentData()
+        curr_model  = self.combo_model_type.currentData()
+        curr_voice  = self.combo_voice.currentData() or ""
+        curr_lang   = self.combo_lang.currentData()
+
+        # [FIX] No Edit Mode, precisamos garantir que o snapshot também seja atualizado se necessário
+        # Para simplicidade, vamos apenas atualizar os campos principais por enquanto
+        new_data = {
+            "project_name": curr_proj,
+            "workflow": curr_wf,
+            "engine": curr_engine,
+            "model_type": curr_model,
+            "voice": curr_voice,
+            "lang": curr_lang,
+            "txt_path": self._current_txt,
+            "img_dir": self._img_dir,
+            "audio_dir": self._audio_dir
+        }
+        
+        if self.coordinator.update_job(jid, new_data):
+            # Atualiza UI na tabela
+            row = self._job_widgets[jid]["row"]
+            self.table.setItem(row, 1, QTableWidgetItem(curr_proj))
+            # Pega o label amigável do workflow (podemos melhorar isso)
+            self.table.setItem(row, 2, QTableWidgetItem(curr_wf))
+            self.table.setItem(row, 3, QTableWidgetItem(f"{curr_engine} ({curr_model})"))
+            
+            self._cancel_job_edit()
+            self._append_dash_log("MACRO", "INFO", f"Tarefa '{curr_proj}' atualizada.")
+        
+    def _cancel_job_edit(self):
+        self.edit_mode_job_id = None
+        self.btn_add.setVisible(True)
+        self.btn_save_edit.setVisible(False)
+        self.btn_cancel_edit.setVisible(False)
+        
+        # Limpa campos se necessário ou apenas deixa
+        self.edit_proj.setText("projeto_batch")
+        self._current_txt = ""
+        self.lbl_txt_val.setText("(nenhum)")
 
     def _clear_all(self):
         if self.coordinator.clear_jobs():

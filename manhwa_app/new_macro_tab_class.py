@@ -12,6 +12,35 @@ from PySide6.QtGui import QColor
 from manhwa_app.dashboard_timing import DashboardTiming
 from manhwa_app.macro_core import MacroCoordinator, MacroJob
 
+class MacroTableWidget(QTableWidget):
+    row_moved = Signal(int, int)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDragDropOverwriteMode(False)
+        self.setDropIndicatorShown(True)
+        self.setSelectionMode(QTableWidget.SingleSelection)
+        self.setSelectionBehavior(QTableWidget.SelectRows)
+        self.setDragDropMode(QTableWidget.InternalMove)
+
+    def dropEvent(self, event):
+        if event.source() == self and not event.isAccepted():
+            drop_row = self.rowAt(event.pos().y()) if hasattr(event, 'pos') else self.rowAt(event.position().toPoint().y())
+            if drop_row == -1:
+                drop_row = self.rowCount()
+            
+            drag_row = self.currentRow()
+            if drop_row == drag_row or drop_row == drag_row + 1:
+                event.ignore()
+                return
+
+            event.accept()
+            self.row_moved.emit(drag_row, drop_row)
+        else:
+            super().dropEvent(event)
+
 class MacroTab(QWidget):
     """Aba de Macro Geral para automação total do fluxo de trabalho."""
     
@@ -153,10 +182,6 @@ class MacroTab(QWidget):
         
         fl.addRow(self.video_container)
         
-        self.combo_workflow.currentTextChanged.connect(self._on_workflow_changed)
-        self._on_workflow_changed()
-        self._on_engine_changed()
-        
         btn_add = QPushButton("➕ Adicionar tarefa à Fila")
         btn_add.setObjectName("primary")
         btn_add.setMinimumHeight(40)
@@ -194,7 +219,7 @@ class MacroTab(QWidget):
         right_panel.addWidget(timing_w)
         
         # B. Fila de Jobs (Tabela)
-        self.table = QTableWidget(0, 9)
+        self.table = MacroTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(["#", "Projeto", "Workflow", "Engine", "Status", "🎙️ Áudio", "🎬 Vídeo", "Elapsed", "Ação"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
@@ -208,6 +233,7 @@ class MacroTab(QWidget):
             QTableWidget { background: transparent; border: none; }
             QTableWidget::item { padding: 5px; border-bottom: 1px solid rgba(255,255,255,0.05); }
         """)
+        self.table.row_moved.connect(self._on_row_moved)
         right_panel.addWidget(self.table)
         
         # C. Log e Stats Strip (Bottom Splitter)
@@ -281,6 +307,12 @@ class MacroTab(QWidget):
         action_h.addWidget(self.btn_start, 3)
         action_h.addWidget(self.btn_pause, 1)
         main_v.addLayout(action_h)
+
+        # Inicialização Segura (Bug Fix: só chama após criar todos os widgets)
+        self.combo_workflow.currentTextChanged.connect(self._on_workflow_changed)
+        self._on_workflow_changed()
+        self._on_engine_changed()
+        self._refresh_voices()
 
     def _setup_connections(self):
         # Timing
@@ -405,7 +437,12 @@ class MacroTab(QWidget):
     @Slot(str, int, int)
     def _update_audio_bar(self, jid, current, total):
         if jid in self._job_widgets:
-            pb = self._job_widgets[jid]["aud_bar"]
+            # Encontrar o job real para saber se estamos no estágio de áudio ou vídeo
+            job = next((j for j in self.coordinator.jobs if j.id == jid), None)
+            is_video = job and job.status == "stage_video"
+            
+            pb = self._job_widgets[jid]["vid_bar"] if is_video else self._job_widgets[jid]["aud_bar"]
+            
             if total > 0:
                 pb.setMaximum(total)
                 pb.setValue(current)
@@ -525,10 +562,25 @@ class MacroTab(QWidget):
 
     @Slot(str, str)
     def _on_job_log(self, jid, msg):
-        if "Erro" in msg or "Falha" in msg or "Error" in msg:
-            self._append_dash_log("AUDIO" if "TTS" in msg else "MACRO", "ERROR", msg)
-        else:
-            self._append_dash_log("AUDIO" if "TTS" in msg else "MACRO", "INFO", msg)
+        stage = "MACRO"
+        level = "INFO"
+        
+        # Detecta nível de log
+        if any(x in msg for x in ["Erro", "Falha", "Error", "✗"]):
+            level = "ERROR"
+        elif any(x in msg for x in ["Aviso", "Warning", "⚠️"]):
+            level = "WARN"
+
+        # Detecta estágio para cor do log
+        clean_msg = msg
+        if "[VIDEO]" in msg:
+            stage = "VIDEO"
+            clean_msg = msg.replace("[VIDEO]", "").strip()
+        elif "[AUDIO]" in msg or "[TTS]" in msg:
+            stage = "AUDIO"
+            clean_msg = msg.replace("[AUDIO]", "").replace("[TTS]", "").strip()
+            
+        self._append_dash_log(stage, level, f"[{jid}] {clean_msg}")
 
     def _copy_log(self):
         cb = QApplication.clipboard()
@@ -554,7 +606,13 @@ class MacroTab(QWidget):
                 item = self.table.item(w["row"], c)
                 if item: item.setBackground(QColor(0, 0, 0, 0))
                 
-        self.coordinator.start()
+        # Verifica se deve reiniciar ou retomar
+        is_stopped_midway = self.coordinator._current_idx >= 0 and self.coordinator._current_idx < len(self.coordinator.jobs) - 1
+        
+        if is_stopped_midway:
+            self.coordinator.start(restart=False)
+        else:
+            self.coordinator.start(restart=True)
 
     def _on_engine_changed(self):
         self.combo_model_type.clear()
@@ -627,20 +685,38 @@ class MacroTab(QWidget):
         curr_proj = self.edit_proj.text().strip()
 
         if curr_wf == "video_edit":
-            if not curr_proj: return QMessageBox.warning(self, "Erro", "Digite o nome do Projeto.")
+            if not curr_proj:
+                QMessageBox.warning(self, "Erro", "Digite o nome do Projeto.")
+                return
         else:
-            if not self._current_txt: return QMessageBox.warning(self, "Erro", "Selecione script.")
+            if not self._current_txt:
+                QMessageBox.warning(self, "Erro", "Selecione o script (.txt) primeiro.")
+                return
+            if not Path(self._current_txt).exists():
+                QMessageBox.warning(self, "Erro", f"O arquivo selecionado não existe mais:\n{self._current_txt}")
+                self._current_txt = ""
+                self.lbl_txt_val.setText("(nenhum)")
+                return
         
-        # Same setup as before
+        # Snapshots seguros
         audio_snapshot = {}
-        if hasattr(self.main_window.audio_tab, "get_session"):
-            audio_snapshot = self.main_window.audio_tab.get_session()
-        if hasattr(self.main_window.tts_tab, "get_session"):
-            audio_snapshot.update(self.main_window.tts_tab.get_session())
-            
         video_snapshot = {}
-        if hasattr(self.main_window.video_tab, "get_session"):
-            video_snapshot = self.main_window.video_tab.get_session()
+        out_root = "output"
+
+        mw = self.main_window
+        if hasattr(mw, "audio_tab") and mw.audio_tab:
+            if hasattr(mw.audio_tab, "get_session"):
+                audio_snapshot = mw.audio_tab.get_session()
+            if hasattr(mw.audio_tab, "output_root_edit"):
+                out_root = mw.audio_tab.output_root_edit.text().strip() or "output"
+        
+        if hasattr(mw, "tts_tab") and mw.tts_tab:
+            if hasattr(mw.tts_tab, "get_session"):
+                audio_snapshot.update(mw.tts_tab.get_session())
+            
+        if hasattr(mw, "video_tab") and mw.video_tab:
+            if hasattr(mw.video_tab, "get_session"):
+                video_snapshot = mw.video_tab.get_session()
 
         import re, time
         safe_proj = re.sub(r'[^a-zA-Z0-9_\-]', '_', curr_proj or "projeto_macro")
@@ -652,15 +728,17 @@ class MacroTab(QWidget):
             txt_path=self._current_txt, img_dir=self._img_dir,
             engine=self.combo_engine.currentData(), model_type=self.combo_model_type.currentData(),
             voice=curr_voice, lang=self.combo_lang.currentData(),
-            output_root=self.main_window.audio_tab.output_root_edit.text() if hasattr(self.main_window.audio_tab, "output_root_edit") else "output",
+            output_root=out_root,
             audio_dir=self._audio_dir if curr_wf == "video_edit" else "",
-            temperature=audio_snapshot.get("temperature", 0.8),
+            temperature=audio_snapshot.get("temperature", 0.65),
             speed=audio_snapshot.get("speed", 1.0),
             top_p=audio_snapshot.get("top_p", 1.0),
             audio_params=audio_snapshot, video_params=video_snapshot
         )
+        
         self.coordinator.add_job(job)
         self._add_job_row(job)
+        self._append_dash_log("MACRO", "INFO", f"Tarefa '{safe_proj}' adicionada à fila.")
 
     def _bulk_import(self):
         root = QFileDialog.getExistingDirectory(self, "Selecionar Pasta Raiz")
@@ -668,26 +746,41 @@ class MacroTab(QWidget):
         scripts = list(Path(root).rglob("*.txt"))
         if not scripts: return QMessageBox.information(self, "Vazio", "Nenhum .txt.")
         
-        # Similar à anterior ...
         import time
-        audio_snapshot, video_snapshot = {}, {}
-        if hasattr(self.main_window.audio_tab, "get_session"): audio_snapshot = self.main_window.audio_tab.get_session()
-        if hasattr(self.main_window.tts_tab, "get_session"): audio_snapshot.update(self.main_window.tts_tab.get_session())
-        if hasattr(self.main_window.video_tab, "get_session"): video_snapshot = self.main_window.video_tab.get_session()
+        audio_snapshot = {}
+        video_snapshot = {}
+        out_root = "output"
+
+        mw = self.main_window
+        if hasattr(mw, "audio_tab") and mw.audio_tab:
+            if hasattr(mw.audio_tab, "get_session"):
+                audio_snapshot = mw.audio_tab.get_session()
+            if hasattr(mw.audio_tab, "output_root_edit"):
+                out_root = mw.audio_tab.output_root_edit.text().strip() or "output"
+        
+        if hasattr(mw, "tts_tab") and mw.tts_tab:
+            if hasattr(mw.tts_tab, "get_session"):
+                audio_snapshot.update(mw.tts_tab.get_session())
+            
+        if hasattr(mw, "video_tab") and mw.video_tab:
+            if hasattr(mw.video_tab, "get_session"):
+                video_snapshot = mw.video_tab.get_session()
 
         for i, s in enumerate(scripts):
             job = MacroJob(
                 id=f"job_{int(time.time())}_{i}_{len(self.coordinator.jobs)}", project_name=s.stem.replace(" ","_").lower(),
                 workflow=self.combo_workflow.currentData(), txt_path=str(s), img_dir="",
                 engine=self.combo_engine.currentData(), model_type=self.combo_model_type.currentData(),
-                voice=self.combo_voice.currentData() or "", lang=self.combo_lang.currentData(),
-                output_root=self.main_window.audio_tab.output_root_edit.text() if hasattr(self.main_window.audio_tab, "output_root_edit") else "output",
-                audio_dir="", temperature=audio_snapshot.get("temperature", 0.8),
+                voice=self.combo_voice.currentData() or "", lang="auto",
+                output_root=out_root,
+                audio_dir="", temperature=audio_snapshot.get("temperature", 0.65),
                 speed=audio_snapshot.get("speed", 1.0), top_p=audio_snapshot.get("top_p", 1.0),
                 audio_params=audio_snapshot, video_params=video_snapshot
             )
             self.coordinator.add_job(job)
             self._add_job_row(job)
+
+        self._append_dash_log("MACRO", "INFO", f"Batch: {len(scripts)} tarefas importadas.")
 
     def _add_job_row(self, job):
         row = self.table.rowCount()
@@ -766,6 +859,42 @@ class MacroTab(QWidget):
             self.table.setRowCount(0)
             self._job_widgets.clear()
             self.log_html.clear()
+
+    @Slot(int, int)
+    def _on_row_moved(self, from_row, to_row):
+        jobs = self.coordinator.jobs
+        if from_row < 0 or from_row >= len(jobs): return
+        
+        job = jobs.pop(from_row)
+        if to_row > from_row:
+            to_row -= 1
+            
+        jobs.insert(to_row, job)
+        self._refresh_table()
+
+    def _refresh_table(self):
+        self.table.setRowCount(0)
+        self._job_widgets.clear()
+        for job in self.coordinator.jobs:
+            self._add_job_row(job)
+            
+            # Restaura aparência se o job já estava concluído/rodando
+            if job.status in ("done", "success"):
+                w = self._job_widgets[job.id]
+                w["status_lbl"].setText("✅ Done")
+                w["status_lbl"].setStyleSheet("color: #81c784; font-weight: bold;")
+                w["aud_bar"].setValue(100)
+                w["vid_bar"].setValue(100)
+                for c in range(9):
+                    item = self.table.item(w["row"], c)
+                    if item: item.setBackground(QColor(0, 100, 0, 30))
+            elif job.status == "error":
+                w = self._job_widgets[job.id]
+                w["status_lbl"].setText("❌ Error")
+                w["status_lbl"].setStyleSheet("color: #e57373; font-weight: bold;")
+                for c in range(9):
+                    item = self.table.item(w["row"], c)
+                    if item: item.setBackground(QColor(100, 0, 0, 30))
 
     # Serialization (Mesmo que o original)
     def get_session(self) -> dict:

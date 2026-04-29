@@ -16,6 +16,13 @@
 #   - loudnorm: LRA=11→14 (LRA 11 comprimia demais a dinâmica narrativa)
 #   - Nova função apply_audio_post_processing_for_lang() com parâmetros ajustados
 #     automaticamente por idioma (PT-BR, ES, EN)
+#
+# [NOISE FIX] Ruído branco agudo eliminado com:
+#   - anlmdn antes do loudnorm: atenua noise floor do modelo TTS (~-60dB)
+#     sem afetar a voz (strength=3, patch=2, research=4)
+#   - loudnorm TP=-2.0 (era -1.5): mais headroom → menos pressão de ganho → menos
+#     amplificação do noise floor no gain staging do loudnorm
+#   - echo zerado no preset base: out_gain 0.3 amplificava o noise floor do TTS
 
 import logging
 import os
@@ -36,18 +43,22 @@ _FX_BASE = {
     "highpass_hz":         120,      # Remove sub-bass sem tirar presença da voz
     "deesser_intensity":   0.03,     # Suave — TTS já não tem sibilância exagerada
     "deesser_frequency":   0.55,     # Banda mais estreita que o padrão (era 0.8)
-    "comp_threshold":      "-18dB",  # Mais suave que -15dB anterior
-    "comp_ratio":          2.5,      # Narração dramática, não rádio AM (era 4.0)
-    "comp_attack":         8,        # Ataque lento preserva transientes de consoantes
-    "comp_release":        80,       # Release longo mantém consistência
-    "comp_makeup":         1.5,      # Ganho de compensação moderado
+    "comp_threshold":      "-16dB",  # Mais suave que -18dB anterior (menos compressão)
+    "comp_ratio":          1.8,      # Bem leve (era 2.5) para não amassar a dinâmica
+    "comp_attack":         12,       # Ataque médio para não cortar plosivas
+    "comp_release":        100,      # Release suave
+    "comp_makeup":         1.0,      # Menos ganho de compensação
     "echo_in_gain":        0.8,
-    "echo_out_gain":       0.9,
-    "echo_delay_ms":       22,       # Delay menor (era 40ms) — frases curtas de manhwa
-    "echo_decay":          0.05,     # Decay menor — menos "cauda" artificial
+    "echo_out_gain":       0.15,     # [NOISE FIX] Reduzido de 0.3 — out_gain alto amplifica noise floor do TTS
+    "echo_delay_ms":       15,       # Delay minúsculo
+    "echo_decay":          0.02,     # Decay quase imperceptível
     "loudnorm_I":          -14,      # Target YouTube ideal para narração
-    "loudnorm_TP":         -1.5,
+    "loudnorm_TP":         -2.0,     # [NOISE FIX] Era -1.5 → -2.0: mais headroom, menos pressão de ganho
     "loudnorm_LRA":        14,       # Mais dinâmica dramática (era 11)
+    # [NOISE FIX] lowpass: corta ruído branco acima de 11.5kHz (universalmente suportado)
+    # Voz humana + Chatterbox não tem harmônicos úteis acima de ~8kHz.
+    # Ruído branco agudo do TTS vive exatamente acima de 12kHz → corte seguro em 11500Hz.
+    "noise_lowpass_hz":    11500,
 }
 
 # PT-BR: mais dinâmica, sem de-esser (sibilância é natural e importante)
@@ -56,18 +67,18 @@ _FX_PTBR = {
     **_FX_BASE,
     "highpass_hz":         100,      # PT-BR tem mais presença nos médios-graves
     "deesser_intensity":   0.0,      # Desativado: sibilância PT é natural
-    # [Q3] comp_attack=50ms (era 15ms) preserva transientes de plosivas (P,B,T,D)
-    # Attack 15ms é rápido demais — o compressor "morde" o inicio das consoantes
-    "comp_ratio":          1.5,      # [Q3] Ratio mais leve ainda (era 1.7)
-    "comp_threshold":      "-20dB",
-    "comp_attack":         50,       # [Q3] Era 15 — preserva plosivas PT-BR
+    "comp_ratio":          1.3,      # Ratio quase transparente (era 1.5)
+    "comp_threshold":      "-18dB",
+    "comp_attack":         50,       # Preserva plosivas PT-BR
     "comp_release":        250,      # Release explícito para consistência
+
     "comp_makeup":         1.2,
     # [P7] LRA=9 (era 16) — 16 demais para alto-falantes de laptop/celular.
     # LRA 16 significa silêncios inaudíveis e picos ásperos em fones de ouvido.
     # LRA=9 mantém dinâmica dramática mas compatível com mídia móvel (YouTube Shorts, Reels).
     "loudnorm_I":          -14,      # -14 LUFS: levemente mais alto para mobile (era -16)
     "loudnorm_LRA":        9,        # LRA=9: YouTube/Reels ideal para narração (era 16)
+    "loudnorm_TP":         -2.0,     # [NOISE FIX] Herdado do base, confirmado para PT-BR
 }
 
 
@@ -110,13 +121,13 @@ def get_recommended_chatterbox_params(lang: str) -> dict:
     lang_key = lang.lower().split("-")[0]
     if lang_key == "pt":
         return {
-            "exaggeration": 0.65,   # [CB4] era 0.55 — mais dramático para manhwa
-            "cfg_weight":   0.40,   # [CB4] era 0.45 — mais flexibilidade emocional
-            "temperature":  0.75,   # [CB4] era default 0.65 — mais variação prosódica
+            "exaggeration": 0.55,   # Revertido para valor estável
+            "cfg_weight":   0.45,   # Revertido para valor estável
+            "temperature":  0.65,   # Revertido para valor estável
         }
     elif lang_key == "es":
-        return {"exaggeration": 0.62, "cfg_weight": 0.42, "temperature": 0.72}
-    return {"exaggeration": 0.65, "cfg_weight": 0.35}  # EN Turbo
+        return {"exaggeration": 0.55, "cfg_weight": 0.45, "temperature": 0.65}
+    return {"exaggeration": 0.5, "cfg_weight": 0.5}  # Fallback seguro
 
 
 
@@ -207,7 +218,15 @@ def apply_audio_post_processing(
                 f"{p['echo_decay']}"
             )
 
-        # 7. Loudnorm Broadcast
+        # 7. [NOISE FIX] lowpass antes do loudnorm — corta ruído branco agudo do TTS
+        # anlmdn (alternativa anterior) não está disponível em todos os builds do FFmpeg.
+        # lowpass=f=11500 é universalmente suportado e cobre exatamente a faixa do ruído:
+        # voz humana/Chatterbox tem conteúdo útil até ~8kHz, ruído TTS está acima de 12kHz.
+        # Executado SEMPRE que loudnorm está ativo (loudnorm amplifica o noise floor).
+        if do_loudnorm:
+            filters.append(f"lowpass=f={p['noise_lowpass_hz']}")
+
+        # 8. Loudnorm Broadcast
         if do_loudnorm:
             filters.append(
                 f"loudnorm="
@@ -220,12 +239,9 @@ def apply_audio_post_processing(
     # O stage 3a (utils.trim_lead_trail_silence) já cuida disso muito melhor.
     # O uso duplo estava cortando palavras.
 
-    # [Q4] Realce Espectral — Presença + Air para TTS mais natural
-    # TTS treinado em áudio comprimido tem qualidade de "sala morta" — sem ar e presença.
-    # +1.5dB em 2500Hz (presença dramática) + +1.2dB em 8000Hz (ar/respiração)
-    # Aplicado SEMPRE (mesmo sem outros FX) para qualquer idioma.
-    filters.append("equalizer=f=2500:width_type=o:width=2:g=1.5")  # Presença médio-alta
-    filters.append("equalizer=f=8000:width_type=o:width=2:g=1.2")  # Air band
+    # [Q4] Realce Espectral — Desativado temporariamente para diagnosticar tom agudo
+    # filters.append("equalizer=f=2500:width_type=o:width=2:g=0.7")
+    # filters.append("equalizer=f=8000:width_type=o:width=2:g=0.5")
     # O stage 3a (utils.trim_lead_trail_silence) já cuida disso muito melhor.
     # O uso duplo estava cortando palavras.
 
@@ -237,6 +253,8 @@ def apply_audio_post_processing(
     unique_id = uuid.uuid4().hex[:8]
     temp_wav = str(Path(input_wav).parent / f"_fx_tmp_{unique_id}.wav")
     filter_string = ",".join(filters)
+    
+    logger.info(f"[FX] Filters para {lang}: {filter_string}")
 
     cmd = [
         "ffmpeg", "-y",

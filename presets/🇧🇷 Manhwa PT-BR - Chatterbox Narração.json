@@ -23,9 +23,9 @@
     "model_type": "multilingual",
     "lang": "pt",
 
-    "temperature": 0.82,
-    "exaggeration": 0.68,
-    "cfg_weight": 0.05,
+    "temperature": 0.65,
+    "exaggeration": 0.55,
+    "cfg_weight": 0.45,
     "seed": 3000,
     "speed": 0.97,
 
